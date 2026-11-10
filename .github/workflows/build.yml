@@ -11,7 +11,7 @@ jobs:
           mkdir -p Sources
           cat > project.yml <<'PROJEOF'
           name: probe
-          options: { bundleIdPrefix: com.buurza21, deploymentTarget: { iOS: "18.0" } }
+          options: { bundleIdPrefix: com.buurza22, deploymentTarget: { iOS: "18.0" } }
           targets:
             probe:
               type: application
@@ -21,9 +21,9 @@ jobs:
               info:
                 path: Info.plist
                 properties:
-                  CFBundleDisplayName: buurd21
+                  CFBundleDisplayName: buurd22
                   CFBundleShortVersionString: "1.0"
-                  CFBundleVersion: "21"
+                  CFBundleVersion: "22"
                   UILaunchScreen: {}
               settings:
                 ARCHS: "arm64"
@@ -40,7 +40,6 @@ jobs:
                 - sdk: CoreMedia.framework
                 - sdk: CoreVideo.framework
                 - sdk: Security.framework
-                - sdk: IOSurface.framework
           PROJEOF
           cat > probe.entitlements <<'ENTEOF'
           <?xml version="1.0" encoding="UTF-8"?>
@@ -54,7 +53,6 @@ jobs:
           cat > Sources/main.m <<'MAINEOF'
           #import <UIKit/UIKit.h>
           #import <IOKit/IOKitLib.h>
-          #import <IOSurface/IOSurface.h>
           #import <VideoToolbox/VideoToolbox.h>
           #import <CoreVideo/CoreVideo.h>
           #import <Security/Security.h>
@@ -73,8 +71,9 @@ jobs:
           typedef struct __SecTask *SecTaskRef;
           typedef SecTaskRef (*fn_create)(CFAllocatorRef);
           typedef CFTypeRef (*fn_copy)(SecTaskRef, CFStringRef, CFErrorRef*);
+          typedef uint32_t (*fn_surfid)(IOSurfaceRef);
 
-          #define BUILD_TAG "v21-heap"
+          #define BUILD_TAG "v22-surf"
           #define MAXC 96
           #define STEP_MAX 17
           #define TRY_MAX 2
@@ -94,12 +93,13 @@ jobs:
           static int g_fd = -1;
           static int g_nchild = 0;
           static int g_root_idx = -1;
+          static uint32_t g_sid = 0;
           static io_service_t g_root = 0;
           static io_service_t g_child[MAXCHILD + 1];
           static NSMutableSet* g_seen;
           static pthread_mutex_t g_lk = PTHREAD_MUTEX_INITIALIZER;
           static VTCompressionSessionRef g_vt = NULL;
-          static IOSurfaceRef g_surf = NULL;
+          static CVPixelBufferRef g_surf = NULL;
 
           static io_connect_t g_conn[MAXC];
           static uint32_t g_ctype[MAXC];
@@ -529,18 +529,25 @@ jobs:
           }
 
           static void surf_make(void) {
-              NSDictionary* p = @{ (id)kIOSurfaceWidth: @1920, (id)kIOSurfaceHeight: @1080,
-                                   (id)kIOSurfaceBytesPerElement: @4,
-                                   (id)kIOSurfacePixelFormat: @(0x42475241) };
-              g_surf = IOSurfaceCreate((__bridge CFDictionaryRef)p);
-              persist([NSString stringWithFormat:@"surf=%d id=%u", g_surf ? 1 : 0,
-                       g_surf ? IOSurfaceGetID(g_surf) : 0]);
-              ui([NSString stringWithFormat:@"surf=%d", g_surf ? 1 : 0]);
+              NSDictionary* p = @{ (id)kCVPixelBufferIOSurfacePropertiesKey: @{} };
+              CVReturn r = CVPixelBufferCreate(NULL, 1920, 1080, kCVPixelFormatType_32BGRA,
+                                               (__bridge CFDictionaryRef)p, &g_surf);
+              if (r != kCVReturnSuccess || !g_surf) {
+                  persist([NSString stringWithFormat:@"surf=0 rc=%d", (int)r]);
+                  ui([NSString stringWithFormat:@"surf=0 rc=%d", (int)r]);
+                  return;
+              }
+              IOSurfaceRef s = CVPixelBufferGetIOSurface(g_surf);
+              fn_surfid idf = (fn_surfid)dlsym(RTLD_DEFAULT, "IOSurfaceGetID");
+              g_sid = (s && idf) ? idf(s) : 0;
+              persist([NSString stringWithFormat:@"surf=1 iosurf=%d idfn=%d id=%u",
+                       s ? 1 : 0, idf ? 1 : 0, g_sid]);
+              ui([NSString stringWithFormat:@"surf=%d id=%u", s ? 1 : 0, g_sid]);
           }
 
           static void surf_probe(void) {
               if (!g_surf) { ui(@"no surf"); return; }
-              IOSurfaceID sid = IOSurfaceGetID(g_surf);
+              uint32_t sid = g_sid;
               persist([NSString stringWithFormat:@"sid=%u", sid]);
               for (int off = 0; off <= 32; off += 4) {
                   uint8_t* in = calloc(1, FIXED);
@@ -580,10 +587,10 @@ jobs:
           }
 
           static void verdict(void) {
-              persist([NSString stringWithFormat:@"VERDICT ok4=%d hits=%d conns=%d root_idx=%d",
-                       g_ok4, g_hits, g_nconn, g_root_idx]);
-              ui([NSString stringWithFormat:@"VERDICT ok4=%d hits=%d idx=%d",
-                  g_ok4, g_hits, g_root_idx]);
+              persist([NSString stringWithFormat:@"VERDICT ok4=%d hits=%d conns=%d root_idx=%d sid=%u",
+                       g_ok4, g_hits, g_nconn, g_root_idx, g_sid]);
+              ui([NSString stringWithFormat:@"VERDICT ok4=%d hits=%d idx=%d sid=%u",
+                  g_ok4, g_hits, g_root_idx, g_sid]);
           }
 
           static void do_step(int s) {
@@ -733,6 +740,8 @@ jobs:
           xcrun -sdk iphoneos clang -fsyntax-only -x objective-c \
             -target arm64-apple-ios18.0 \
             -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" \
+            -F "$(xcrun --sdk iphoneos --show-sdk-path)/System/Library/PrivateFrameworks" \
+            -F "$(xcrun --sdk iphoneos --show-sdk-path)/System/Library/Frameworks" \
             -Wno-implicit-function-declaration \
             Sources/main.m > s.log 2>&1
           rc=$?
@@ -751,11 +760,12 @@ jobs:
             SUPPORTED_PLATFORMS=iphoneos \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
             OTHER_CFLAGS="-Wno-implicit-function-declaration" \
+            OTHER_LDFLAGS="-F$(xcrun --sdk iphoneos --show-sdk-path)/System/Library/PrivateFrameworks" \
             build > b.log 2>&1
           rc=$?
           set -e
           echo "=== rc=$rc ==="
-          grep -nE "error:|fatal error:" b.log | head -40
+          grep -nE "error:|fatal error:|Undefined symbols" b.log | head -40
           echo "=== end ==="
           exit $rc
 
