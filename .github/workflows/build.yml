@@ -11,7 +11,7 @@ jobs:
           mkdir -p Sources
           cat > project.yml <<'PROJEOF'
           name: probe
-          options: { bundleIdPrefix: com.buurza14, deploymentTarget: { iOS: "18.0" } }
+          options: { bundleIdPrefix: com.buurza15, deploymentTarget: { iOS: "18.0" } }
           targets:
             probe:
               type: application
@@ -21,9 +21,9 @@ jobs:
               info:
                 path: Info.plist
                 properties:
-                  CFBundleDisplayName: buurd14
+                  CFBundleDisplayName: buurd15
                   CFBundleShortVersionString: "1.0"
-                  CFBundleVersion: "14"
+                  CFBundleVersion: "15"
                   UILaunchScreen: {}
               settings:
                 ARCHS: "arm64"
@@ -54,6 +54,7 @@ jobs:
           #import <UIKit/UIKit.h>
           #import <IOKit/IOKitLib.h>
           #import <VideoToolbox/VideoToolbox.h>
+          #import <CoreVideo/CoreVideo.h>
           #import <mach/mach.h>
           #import <mach/vm_region.h>
           #include <unistd.h>
@@ -68,9 +69,9 @@ jobs:
               mach_vm_size_t *, vm_region_flavor_t, vm_region_info_t,
               mach_msg_type_number_t *, mach_port_t *);
 
-          #define BUILD_TAG "v14-latch"
+          #define BUILD_TAG "v15-open"
           #define MAXC 24
-          #define STEP_MAX 21
+          #define STEP_MAX 12
           #define TRY_MAX 2
 
           static UITextView* g_tv;
@@ -79,10 +80,13 @@ jobs:
           static volatile int g_hits = 0, g_done = 0;
           static volatile int g_step = 0;
           static volatile int g_stop = 0;
+          static volatile int g_vt_done = 0;
           static int g_try = 0;
+          static int g_open_idx = -1;
           static int g_fd = -1;
           static NSMutableSet* g_seen;
           static pthread_mutex_t g_lk = PTHREAD_MUTEX_INITIALIZER;
+          static VTCompressionSessionRef g_vt = NULL;
 
           static io_connect_t g_conn[MAXC];
           static uint32_t g_ctype[MAXC];
@@ -91,13 +95,13 @@ jobs:
           static const uint32_t FUZZ_VALS[12] = {
               1, 8, 16, 64, 256, 1024, 4096, 8192, 0x10000, 0x100000, 0x7fffffff, 0xffffffff
           };
+          static const uint32_t MAGIC_VALS[8] = {1, 2, 4, 0x10, 0x100, 0x1000, 0x10000, 0x100000};
+          static const uint32_t MAGIC_OFFS[5] = {0, 4, 120, 124, 128};
 
           static const char* STEP_NAME[STEP_MAX + 1] = {
-              "boot-only", "open-1", "open-all", "s4-zero", "s5-zero",
-              "mm-0", "mm-1-7", "mm-8-31", "mix-s5", "mix-s4",
-              "cmd124-0-31", "cmd124-32-255", "cmd122-0-63", "cmd126-0-255",
-              "cmd128-0-255", "hmap5-128-255", "hmap5-256-511", "hmap5-512-4095",
-              "hmap4-128-511", "inv5", "inv4", "fuzz-200"
+              "boot", "vt-init", "vt-encode", "type-sweep-s5", "magic-sweep",
+              "s4-on-open", "mm-sweep", "mm-write", "cmd124-zero-511",
+              "cmd128-zero-511", "cmd122-zero-127", "hmap124", "fuzz-300"
           };
 
           static void ui(NSString* s) {
@@ -212,52 +216,100 @@ jobs:
               return r;
           }
 
-          static kern_return_t callp(const char* tag, io_connect_t c, uint32_t t, uint32_t sel,
+          static kern_return_t callp(const char* tag, int ci, uint32_t sel,
                                      const uint8_t* in, size_t sz, size_t outsz, BOOL always) {
+              if (ci < 0) ci = 0;
+              uint32_t t = g_ctype[ci];
               NSString* key = [NSString stringWithFormat:@"%u:%u:%zu:%zu:%s", t, sel, sz, outsz, tag];
               if (seen_key(key)) return (kern_return_t)0xdeadbeef;
               persist([NSString stringWithFormat:@"K %@", key]);
               bread(tag);
               uint8_t out[4096]; size_t oSz = outsz;
               memset(out, 0xCC, sizeof(out));
-              kern_return_t kr = IOConnectCallStructMethod(c, sel, in, sz, outsz ? out : NULL, &oSz);
+              kern_return_t kr = IOConnectCallStructMethod(g_conn[ci], sel, in, sz,
+                                                           outsz ? out : NULL, &oSz);
               __sync_fetch_and_add(&g_done, 1);
               if (kr == KERN_SUCCESS) {
                   persist([NSString stringWithFormat:@"OK %s t%u s%u out=%zu %@ IN %@",
                            tag, t, sel, oSz, hex(out, oSz), hex(in, sz)]);
                   __sync_fetch_and_add(&g_hits, 1);
-                  ui([NSString stringWithFormat:@"!!! OK %s out=%zu %@", tag, oSz, hex(out, oSz)]);
-              } else if (kr != 0xe00002c2 && kr != 0xe00002c7) {
+                  ui([NSString stringWithFormat:@"!!! OK %s t%u out=%zu %@", tag, t, oSz, hex(out, oSz)]);
+              } else if (kr != 0xe00002c2 && kr != 0xe00002c7 && kr != 0xe00002cc) {
                   persist([NSString stringWithFormat:@"%u %u %zu %@ | %s", t, sel, sz, kr_name(kr), tag]);
                   __sync_fetch_and_add(&g_hits, 1);
-                  ui([NSString stringWithFormat:@"!! %s -> %@", tag, kr_name(kr)]);
+                  ui([NSString stringWithFormat:@"!! %s t%u -> %@", tag, t, kr_name(kr)]);
               } else {
                   persist([NSString stringWithFormat:@"%u %u %zu %@ | %s", t, sel, sz, kr_name(kr), tag]);
-                  if (always) ui([NSString stringWithFormat:@"%s -> %@", tag, kr_name(kr)]);
+                  if (always) ui([NSString stringWithFormat:@"%s t%u -> %@", tag, t, kr_name(kr)]);
               }
               usleep(300);
               return kr;
           }
 
-          static void open_n(int n) {
+          static int open_all(void) {
               io_iterator_t it = 0;
               if (IOServiceGetMatchingServices(kIOMainPortDefault,
-                      IOServiceMatching("AppleJPEGDriver"), &it) != KERN_SUCCESS) return;
-              io_service_t s = IOIteratorNext(it);
-              if (!s) { IOObjectRelease(it); return; }
-              for (int t = 0; t <= 40 && g_nconn < n && g_nconn < MAXC; t++) {
-                  io_connect_t c = 0;
-                  if (IOServiceOpen(s, mach_task_self(), (uint32_t)t, &c) == KERN_SUCCESS) {
-                      g_conn[g_nconn] = c; g_ctype[g_nconn] = (uint32_t)t; g_nconn++;
+                      IOServiceMatching("AppleJPEGDriver"), &it) != KERN_SUCCESS) return 0;
+              int svc = 0;
+              io_service_t s;
+              while ((s = IOIteratorNext(it))) {
+                  svc++;
+                  for (uint32_t t = 0; t <= 40 && g_nconn < MAXC; t++) {
+                      io_connect_t c = 0;
+                      if (IOServiceOpen(s, mach_task_self(), t, &c) == KERN_SUCCESS) {
+                          g_conn[g_nconn] = c; g_ctype[g_nconn] = t; g_nconn++;
+                      }
+                  }
+                  IOObjectRelease(s);
+              }
+              IOObjectRelease(it);
+              return svc;
+          }
+
+          static void vt_cb(void* ref, void* src, OSStatus st, VTEncodeInfoFlags fl,
+                            CMSampleBufferRef sb) { g_vt_done = 1; }
+
+          static void vt_start(void) {
+              VTCompressionSessionCreate(NULL, 1920, 1080, kCMVideoCodecType_H264,
+                  NULL, NULL, NULL, vt_cb, NULL, &g_vt);
+              if (g_vt) VTCompressionSessionPrepareToEncodeFrames(g_vt);
+          }
+
+          static int vt_encode(void) {
+              if (!g_vt) return -1;
+              CVPixelBufferRef pb = NULL;
+              NSDictionary* a = @{ (id)kCVPixelBufferIOSurfacePropertiesKey: @{} };
+              if (CVPixelBufferCreate(NULL, 1920, 1080, kCVPixelFormatType_32BGRA,
+                      (__bridge CFDictionaryRef)a, &pb) != kCVReturnSuccess) return -2;
+              CVPixelBufferLockBaseAddress(pb, 0);
+              memset(CVPixelBufferGetBaseAddress(pb), 0x80, CVPixelBufferGetDataSize(pb));
+              CVPixelBufferUnlockBaseAddress(pb, 0);
+              VTEncodeInfoFlags fl = 0;
+              OSStatus st = VTCompressionSessionEncodeFrame(g_vt, pb, CMTimeMake(1, 30),
+                  CMTimeMake(1, 30), NULL, NULL, &fl);
+              CVPixelBufferRelease(pb);
+              for (int i = 0; i < 300 && !g_vt_done; i++) usleep(10000);
+              return (int)st;
+          }
+
+          static void type_sweep(void) {
+              for (int i = 0; i < g_nconn; i++) {
+                  uint8_t* in = calloc(1, 4096);
+                  char tg[32]; snprintf(tg, sizeof(tg), "ts%u", g_ctype[i]);
+                  kern_return_t kr = callp(tg, i, 5, in, 4096, 4096, YES);
+                  free(in);
+                  if (kr == KERN_SUCCESS && g_open_idx < 0) {
+                      g_open_idx = i;
+                      persist([NSString stringWithFormat:@"OPEN type=%u idx=%d", g_ctype[i], i]);
+                      ui([NSString stringWithFormat:@"### OPEN t%u idx=%d", g_ctype[i], i]);
                   }
               }
-              IOObjectRelease(s); IOObjectRelease(it);
           }
 
           static void s_zero(uint32_t sel) {
               uint8_t* in = calloc(1, 4096);
               char tg[32]; snprintf(tg, sizeof(tg), "z%u", sel);
-              callp(tg, g_conn[0], g_ctype[0], sel, in, 4096, 4096, YES);
+              callp(tg, g_open_idx, sel, in, 4096, 4096, YES);
               free(in);
           }
 
@@ -278,56 +330,60 @@ jobs:
               return real;
           }
 
-          static void mm_range(uint32_t lo, uint32_t hi) {
+          static void mm_range(uint32_t lo, uint32_t hi, BOOL touch) {
+              int ci = g_open_idx < 0 ? 0 : g_open_idx;
               for (uint32_t mt = lo; mt <= hi; mt++) {
                   char tg[32]; snprintf(tg, sizeof(tg), "mm%u", mt);
                   bread(tg);
                   mach_vm_address_t addr = 0; mach_vm_size_t size = 0;
-                  kern_return_t kr = IOConnectMapMemory64(g_conn[0], mt, mach_task_self(),
+                  kern_return_t kr = IOConnectMapMemory64(g_conn[ci], mt, mach_task_self(),
                                                           &addr, &size, kIOMapAnywhere);
                   persist([NSString stringWithFormat:@"map %u %@ %llu | %s", mt, kr_name(kr), size, tg]);
                   if (kr != KERN_SUCCESS) { ui([NSString stringWithFormat:@"%s -> %@", tg, kr_name(kr)]); continue; }
                   __sync_fetch_and_add(&g_hits, 1);
                   BOOL wr = NO; size_t ext = map_extent(addr, size, &wr);
                   ui([NSString stringWithFormat:@"!!! %s claim=%llu real=%zu wr=%d", tg, size, ext, (int)wr]);
-                  if (ext >= 64 && wr) {
+                  if (touch && ext >= 64 && wr) {
                       uint8_t* p = (uint8_t*)addr;
                       ui([NSString stringWithFormat:@"    pre %@", hex(p, ext > 64 ? 64 : ext)]);
                       memset(p, 0xFF, ext > 4096 ? 4096 : ext);
                       s_zero(5); s_zero(4);
                       ui([NSString stringWithFormat:@"    post %@", hex(p, ext > 64 ? 64 : ext)]);
                   } else if (ext >= 64) ui(@"    read-only");
-                  IOConnectUnmapMemory64(g_conn[0], mt, mach_task_self(), addr);
+                  IOConnectUnmapMemory64(g_conn[ci], mt, mach_task_self(), addr);
               }
           }
 
-          static void cmd_at(uint32_t off, uint32_t from, uint32_t to) {
+          static void magic_sweep(void) {
+              for (int o = 0; o < 5; o++) {
+                  for (int v = 0; v < 8; v++) {
+                      uint8_t* in = calloc(1, 4096);
+                      memcpy(in + MAGIC_OFFS[o], &MAGIC_VALS[v], 4);
+                      char tg[40]; snprintf(tg, sizeof(tg), "mg%d.%u", MAGIC_OFFS[o], MAGIC_VALS[v]);
+                      callp(tg, g_open_idx, 5, in, 4096, 4096, NO);
+                      free(in);
+                  }
+              }
+          }
+
+          static void cmd_zero(uint32_t off, uint32_t from, uint32_t to) {
               for (uint32_t v = from; v <= to; v++) {
                   uint8_t* in = calloc(1, 4096);
-                  if (off == 126 || off == 122) { uint16_t h = v; memcpy(in + off, &h, 2); }
-                  else memcpy(in + off, &v, 4);
-                  char tg[40]; snprintf(tg, sizeof(tg), "cmd%u.%u", off, v);
-                  callp(tg, g_conn[0], g_ctype[0], 5, in, 4096, 4096, NO);
+                  memcpy(in + off, &v, 4);
+                  char tg[40]; snprintf(tg, sizeof(tg), "c%u.%u", off, v);
+                  callp(tg, g_open_idx, 5, in, 4096, 4096, NO);
                   free(in);
               }
           }
 
-          static void mixed(uint32_t sel) {
-              for (uint32_t ic = 0; ic <= 6; ic++) {
-                  uint64_t inS[8] = {0}, outS[16] = {0}; uint32_t oc = 16;
+          static void cmd122(void) {
+              for (uint32_t v = 0; v <= 127; v++) {
                   uint8_t* in = calloc(1, 4096);
-                  uint8_t out[4096]; size_t oSz = sizeof(out);
-                  memset(out, 0xCC, sizeof(out));
-                  char tg[32]; snprintf(tg, sizeof(tg), "m%u.%u", sel, ic);
-                  bread(tg);
-                  kern_return_t kr = IOConnectCallMethod(g_conn[0], sel, inS, ic, in, 4096,
-                                                        outS, &oc, out, &oSz);
+                  uint16_t h = (uint16_t)v;
+                  memcpy(in + 122, &h, 2);
+                  char tg[40]; snprintf(tg, sizeof(tg), "c122.%u", v);
+                  callp(tg, g_open_idx, 5, in, 4096, 4096, NO);
                   free(in);
-                  persist([NSString stringWithFormat:@"mixed %u sc=%u %@ | %s", sel, ic, kr_name(kr), tg]);
-                  if (kr != 0xe00002c2 && kr != 0xe00002c7) {
-                      __sync_fetch_and_add(&g_hits, 1);
-                      ui([NSString stringWithFormat:@"!! %s -> %@ oc=%u %@", tg, kr_name(kr), oc, hex(out, oSz)]);
-                  } else ui([NSString stringWithFormat:@"%s -> %@", tg, kr_name(kr)]);
               }
           }
 
@@ -336,20 +392,8 @@ jobs:
               for (int i = lo; i <= hi; i++) {
                   in[i] = 0xFF;
                   char tg[40]; snprintf(tg, sizeof(tg), "h%u.%d", sel, i);
-                  callp(tg, g_conn[0], g_ctype[0], sel, in, 4096, 4096, NO);
+                  callp(tg, g_open_idx, sel, in, 4096, 4096, NO);
                   in[i] = 0;
-              }
-              free(in);
-          }
-
-          static void imap(uint32_t sel) {
-              uint8_t* in = malloc(4096);
-              memset(in, 0xFF, 4096);
-              for (int i = 0; i < 512; i++) {
-                  in[i] = 0;
-                  char tg[40]; snprintf(tg, sizeof(tg), "i%u.%d", sel, i);
-                  callp(tg, g_conn[0], g_ctype[0], sel, in, 4096, 4096, NO);
-                  in[i] = 0xFF;
               }
               free(in);
           }
@@ -364,33 +408,26 @@ jobs:
                       memcpy(in + off, &v, 4);
                   }
                   char tg[32]; snprintf(tg, sizeof(tg), "f.%d", r);
-                  callp(tg, g_conn[0], g_ctype[0], 5, in, 4096, 4096, NO);
+                  callp(tg, g_open_idx, 5, in, 4096, 4096, NO);
                   free(in);
               }
           }
 
           static void do_step(int s) {
               switch (s) {
-                  case 0: case 1: case 2: break;
-                  case 3: s_zero(4); break;
-                  case 4: s_zero(5); break;
-                  case 5: mm_range(0, 0); break;
-                  case 6: mm_range(1, 7); break;
-                  case 7: mm_range(8, 31); break;
-                  case 8: mixed(5); break;
-                  case 9: mixed(4); break;
-                  case 10: cmd_at(124, 0, 31); break;
-                  case 11: cmd_at(124, 32, 255); break;
-                  case 12: cmd_at(122, 0, 63); break;
-                  case 13: cmd_at(126, 0, 255); break;
-                  case 14: cmd_at(128, 0, 255); break;
-                  case 15: hmap(5, 128, 255); break;
-                  case 16: hmap(5, 256, 511); break;
-                  case 17: hmap(5, 512, 4095); break;
-                  case 18: hmap(4, 128, 511); break;
-                  case 19: imap(5); break;
-                  case 20: imap(4); break;
-                  case 21: fuzz(200); break;
+                  case 0: break;
+                  case 1: vt_start(); break;
+                  case 2: ui([NSString stringWithFormat:@"vt=%d done=%d", (int)vt_encode(), g_vt_done]); break;
+                  case 3: type_sweep(); break;
+                  case 4: if (g_open_idx >= 0) magic_sweep(); else ui(@"no open type"); break;
+                  case 5: if (g_open_idx >= 0) s_zero(4); else ui(@"no open type"); break;
+                  case 6: mm_range(0, 31, NO); break;
+                  case 7: mm_range(0, 7, YES); break;
+                  case 8: if (g_open_idx >= 0) cmd_zero(124, 0, 511); else ui(@"no open type"); break;
+                  case 9: if (g_open_idx >= 0) cmd_zero(128, 0, 511); else ui(@"no open type"); break;
+                  case 10: if (g_open_idx >= 0) cmd122(); else ui(@"no open type"); break;
+                  case 11: if (g_open_idx >= 0) hmap(5, 0, 511); else ui(@"no open type"); break;
+                  case 12: if (g_open_idx >= 0) fuzz(300); else ui(@"no open type"); break;
               }
           }
 
@@ -411,20 +448,15 @@ jobs:
 
               if (g_step > STEP_MAX) { ui(@"ALL DONE"); return; }
 
-              VTCompressionSessionRef v = NULL;
-              VTCompressionSessionCreate(NULL, 1920, 1080, kCMVideoCodecType_H264,
-                  NULL, NULL, NULL, NULL, NULL, &v);
-              if (v) VTCompressionSessionPrepareToEncodeFrames(v);
-              usleep(200000);
-              open_n(MAXC);
-              ui([NSString stringWithFormat:@"conns=%d", g_nconn]);
+              int svc = open_all();
+              ui([NSString stringWithFormat:@"svc=%d conns=%d", svc, g_nconn]);
+              persist([NSString stringWithFormat:@"svc=%d conns=%d", svc, g_nconn]);
               if (!g_nconn) { ui(@"NO CONN — STOP"); g_stop = 1; }
 
               while (g_step <= STEP_MAX && !g_stop) {
                   load_try();
                   if (g_try >= TRY_MAX) {
-                      ui([NSString stringWithFormat:@"SKIP %d %s", g_step,
-                          STEP_NAME[g_step]]);
+                      ui([NSString stringWithFormat:@"SKIP %d %s", g_step, STEP_NAME[g_step]]);
                       persist([NSString stringWithFormat:@"SKIP %d", g_step]);
                       g_step++; save_step(g_step);
                       usleep(150000);
@@ -435,7 +467,8 @@ jobs:
                   ui([NSString stringWithFormat:@"CHAIN %d %s", g_step, STEP_NAME[g_step]]);
                   do_step(g_step);
 
-                  persist([NSString stringWithFormat:@"STEP %d OK calls=%d hits=%d", g_step, g_done, g_hits]);
+                  persist([NSString stringWithFormat:@"STEP %d OK calls=%d hits=%d open=%d",
+                           g_step, g_done, g_hits, g_open_idx]);
                   if (g_fd >= 0) fsync(g_fd);
                   ui([NSString stringWithFormat:@"STEP %d SURVIVED", g_step]);
                   g_step++; save_step(g_step);
@@ -484,8 +517,8 @@ jobs:
               [self.w makeKeyAndVisible];
 
               [NSTimer scheduledTimerWithTimeInterval:0.25 repeats:YES block:^(NSTimer*) {
-                  g_hb.text = [NSString stringWithFormat:@"%s step %d/%d c=%d h=%d",
-                               BUILD_TAG, g_step, STEP_MAX, g_done, g_hits];
+                  g_hb.text = [NSString stringWithFormat:@"%s step %d/%d c=%d h=%d o=%d",
+                               BUILD_TAG, g_step, STEP_MAX, g_done, g_hits, g_open_idx];
                   flush_ui();
               }];
 
