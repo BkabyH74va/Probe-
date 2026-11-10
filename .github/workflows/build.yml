@@ -11,7 +11,7 @@ jobs:
           mkdir -p Sources
           cat > project.yml <<'PROJEOF'
           name: probe
-          options: { bundleIdPrefix: com.buurza11, deploymentTarget: { iOS: "18.0" } }
+          options: { bundleIdPrefix: com.buurza12, deploymentTarget: { iOS: "18.0" } }
           targets:
             probe:
               type: application
@@ -21,9 +21,9 @@ jobs:
               info:
                 path: Info.plist
                 properties:
-                  CFBundleDisplayName: buurd11
+                  CFBundleDisplayName: buurd12
                   CFBundleShortVersionString: "1.0"
-                  CFBundleVersion: "11"
+                  CFBundleVersion: "12"
                   UILaunchScreen: {}
               settings:
                 ARCHS: "arm64"
@@ -68,15 +68,18 @@ jobs:
               mach_vm_size_t *, vm_region_flavor_t, vm_region_info_t,
               mach_msg_type_number_t *, mach_port_t *);
 
-          #define BUILD_TAG "v11-vmreg"
+          #define BUILD_TAG "v12-chain"
           #define MAXC 24
           #define STEP_MAX 21
+          #define TRY_MAX 2
 
           static UITextView* g_tv;
           static UILabel* g_hb;
           static NSMutableArray* g_lines;
           static volatile int g_hits = 0, g_done = 0;
           static volatile int g_step = 0;
+          static volatile int g_stop = 0;
+          static int g_try = 0;
           static int g_fd = -1;
           static NSMutableSet* g_seen;
           static pthread_mutex_t g_lk = PTHREAD_MUTEX_INITIALIZER;
@@ -164,6 +167,18 @@ jobs:
               char b[512]; doc_path("step.txt", b, sizeof(b));
               [[NSString stringWithFormat:@"%d", v] writeToFile:@(b) atomically:YES
                   encoding:NSUTF8StringEncoding error:nil];
+          }
+          static void load_try(void) {
+              char b[512]; doc_path("try.txt", b, sizeof(b));
+              NSString* s = [NSString stringWithContentsOfFile:@(b) encoding:NSUTF8StringEncoding error:nil];
+              if (!s) return;
+              NSArray* f = [s componentsSeparatedByString:@":"];
+              if (f.count == 2 && f[0].intValue == g_step) g_try = f[1].intValue;
+          }
+          static void save_try(void) {
+              char b[512]; doc_path("try.txt", b, sizeof(b));
+              [[NSString stringWithFormat:@"%d:%d", g_step, g_try] writeToFile:@(b)
+                  atomically:YES encoding:NSUTF8StringEncoding error:nil];
           }
           static void load_state(void) {
               char b[512]; doc_path("state.txt", b, sizeof(b));
@@ -337,6 +352,31 @@ jobs:
               }
           }
 
+          static void do_step(int s) {
+              switch (s) {
+                  case 0: case 1: case 2: break;
+                  case 3: s_zero(4); break;
+                  case 4: s_zero(5); break;
+                  case 5: mm_range(0, 0); break;
+                  case 6: mm_range(1, 7); break;
+                  case 7: mm_range(8, 31); break;
+                  case 8: mixed(5); break;
+                  case 9: mixed(4); break;
+                  case 10: cmd_at(124, 0, 31); break;
+                  case 11: cmd_at(124, 32, 255); break;
+                  case 12: cmd_at(122, 0, 63); break;
+                  case 13: cmd_at(126, 0, 255); break;
+                  case 14: cmd_at(128, 0, 255); break;
+                  case 15: hmap(5, 128, 255); break;
+                  case 16: hmap(5, 256, 511); break;
+                  case 17: hmap(5, 512, 4095); break;
+                  case 18: hmap(4, 128, 511); break;
+                  case 19: imap(5); break;
+                  case 20: imap(4); break;
+                  case 21: fuzz(200); break;
+              }
+          }
+
           static void run(void) {
               char b[512]; doc_path("state.txt", b, sizeof(b));
               g_fd = open(b, O_CREAT | O_WRONLY | O_APPEND, 0644);
@@ -359,39 +399,36 @@ jobs:
                       NULL, NULL, NULL, NULL, NULL, &v);
                   if (v) VTCompressionSessionPrepareToEncodeFrames(v);
                   usleep(200000);
-                  open_n(g_step >= 2 ? MAXC : 1);
+                  open_n(MAXC);
                   ui([NSString stringWithFormat:@"conns=%d", g_nconn]);
-                  if (!g_nconn) { ui(@"NO CONN"); return; }
+                  if (!g_nconn) { ui(@"NO CONN — STOP"); g_stop = 1; }
               }
 
-              switch (g_step) {
-                  case 0: break;
-                  case 1: case 2: break;
-                  case 3: s_zero(4); break;
-                  case 4: s_zero(5); break;
-                  case 5: mm_range(0, 0); break;
-                  case 6: mm_range(1, 7); break;
-                  case 7: mm_range(8, 31); break;
-                  case 8: mixed(5); break;
-                  case 9: mixed(4); break;
-                  case 10: cmd_at(124, 0, 31); break;
-                  case 11: cmd_at(124, 32, 255); break;
-                  case 12: cmd_at(122, 0, 63); break;
-                  case 13: cmd_at(126, 0, 255); break;
-                  case 14: cmd_at(128, 0, 255); break;
-                  case 15: hmap(5, 128, 255); break;
-                  case 16: hmap(5, 256, 511); break;
-                  case 17: hmap(5, 512, 4095); break;
-                  case 18: hmap(4, 128, 511); break;
-                  case 19: imap(5); break;
-                  case 20: imap(4); break;
-                  case 21: fuzz(200); break;
+              while (g_step <= STEP_MAX && !g_stop) {
+                  load_try();
+                  if (g_try >= TRY_MAX) {
+                      ui([NSString stringWithFormat:@"SKIP %d %s", g_step,
+                          STEP_NAME[g_step]]);
+                      persist([NSString stringWithFormat:@"SKIP %d", g_step]);
+                      g_step++; save_step(g_step);
+                      usleep(150000);
+                      continue;
+                  }
+                  g_try++; save_try();
+
+                  ui([NSString stringWithFormat:@"CHAIN %d %s", g_step, STEP_NAME[g_step]]);
+                  do_step(g_step);
+
+                  persist([NSString stringWithFormat:@"STEP %d OK calls=%d hits=%d", g_step, g_done, g_hits]);
+                  if (g_fd >= 0) fsync(g_fd);
+                  ui([NSString stringWithFormat:@"STEP %d SURVIVED", g_step]);
+                  g_step++; save_step(g_step);
+                  if (g_step <= STEP_MAX) usleep(400000);
               }
 
-              persist([NSString stringWithFormat:@"STEP %d OK calls=%d hits=%d", g_step, g_done, g_hits]);
+              ui(@"CHAIN END");
+              persist(@"CHAIN END");
               if (g_fd >= 0) fsync(g_fd);
-              save_step(g_step + 1);
-              ui([NSString stringWithFormat:@"STEP %d SURVIVED — relaunch", g_step]);
               close(g_fd); g_fd = -1;
           }
 
