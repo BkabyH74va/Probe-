@@ -1,344 +1,173 @@
-name: build
+name: dylib
 on: [push, workflow_dispatch]
 jobs:
-  ipa:
+  dylib:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: scaffold
+      - name: source
         run: |
-          mkdir -p Sources
-          cat > project.yml <<'EOF'
-          name: probe
-          options: { bundleIdPrefix: com.buurza, deploymentTarget: { iOS: "18.0" } }
-          targets:
-            probe:
-              type: application
-              platform: iOS
-              sources: [Sources]
-              entitlements: { path: probe.entitlements }
-              info:
-                path: Sources/Info.plist
-                properties:
-                  CFBundleDisplayName: buurd
-                  CFBundleShortVersionString: "1.0"
-                  CFBundleVersion: "1"
-                  UILaunchScreen: {}
-              settings:
-                ARCHS: "arm64e arm64"
-                SUPPORTED_PLATFORMS: "iphoneos"
-                SDKROOT: "iphoneos"
-                CODE_SIGN_IDENTITY: ""
-                CODE_SIGNING_REQUIRED: "NO"
-                CODE_SIGNING_ALLOWED: "NO"
-                OTHER_CFLAGS: "-Wno-implicit-function-declaration"
-              dependencies:
-                - sdk: IOKit.framework
-                - sdk: UIKit.framework
-                - sdk: VideoToolbox.framework
-                - sdk: CoreMedia.framework
-                - sdk: CoreVideo.framework
-                - sdk: Security.framework
-          EOF
-          cat > probe.entitlements <<'EOF'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0"><dict>
-            <key>platform-application</key><true/>
-            <key>com.apple.private.security.no-container</key><true/>
-            <key>get-task-allow</key><true/>
-          </dict></plist>
-          EOF
-          cat > Sources/main.m <<'EOF'
+          mkdir -p out
+          cat > buurd.m <<'EOF'
           #import <UIKit/UIKit.h>
-          #import <IOKit/IOKitLib.h>
-          #import <Security/Security.h>
-          #import <VideoToolbox/VideoToolbox.h>
-          #include <unistd.h>
-          #include <fcntl.h>
-          #include <pthread.h>
+          #import <mach/mach.h>
+          #import <mach-o/dyld.h>
+          #import <dlfcn.h>
+          #include <string.h>
 
-          extern int csops(pid_t, unsigned int, void *, size_t);
-          #define CS_OPS_STATUS 0
+          // ================= USTAWIENIA =================
+          #define OFF_LIST      0x00000000ULL   // wskaznik do listy chunkow
+          #define OFF_COUNT     0x00000000ULL   // uint32 liczba entity (0 = uzyj MAX_ENT)
+          #define OFF_MATRIX    0x00000000ULL   // float[16] row-major view matrix
+          #define OFF_ENT_POS   0x00000000ULL   // float x,y,z w entity
+          // ==============================================
 
-          static UITextView* g_tv;
-          static UILabel* g_hb;
-          static int g_hits = 0, g_done = 0, g_total = 0;
-          static int g_fd = -1;
-          static NSMutableSet* g_seen;
-          static pthread_mutex_t g_lk = PTHREAD_MUTEX_INITIALIZER;
+          #define STRIDE      0x78
+          #define CHUNK_BITS  9
+          #define MAX_ENT     4096
+          #define MAX_DRAW    28
 
-          #define MAXC 16
-          static io_connect_t g_conn[MAXC];
-          static uint32_t g_ctype[MAXC];
-          static int g_nconn = 0;
+          static uintptr_t g_base = 0;
+          static uint32_t  g_ents = 0;
+          static BOOL      g_ready = NO;
 
-          static void ui(NSString* s) {
-              dispatch_async(dispatch_get_main_queue(), ^{
-                  g_tv.text = [g_tv.text stringByAppendingFormat:@"\n%@", s];
-                  [g_tv scrollRangeToVisible:NSMakeRange(g_tv.text.length, 0)];
-              });
+          static inline BOOL rd(uintptr_t a, void* b, size_t n) {
+              if (!a || a < 0x100000000ULL) return NO;
+              vm_size_t got = 0;
+              return vm_read_overwrite(mach_task_self(), (vm_address_t)a,
+                       (vm_size_t)n, (vm_address_t)b, &got) == KERN_SUCCESS && got == n;
           }
-          static void persist(NSString* s) {
-              if (g_fd < 0) return;
-              NSData* d = [[s stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
-              pthread_mutex_lock(&g_lk);
-              write(g_fd, d.bytes, d.length);
-              pthread_mutex_unlock(&g_lk);
-          }
-          static NSString* kr_name(kern_return_t kr) {
-              switch (kr) {
-                  case KERN_SUCCESS: return @"OK";
-                  case 0xe00002bc: return @"Error";
-                  case 0xe00002bd: return @"NoMem";
-                  case 0xe00002be: return @"NoRes";
-                  case 0xe00002c1: return @"NotPriv";
-                  case 0xe00002c2: return @"BadArg";
-                  case 0xe00002c5: return @"Excl";
-                  case 0xe00002c7: return @"Unsup";
-                  case 0xe00002cc: return @"NotOpen";
-                  case 0xe00002d4: return @"Busy";
-                  case 0xe00002e2: return @"NotPerm";
-                  default: return [NSString stringWithFormat:@"0x%x", kr];
-              }
-          }
-          static NSString* hex(const uint8_t* p, size_t n) {
-              if (!n) return @"-";
-              if (n > 40) n = 40;
-              NSMutableString* s = [NSMutableString string];
-              for (size_t i = 0; i < n; i++) [s appendFormat:@"%02x", p[i]];
-              return s;
-          }
-          static void state_path(char* b, size_t n) {
-              NSString* p = [NSSearchPathForDirectoriesInDomains(
-                  NSDocumentDirectory, NSUserDomainMask, YES).firstObject
-                  stringByAppendingPathComponent:@"state.txt"];
-              strncpy(b, p.UTF8String, n - 1);
-          }
-          static void load_state(void) {
-              char b[512]; state_path(b, sizeof(b));
-              NSString* s = [NSString stringWithContentsOfFile:@(b) encoding:NSUTF8StringEncoding error:nil];
-              for (NSString* ln in [s componentsSeparatedByString:@"\n"]) {
-                  if (ln.length < 5) continue;
-                  NSArray* f = [ln componentsSeparatedByString:@" "];
-                  if (f.count >= 3) [g_seen addObject:[NSString stringWithFormat:@"%@:%@:%@", f[0], f[1], f[2]]];
-              }
-          }
-          static BOOL seen_key(NSString* k) {
-              pthread_mutex_lock(&g_lk);
-              BOOL r = [g_seen containsObject:k];
-              [g_seen addObject:k];
-              pthread_mutex_unlock(&g_lk);
-              return r;
-          }
+          static inline uint64_t rd64(uintptr_t a) { uint64_t v = 0; rd(a, &v, 8); return v; }
+          static inline uint32_t rd32(uintptr_t a) { uint32_t v = 0; rd(a, &v, 4); return v; }
+          static inline float    rdf (uintptr_t a) { float    v = 0; rd(a, &v, 4); return v; }
 
-          static void call(const char* tag, io_connect_t c, uint32_t t, uint32_t sel,
-                           const uint8_t* in, size_t sz, size_t outsz) {
-              NSString* key = [NSString stringWithFormat:@"%u:%u:%zu:%zu:%s", t, sel, sz, outsz, tag];
-              if (seen_key(key)) return;
-              uint8_t out[4096]; size_t oSz = outsz;
-              memset(out, 0xCC, sizeof(out));
-              kern_return_t kr = IOConnectCallStructMethod(c, sel, in, sz, outsz ? out : NULL, &oSz);
-              g_done++;
-              NSString* line = [NSString stringWithFormat:@"%u %u %zu %@ %zu %@ | %s",
-                                t, sel, sz, kr_name(kr), oSz, hex(out, oSz), tag];
-              persist(line);
-              if (kr != 0xe00002c2 && kr != 0xe00002c7) {
-                  g_hits++;
-                  ui([NSString stringWithFormat:@"!! t%u s%u sz=%zu out=%zu -> %@ %@ [%s]",
-                      t, sel, sz, outsz, kr_name(kr), hex(out, oSz), tag]);
-              } else if (strcmp(tag, "sweep") == 0) {
-                  ui([NSString stringWithFormat:@"t%u s%u -> %@", t, sel, kr_name(kr)]);
-              }
-              usleep(1500);
-          }
-
-          static void sweep(io_connect_t c, uint32_t t, uint32_t upto) {
-              uint8_t* in = calloc(1, 4096);
-              for (uint32_t s = 0; s < upto; s++) call("sweep", c, t, s, in, 4096, 4096);
-              free(in);
-          }
-
-          static void ladder(io_connect_t c, uint32_t t, uint32_t sel) {
-              size_t L[] = { 4096, 8192, 16384, 32768, 65536, 131072 };
-              for (int i = 0; i < 6; i++) {
-                  uint8_t* in = calloc(1, L[i]);
-                  call("ladder", c, t, sel, in, L[i], 4096);
-                  free(in);
-              }
-          }
-
-          static void patterns(io_connect_t c, uint32_t t, uint32_t sel, size_t sz) {
-              const char* nm[] = { "zero","ff","41","u32sz","u32k","u64k","wh","u32at8","u32at12","u64at8" };
-              for (int p = 0; p < 10; p++) {
-                  uint8_t* in = calloc(1, sz);
-                  switch (p) {
-                      case 1: memset(in, 0xFF, sz); break;
-                      case 2: memset(in, 0x41, sz); break;
-                      case 3: *(uint32_t*)in = (uint32_t)sz; break;
-                      case 4: *(uint32_t*)in = 0x1000; break;
-                      case 5: *(uint64_t*)in = 0x1000; break;
-                      case 6: ((uint32_t*)in)[0] = 1920; ((uint32_t*)in)[1] = 1080; break;
-                      case 7: ((uint32_t*)in)[2] = (uint32_t)sz; break;
-                      case 8: ((uint32_t*)in)[3] = (uint32_t)sz; break;
-                      case 9: *(uint64_t*)(in + 8) = 0x1000; break;
-                  }
-                  for (int r = 0; r < 2; r++) {
-                      char tg[32]; snprintf(tg, sizeof(tg), "pat_%s", nm[p]);
-                      call(tg, c, t, sel, in, sz, 4096);
-                  }
-                  free(in);
-              }
-          }
-
-          static void outvars(io_connect_t c, uint32_t t, uint32_t sel, size_t sz) {
-              size_t ov[] = { 0, 8, 64, 512, 1024, 2048, 4096 };
-              for (int i = 0; i < 7; i++) {
-                  uint8_t* in = calloc(1, sz);
-                  char tg[32]; snprintf(tg, sizeof(tg), "out_%zu", ov[i]);
-                  call(tg, c, t, sel, in, sz, ov[i]);
-                  free(in);
-              }
-          }
-
-          static void scalars(io_connect_t c, uint32_t t, uint32_t sel) {
-              for (uint32_t ic = 0; ic <= 6; ic++) {
-                  uint64_t in[8] = {0}, out[16] = {0}; uint32_t oc = 16;
-                  kern_return_t kr = IOConnectCallScalarMethod(c, sel, in, ic, out, &oc);
-                  ui([NSString stringWithFormat:@"S t%u s%u in=%u -> %@", t, sel, ic, kr_name(kr)]);
-              }
-          }
-
-          static void open_all(void) {
-              io_iterator_t it = 0;
-              if (IOServiceGetMatchingServices(kIOMainPortDefault,
-                      IOServiceMatching("AppleJPEGDriver"), &it) != KERN_SUCCESS) return;
-              io_service_t s; int nodes = 0;
-              while ((s = IOIteratorNext(it)) && nodes < 2 && g_nconn < MAXC) {
-                  nodes++;
-                  for (int t = 0; t <= 40 && g_nconn < MAXC; t++) {
-                      io_connect_t c = 0;
-                      if (IOServiceOpen(s, mach_task_self(), (uint32_t)t, &c) == KERN_SUCCESS) {
-                          g_conn[g_nconn] = c; g_ctype[g_nconn] = (uint32_t)t; g_nconn++;
-                      }
-                  }
-                  IOObjectRelease(s);
-              }
-              IOObjectRelease(it);
-          }
-
-          static void run(void) {
-              char b[512]; state_path(b, sizeof(b));
-              g_fd = open(b, O_CREAT | O_WRONLY | O_APPEND, 0644);
-              g_seen = [NSMutableSet set];
-              load_state();
-              ui([NSString stringWithFormat:@"resume=%lu", (unsigned long)g_seen.count]);
-
-              VTCompressionSessionRef v = NULL;
-              VTCompressionSessionCreate(NULL, 1920, 1080, kCMVideoCodecType_H264,
-                  NULL, NULL, NULL, NULL, NULL, &v);
-              if (v) VTCompressionSessionPrepareToEncodeFrames(v);
-              usleep(250000);
-
-              open_all();
-              ui([NSString stringWithFormat:@"conns=%d", g_nconn]);
-              if (!g_nconn) return;
-
-              io_connect_t c0 = g_conn[0]; uint32_t t0 = g_ctype[0];
-
-              ui(@"[1] table sweep 0-127 @4096");
-              sweep(c0, t0, 128);
-
-              ui(@"[2] size ladder s4/s5");
-              ladder(c0, t0, 4);
-              ladder(c0, t0, 5);
-
-              ui(@"[3] patterns s4/s5 @4096");
-              patterns(c0, t0, 4, 4096);
-              patterns(c0, t0, 5, 4096);
-
-              ui(@"[4] outSize variants");
-              outvars(c0, t0, 4, 4096);
-              outvars(c0, t0, 5, 4096);
-
-              ui(@"[5] scalar on s4/s5");
-              scalars(c0, t0, 4);
-              scalars(c0, t0, 5);
-
-              ui([NSString stringWithFormat:@"FINISHED calls=%d hits=%d", g_done, g_hits]);
-              close(g_fd); g_fd = -1;
-          }
-
-          @interface AppDelegate : UIResponder <UIApplicationDelegate>
-          @property (strong) UIWindow* w;
-          @end
-
-          @implementation AppDelegate
-          - (BOOL)application:(UIApplication*)a didFinishLaunchingWithOptions:(NSDictionary*)o {
-              self.w = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
-              UIViewController* vc = [UIViewController new];
-              vc.view.backgroundColor = UIColor.blackColor;
-
-              g_hb = [[UILabel alloc] initWithFrame:CGRectMake(8, 50, 340, 18)];
-              g_hb.textColor = UIColor.systemYellowColor;
-              g_hb.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
-              g_hb.text = @"idle";
-              [vc.view addSubview:g_hb];
-
-              CGRect r = vc.view.bounds;
-              r.origin.y = 72; r.size.height -= 80;
-              g_tv = [[UITextView alloc] initWithFrame:r];
-              g_tv.backgroundColor = UIColor.blackColor;
-              g_tv.textColor = UIColor.greenColor;
-              g_tv.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
-              g_tv.editable = NO;
-              g_tv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-              g_tv.text = @"boot";
-              [vc.view addSubview:g_tv];
-
-              self.w.rootViewController = vc;
-              [self.w makeKeyAndVisible];
-
-              [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer* t) {
-                  g_hb.text = [NSString stringWithFormat:@"calls=%d hits=%d", g_done, g_hits];
-              }];
-
-              dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
-                             dispatch_get_global_queue(0,0), ^{ run(); });
+          static BOOL w2s(const float* m, float x, float y, float z, CGPoint* o, CGSize s) {
+              float w = m[3]*x + m[7]*y + m[11]*z + m[15];
+              if (w <= 0.001f) return NO;
+              float cx = m[0]*x + m[4]*y + m[8]*z  + m[12];
+              float cy = m[1]*x + m[5]*y + m[9]*z  + m[13];
+              float nx = cx / w, ny = cy / w;
+              o->x = (s.width  * 0.5f) * (1.0f + nx);
+              o->y = (s.height * 0.5f) * (1.0f - ny);
               return YES;
           }
+
+          @interface BUView : UIView
+          @property (nonatomic, strong) NSMutableArray<NSString*>* lines;
           @end
 
-          int main(int argc, char** argv) {
-              @autoreleasepool { return UIApplicationMain(argc, argv, nil, @"AppDelegate"); }
+          @implementation BUView
+          - (instancetype)initWithFrame:(CGRect)f {
+              if ((self = [super initWithFrame:f])) {
+                  self.backgroundColor = UIColor.clearColor;
+                  self.userInteractionEnabled = NO;
+                  self.opaque = NO;
+                  _lines = [NSMutableArray array];
+              }
+              return self;
+          }
+          - (void)drawRect:(CGRect)r {
+              NSDictionary* at = @{
+                  NSFontAttributeName: [UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightRegular],
+                  NSForegroundColorAttributeName: UIColor.greenColor };
+              CGFloat y = 34;
+              for (NSString* s in self.lines) {
+                  [s drawAtPoint:CGPointMake(6, y) withAttributes:at];
+                  y += 11;
+                  if (y > r.size.height - 40) break;
+              }
+          }
+          @end
+
+          static BUView* g_view = NULL;
+
+          static void tick(void) {
+              if (!g_ready || !g_base) return;
+              CGSize sz = UIScreen.mainScreen.bounds.size;
+              NSMutableArray* out = [NSMutableArray array];
+
+              float m[16];
+              if (!rd(g_base + OFF_MATRIX, m, sizeof(m))) {
+                  [out addObject:@"matrix unreadable"];
+              }
+              uintptr_t list = rd64(g_base + OFF_LIST);
+              uint32_t cnt = OFF_COUNT ? rd32(g_base + OFF_COUNT) : 0;
+              if (!cnt || cnt > MAX_ENT) cnt = MAX_ENT;
+              g_ents = cnt;
+
+              [out addObject:[NSString stringWithFormat:@"base=%p list=%p n=%u", (void*)g_base, (void*)list, cnt]];
+
+              int shown = 0, live = 0;
+              for (uint32_t i = 0; i < cnt && shown < MAX_DRAW; i++) {
+                  uintptr_t chunk = rd64(list + ((i >> CHUNK_BITS) * 8));
+                  if (!chunk) continue;
+                  uintptr_t ent = rd64(chunk + ((i & 0x1FF) * STRIDE));
+                  if (!ent) continue;
+                  live++;
+                  float x = rdf(ent + OFF_ENT_POS);
+                  float y = rdf(ent + OFF_ENT_POS + 4);
+                  float z = rdf(ent + OFF_ENT_POS + 8);
+                  CGPoint p;
+                  if (!w2s(m, x, y, z, &p, sz)) continue;
+                  [out addObject:[NSString stringWithFormat:@"#%u %4.0f,%4.0f | %.0f %.0f %.0f",
+                                 i, p.x, p.y, x, y, z]];
+                  shown++;
+              }
+              [out addObject:[NSString stringWithFormat:@"live=%d shown=%d", live, shown]];
+
+              dispatch_async(dispatch_get_main_queue(), ^{
+                  g_view.lines = out;
+                  [g_view setNeedsDisplay];
+              });
+          }
+
+          static void install(void) {
+              if (g_view) return;
+              dispatch_async(dispatch_get_main_queue(), ^{
+                  UIWindow* w = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+                  w.windowLevel = UIWindowLevelAlert + 1;
+                  w.backgroundColor = UIColor.clearColor;
+                  UIViewController* vc = [UIViewController new];
+                  vc.view.backgroundColor = UIColor.clearColor;
+                  g_view = [[BUView alloc] initWithFrame:UIScreen.mainScreen.bounds];
+                  g_view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+                  [vc.view addSubview:g_view];
+                  w.rootViewController = vc;
+                  [w makeKeyAndVisible];
+
+                  [NSTimer scheduledTimerWithTimeInterval:0.05 repeats:YES block:^(NSTimer* t) { tick(); }];
+                  NSLog(@"BUURD: overlay up, base=%p", (void*)g_base);
+              });
+          }
+
+          __attribute__((constructor))
+          static void buurd_init(void) {
+              const struct mach_header_64* h = (const struct mach_header_64*)_dyld_get_image_header(0);
+              intptr_t slide = _dyld_get_image_vmaddr_slide(0);
+              if (h) g_base = (uintptr_t)h + (uintptr_t)slide;
+              NSLog(@"BUURD: loaded, hdr=%p slide=%ld base=%p", h, (long)slide, (void*)g_base);
+              g_ready = YES;
+              dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
+                             dispatch_get_main_queue(), ^{ install(); });
           }
           EOF
 
-      - name: xcodegen
+      - name: compile
         run: |
-          brew install xcodegen
-          xcodegen generate
-
-      - name: build
-        run: |
-          mkdir -p out/Payload
-          xcodebuild -project probe.xcodeproj -target probe \
-            -sdk iphoneos -configuration Release \
-            -arch arm64e -arch arm64 \
-            CONFIGURATION_BUILD_DIR=$PWD/out/Payload \
-            SUPPORTED_PLATFORMS=iphoneos \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
-            OTHER_CFLAGS="-Wno-implicit-function-declaration" \
-            build
-
-      - name: ipa
-        run: |
-          ls -la out/Payload
-          cd out && zip -r probe.ipa Payload
+          SDK=$(xcrun -sdk iphoneos --show-sdk-path)
+          xcrun -sdk iphoneos clang -arch arm64e -arch arm64 -dynamiclib -fobjc-arc -O2 \
+            -isysroot "$SDK" \
+            -framework Foundation -framework UIKit -framework CoreGraphics \
+            -install_name @executable_path/buurd.dylib \
+            -Wl,-undefined,dynamic_lookup \
+            -o out/buurd.dylib buurd.m
+          lipo -info out/buurd.dylib
+          otool -L out/buurd.dylib
+          file out/buurd.dylib
 
       - uses: actions/upload-artifact@v4
         with:
-          name: probe
-          path: out/probe.ipa
+          name: buurd-dylib
+          path: out/buurd.dylib
           if-no-files-found: error
