@@ -11,7 +11,7 @@ jobs:
           mkdir -p Sources
           cat > project.yml <<'PROJEOF'
           name: probe
-          options: { bundleIdPrefix: com.buurza17, deploymentTarget: { iOS: "18.0" } }
+          options: { bundleIdPrefix: com.buurza18, deploymentTarget: { iOS: "18.0" } }
           targets:
             probe:
               type: application
@@ -21,9 +21,9 @@ jobs:
               info:
                 path: Info.plist
                 properties:
-                  CFBundleDisplayName: buurd17
+                  CFBundleDisplayName: buurd18
                   CFBundleShortVersionString: "1.0"
-                  CFBundleVersion: "17"
+                  CFBundleVersion: "18"
                   UILaunchScreen: {}
               settings:
                 ARCHS: "arm64"
@@ -65,13 +65,18 @@ jobs:
           #include <stdlib.h>
           #include <string.h>
           #include <stdio.h>
+          #include <dlfcn.h>
 
           extern kern_return_t mach_vm_region(vm_map_t, mach_vm_address_t *,
               mach_vm_size_t *, vm_region_flavor_t, vm_region_info_t,
               mach_msg_type_number_t *, mach_port_t *);
           extern int csops(pid_t pid, unsigned int ops, void* uaddr, size_t usize);
 
-          #define BUILD_TAG "v17-oracle"
+          typedef struct __SecTask *SecTaskRef;
+          typedef SecTaskRef (*fn_create)(CFAllocatorRef);
+          typedef CFTypeRef (*fn_copy)(SecTaskRef, CFStringRef, CFErrorRef*);
+
+          #define BUILD_TAG "v18-ent"
           #define MAXC 96
           #define STEP_MAX 12
           #define TRY_MAX 2
@@ -101,7 +106,7 @@ jobs:
           static int g_nconn = 0;
 
           static const char* STEP_NAME[STEP_MAX + 1] = {
-              "boot", "census", "self-sign", "vt-init", "vt-encode",
+              "boot", "census", "entitlements", "vt-init", "vt-encode",
               "dump-tree", "child-open", "root-open", "oracle-root",
               "oracle-child", "s4-iso", "single-conn", "map64-0-7"
           };
@@ -294,16 +299,72 @@ jobs:
                   n, (unsigned long)seen.count, jpeg]);
           }
 
+          static void dump_blob(void) {
+              size_t sz = 16384;
+              char* buf = malloc(sz);
+              if (!buf) return;
+              memset(buf, 0, sz);
+              int brc = csops(getpid(), 5, buf, sz);
+              persist([NSString stringWithFormat:@"BLOB rc=%d", brc]);
+              ui([NSString stringWithFormat:@"BLOB rc=%d", brc]);
+              if (brc == 0) {
+                  size_t n = strnlen(buf, sz);
+                  if (n > 8192) n = 8192;
+                  char* s = malloc(n + 1);
+                  if (s) {
+                      for (size_t i = 0; i < n; i++) {
+                          char c = buf[i];
+                          s[i] = (c == '\n' || c == '\t' || (c >= 32 && c < 127)) ? c : '.';
+                      }
+                      s[n] = 0;
+                      persist(@"--- BLOB BEGIN ---");
+                      persist(@(s));
+                      persist(@"--- BLOB END ---");
+                      ui(@"blob written");
+                      free(s);
+                  }
+              }
+              free(buf);
+          }
+
+          static void dump_prov(void) {
+              NSString* p = [[[NSBundle mainBundle] bundlePath]
+                  stringByAppendingPathComponent:@"embedded.mobileprovision"];
+              NSDictionary* a = [[NSFileManager defaultManager] attributesOfItemAtPath:p error:nil];
+              if (!a) { persist(@"PROV none"); ui(@"PROV none"); return; }
+              persist([NSString stringWithFormat:@"PROV size=%llu",
+                       [a fileSize]]);
+              ui([NSString stringWithFormat:@"PROV size=%llu", [a fileSize]]);
+              NSData* d = [NSData dataWithContentsOfFile:p];
+              if (d && d.length > 512) {
+                  NSString* t = [[NSString alloc] initWithData:[d subdataWithRange:NSMakeRange(0, 512)]
+                      encoding:NSUTF8StringEncoding];
+                  if (t) persist(t);
+              }
+          }
+
           static void self_sign(void) {
               unsigned int fl = 0;
               int rc = csops(getpid(), 0, &fl, sizeof(fl));
               persist([NSString stringWithFormat:@"csops rc=%d f=0x%x valid=%d plat=%d dbg=%d gta=%d",
                        rc, fl, (fl & 1) ? 1 : 0, (fl & 0x04000000) ? 1 : 0,
                        (fl & 0x10000000) ? 1 : 0, (fl & 4) ? 1 : 0]);
-              ui([NSString stringWithFormat:@"csops rc=%d f=0x%x", rc, fl]);
-              SecTaskRef t = SecTaskCreateFromSelf(kCFAllocatorDefault);
+              ui([NSString stringWithFormat:@"csops rc=%d f=0x%x plat=%d",
+                  rc, fl, (fl & 0x04000000) ? 1 : 0]);
+
+              dump_blob();
+              dump_prov();
+
+              fn_create create = (fn_create)dlsym(RTLD_DEFAULT, "SecTaskCreateFromSelf");
+              fn_copy copy = (fn_copy)dlsym(RTLD_DEFAULT, "SecTaskCopyValueForEntitlement");
+              persist([NSString stringWithFormat:@"SYM create=%d copy=%d",
+                       create ? 1 : 0, copy ? 1 : 0]);
+              ui([NSString stringWithFormat:@"SYM c=%d v=%d", create ? 1 : 0, copy ? 1 : 0]);
+              if (!create || !copy) { persist(@"sectask unavailable"); return; }
+
+              SecTaskRef t = create(kCFAllocatorDefault);
               if (!t) { persist(@"no sectask"); ui(@"no sectask"); return; }
-              CFTypeRef d = SecTaskCopyValueForEntitlement(t, NULL, NULL);
+              CFTypeRef d = copy(t, NULL, NULL);
               if (d && CFGetTypeID(d) == CFDictionaryGetTypeID()) {
                   CFIndex n = CFDictionaryGetCount((CFDictionaryRef)d);
                   persist([NSString stringWithFormat:@"ENT count=%ld", (long)n]);
@@ -315,11 +376,11 @@ jobs:
                       persist([NSString stringWithFormat:@"  E %@", (__bridge NSString*)keys[i]]);
               } else { persist(@"ENT none"); ui(@"ENT none"); }
               if (d) CFRelease(d);
+
               const char* probe[3] = {"platform-application", "get-task-allow",
                                       "com.apple.private.security.no-container"};
               for (int i = 0; i < 3; i++) {
-                  CFTypeRef v = SecTaskCopyValueForEntitlement(t,
-                      (__bridge CFStringRef)@(probe[i]), NULL);
+                  CFTypeRef v = copy(t, (__bridge CFStringRef)@(probe[i]), NULL);
                   persist([NSString stringWithFormat:@"CHK %s=%s", probe[i], v ? "YES" : "NO"]);
                   ui([NSString stringWithFormat:@"CHK %s=%s", probe[i], v ? "YES" : "NO"]);
                   if (v) CFRelease(v);
