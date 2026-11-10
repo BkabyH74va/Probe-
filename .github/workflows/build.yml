@@ -54,7 +54,7 @@ jobs:
           typedef kern_return_t (*fn_addclient)(io_connect_t, io_connect_t);
           static fn_addclient g_addclient = NULL;
 
-          #define BUILD_TAG "v45-linux"
+          #define BUILD_TAG "v46-linux"
           #define MAXC 40
           #define STEP_MAX 27
           #define TRY_MAX 2
@@ -1334,14 +1334,14 @@ jobs:
           <plist version="1.0"><dict>
             <key>CFBundleDevelopmentRegion</key><string>en</string>
             <key>CFBundleExecutable</key><string>probe</string>
-            <key>CFBundleIdentifier</key><string>com.buurza45.probe</string>
+            <key>CFBundleIdentifier</key><string>com.buurza46.probe</string>
             <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
             <key>CFBundleName</key><string>probe</string>
-            <key>CFBundleDisplayName</key><string>buurd45</string>
+            <key>CFBundleDisplayName</key><string>buurd46</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleShortVersionString</key><string>1.0</string>
-            <key>CFBundleVersion</key><string>47</string>
-            <key>MinimumOSVersion</key><string>17.0</string>
+            <key>CFBundleVersion</key><string>48</string>
+            <key>MinimumOSVersion</key><string>16.0</string>
             <key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
             <key>UILaunchScreen</key><dict/>
             <key>UISupportedInterfaceOrientations</key>
@@ -1404,50 +1404,71 @@ jobs:
       - name: sdk
         run: |
           set -euo pipefail
-          ok=0
-          try() {
-            echo "try $1"
-            code=$(curl -sSL --retry 2 --max-time 240 -o "$2" -w '%{http_code}' "$1" || echo 000)
-            [ "$code" = "200" ] || { echo "  http $code"; return 1; }
-            return 0
+          WS="$PWD"
+          EX="$WS/ex"
+          SDKROOT="$WS/sdkroot"
+          rm -rf "$EX" "$SDKROOT"
+          mkdir -p "$EX" "$SDKROOT"
+
+          pick() {
+            find "$1" -type d -name '*.sdk' 2>/dev/null | sort -V | tail -1
           }
+
+          got=0
+          echo "--- optional newer SDK mirrors"
           for u in \
             "https://github.com/xybp888/iOS-SDKs/raw/master/iPhoneOS17.5.sdk.zip" \
-            "https://github.com/xybp888/iOS-SDKs/raw/master/iPhoneOS17.4.sdk.zip" \
-            "https://github.com/xybp888/iOS-SDKs/raw/master/iPhoneOS17.2.sdk.zip" \
-            "https://github.com/xybp888/iOS-SDKs/raw/master/iPhoneOS17.0.sdk.zip"; do
-            if try "$u" sdk.zip; then ok=1; break; fi
-          done
-          if [ $ok -eq 0 ]; then
-            echo "zip mirrors dead, trying theos tarball"
-            try "https://codeload.github.com/theos/sdks/tar.gz/refs/heads/master" sdk.tar.gz || true
-            if [ -s sdk.tar.gz ]; then
-              tar xzf sdk.tar.gz
-              D=$(ls -d sdks-master/*.sdk 2>/dev/null | sort -V | tail -1)
-              if [ -n "$D" ]; then mkdir -p x && cp -a "$D" x/ && ok=1; fi
+            "https://github.com/xybp888/iOS-SDKs/raw/master/iPhoneOS17.4.sdk.zip"; do
+            echo "try $u"
+            if curl -fsSL --retry 1 --max-time 90 -o sdk.zip "$u"; then
+              if unzip -q -o sdk.zip -d "$EX" 2>/dev/null; then
+                D="$(pick "$EX")"
+                if [ -n "$D" ]; then mv "$D" "$SDKROOT/sdk"; got=1; echo "zip ok"; break; fi
+              fi
             fi
-          else
-            unzip -q sdk.zip
-            D=$(ls -d *.sdk 2>/dev/null | head -1)
-            [ -n "$D" ] && { mkdir -p x; mv "$D" x/; }
+          done
+
+          if [ "$got" -eq 0 ]; then
+            echo "--- theos tarball (primary)"
+            curl -fsSL --retry 3 --retry-delay 3 --max-time 300 -o sdk.tar.gz \
+              "https://codeload.github.com/theos/sdks/tar.gz/refs/heads/master"
+            test -s sdk.tar.gz || { echo "TARBALL EMPTY"; exit 1; }
+            tar xzf sdk.tar.gz -C "$EX"
+            D="$(pick "$EX")"
+            test -n "$D" || { echo "NO .sdk IN TARBALL"; find "$EX" -maxdepth 2 | head -20; exit 1; }
+            mv "$D" "$SDKROOT/sdk"
+            echo "tarball ok"
           fi
-          test $ok -eq 1 || { echo "SDK FETCH FAILED"; ls -la; exit 1; }
-          SDK_DIR="$(cd x && ls -d *.sdk | head -1 && cd .. && pwd)/$(cd x && ls -d *.sdk | head -1)"
-          test -d "$SDK_DIR" || { echo "SDK_DIR bad: $SDK_DIR"; exit 1; }
+
+          SDK_DIR="$SDKROOT/sdk"
+          test -d "$SDK_DIR" || { echo "SDK_DIR MISSING: $SDK_DIR"; ls -la "$SDKROOT"; exit 1; }
           echo "SDK_DIR=$SDK_DIR" >> "$GITHUB_ENV"
-          echo "sdk staged: $SDK_DIR"
+
+          NAME="$(basename "$SDK_DIR")"
+          echo "sdk staged: $NAME"
           ls "$SDK_DIR" | head
-          test -d "$SDK_DIR/System/Library/Frameworks/UIKit.framework" || { echo "NO UIKIT"; exit 1; }
-          test -f "$SDK_DIR/usr/lib/libSystem.tbd" || test -f "$SDK_DIR/usr/lib/libSystem.dylib" || { echo "NO LIBSYSTEM STUB"; exit 1; }
-          MINVER=17.0
-          case "$SDK_DIR" in
-            *iPhoneOS16*) MINVER=16.0 ;;
-            *iPhoneOS15*) MINVER=15.0 ;;
-            *iPhoneOS14*) MINVER=14.0 ;;
-          esac
+
+          test -d "$SDK_DIR/System/Library/Frameworks/UIKit.framework" || { echo "NO UIKIT in $NAME"; exit 1; }
+          if [ ! -f "$SDK_DIR/usr/lib/libSystem.tbd" ] && [ ! -f "$SDK_DIR/usr/lib/libSystem.dylib" ]; then
+            echo "NO libSystem STUB in $NAME"; exit 1
+          fi
+
+          MAJ="$(echo "$NAME" | sed -n 's/^iPhoneOS\([0-9][0-9]*\)\..*/\1/p')"
+          test -n "$MAJ" || { echo "CANNOT PARSE VERSION from $NAME"; exit 1; }
+          if [ "$MAJ" -lt 15 ]; then echo "SDK TOO OLD: $NAME"; exit 1; fi
+          MINVER="$MAJ.0"
+          if [ "$MAJ" -gt 17 ]; then MINVER="17.0"; fi
           echo "MINVER=$MINVER" >> "$GITHUB_ENV"
-          echo "deployment target: $MINVER"
-          sed -i "s#<string>17.0</string>#<string>$MINVER</string>#" out/Payload/probe.app/Info.plist || true
+          echo "deployment target: $MINVER (sdk $MAJ)"
+
+          python3 - "$MINVER" <<'PY'
+          import plistlib, sys
+          p = 'out/Payload/probe.app/Info.plist'
+          d = plistlib.load(open(p, 'rb'))
+          d['MinimumOSVersion'] = sys.argv[1]
+          plistlib.dump(d, open(p, 'wb'))
+          print('plist minver ->', sys.argv[1])
+          PY
 
       - name: syntax
         run: |
@@ -1557,7 +1578,7 @@ jobs:
           mkdir -p "$APP"
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
           xcrun -sdk iphoneos clang \
-            -arch arm64 -miphoneos-version-min=17.0 -fobjc-arc \
+            -arch arm64 -miphoneos-version-min=16.0 -fobjc-arc \
             -isysroot "$SDK" -O1 -Wno-implicit-function-declaration \
             -framework UIKit -framework Foundation -framework CoreFoundation \
             -framework IOKit -framework VideoToolbox -framework CoreMedia \
