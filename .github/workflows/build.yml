@@ -5,20 +5,15 @@ permissions:
   contents: read
   actions: write
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  ipa:
-    runs-on: macos-latest
-    timeout-minutes: 30
+  stage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
-
-      - name: env
-        run: |
-          uname -a
-          xcodebuild -version
-          xcrun --sdk iphoneos --show-sdk-version
-          xcrun --sdk iphoneos --show-sdk-path
-
       - name: prune
         continue-on-error: true
         env:
@@ -33,7 +28,7 @@ jobs:
 
       - name: source
         run: |
-          mkdir -p Sources
+          mkdir -p Sources out/Payload/probe.app
           cat > Sources/main.m <<'MAINEOF'
           #import <UIKit/UIKit.h>
           #import <IOKit/IOKitLib.h>
@@ -60,7 +55,7 @@ jobs:
           typedef kern_return_t (*fn_addclient)(io_connect_t, io_connect_t);
           static fn_addclient g_addclient = NULL;
 
-          #define BUILD_TAG "v42-grepfix"
+          #define BUILD_TAG "v43-stage"
           #define MAXC 40
           #define STEP_MAX 27
           #define TRY_MAX 2
@@ -1334,20 +1329,19 @@ jobs:
 
       - name: plist
         run: |
-          mkdir -p out/Payload/probe.app
           cat > out/Payload/probe.app/Info.plist <<'PEOF'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0"><dict>
             <key>CFBundleDevelopmentRegion</key><string>en</string>
             <key>CFBundleExecutable</key><string>probe</string>
-            <key>CFBundleIdentifier</key><string>com.buurza42.probe</string>
+            <key>CFBundleIdentifier</key><string>com.buurza43.probe</string>
             <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
             <key>CFBundleName</key><string>probe</string>
-            <key>CFBundleDisplayName</key><string>buurd42</string>
+            <key>CFBundleDisplayName</key><string>buurd43</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleShortVersionString</key><string>1.0</string>
-            <key>CFBundleVersion</key><string>44</string>
+            <key>CFBundleVersion</key><string>45</string>
             <key>MinimumOSVersion</key><string>17.0</string>
             <key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
             <key>UILaunchScreen</key><dict/>
@@ -1358,7 +1352,46 @@ jobs:
             <key>DTSDKName</key><string>iphoneos</string>
           </dict></plist>
           PEOF
+          python3 -c "import plistlib;plistlib.load(open('out/Payload/probe.app/Info.plist','rb'));print('plist ok')"
+          wc -c Sources/main.m
+          md5sum Sources/main.m
+
+      - uses: actions/upload-artifact@v4.6.2
+        with:
+          name: src-${{ github.run_number }}-${{ github.run_attempt }}
+          path: |
+            Sources/main.m
+            out/Payload/probe.app/Info.plist
+          retention-days: 3
+          compression-level: 0
+
+  ipa:
+    needs: stage
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4.1.8
+        with:
+          name: src-${{ github.run_number }}-${{ github.run_attempt }}
+
+      - name: env
+        run: |
+          uname -a
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: layout
+        run: |
+          set -e
+          mkdir -p out/Payload/probe.app
+          test -f Sources/main.m || { echo "NO SOURCE"; ls -R; exit 1; }
+          test -f out/Payload/probe.app/Info.plist || { echo "NO PLIST"; ls -R; exit 1; }
+          mv out/Payload/probe.app/Info.plist /tmp/Info.plist
+          mkdir -p out/Payload/probe.app
+          mv /tmp/Info.plist out/Payload/probe.app/Info.plist
           plutil -lint out/Payload/probe.app/Info.plist
+          ls -la Sources out/Payload/probe.app
 
       - name: syntax
         run: |
