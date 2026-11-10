@@ -5,46 +5,42 @@
 #import <mach/mach_vm.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <pthread.h>
 
-// ===== PRZELACZNIKI FAZ =====
-#define PH_MEMMAP 1
-#define PH_CMD    1
-#define PH_HMAP   1
-#define PH_INV    1
-#define PH_MIX    1
-#define PH_FUZZ   1
-// ============================
-
-#define USE_CONNS 8
-#define UI_LINES  250
+#define MAXC 24
+#define STEP_MAX 18
 
 static UITextView* g_tv;
 static UILabel* g_hb;
 static NSMutableArray* g_lines;
 static NSString* g_phase = @"idle";
 static volatile int g_hits = 0, g_done = 0;
+static volatile int g_step = 0;
 static int g_fd = -1;
 static NSMutableSet* g_seen;
 static pthread_mutex_t g_lk = PTHREAD_MUTEX_INITIALIZER;
 
-#define MAXC 24
 static io_connect_t g_conn[MAXC];
 static uint32_t g_ctype[MAXC];
 static int g_nconn = 0;
 
+static const char* STEP_NAME[STEP_MAX + 1] = {
+    "boot-only", "open-1", "open-all", "s4-zero", "s5-zero",
+    "mm-0", "mm-0-7", "mm-8-31", "cmd5-124-0-31", "cmd5-124-full",
+    "cmd5-126", "cmd5-128", "hmap5-128-255", "hmap5-256-511",
+    "hmap5-512-4095", "hmap4-128-511", "inv5", "inv4", "fuzz-200"
+};
+
 static void ui(NSString* s) {
     dispatch_async(dispatch_get_main_queue(), ^{
         [g_lines addObject:s];
-        if (g_lines.count > UI_LINES) {
-            [g_lines removeObjectsInRange:NSMakeRange(0, 50)];
-        }
+        if (g_lines.count > 200) [g_lines removeObjectsInRange:NSMakeRange(0, 40)];
     });
 }
 static void flush_ui(void) {
     g_tv.text = [g_lines componentsJoinedByString:@"\n"];
-    if (g_lines.count)
-        [g_tv scrollRangeToVisible:NSMakeRange(g_tv.text.length, 0)];
+    if (g_lines.count) [g_tv scrollRangeToVisible:NSMakeRange(g_tv.text.length, 0)];
 }
 static void persist(NSString* s) {
     if (g_fd < 0) return;
@@ -53,10 +49,21 @@ static void persist(NSString* s) {
     write(g_fd, d.bytes, d.length);
     pthread_mutex_unlock(&g_lk);
 }
+static void bread(const char* tag) {
+    persist([NSString stringWithFormat:@"PRE step=%d %s", g_step, tag]);
+    if (g_fd >= 0) fsync(g_fd);
+}
 static void phase(NSString* p) {
     g_phase = p;
-    persist([NSString stringWithFormat:@"=== PHASE %@ calls=%d hits=%d", p, g_done, g_hits]);
     ui([NSString stringWithFormat:@"=== %@", p]);
+}
+static void sigh(int sig) {
+    char b[96];
+    int n = snprintf(b, sizeof(b), "SIGNAL %d at step %d (%s)\n",
+                     sig, g_step, STEP_NAME[g_step < STEP_MAX+1 ? g_step : STEP_MAX]);
+    if (g_fd >= 0) { write(g_fd, b, n); fsync(g_fd); }
+    signal(sig, SIG_DFL);
+    raise(sig);
 }
 static NSString* kr_name(kern_return_t kr) {
     switch (kr) {
@@ -76,19 +83,29 @@ static NSString* kr_name(kern_return_t kr) {
 }
 static NSString* hex(const uint8_t* p, size_t n) {
     if (!n) return @"-";
-    if (n > 512) n = 512;
+    if (n > 64) n = 64;
     NSMutableString* s = [NSMutableString string];
     for (size_t i = 0; i < n; i++) [s appendFormat:@"%02x", p[i]];
     return s;
 }
-static void state_path(char* b, size_t n) {
+static void doc_path(const char* f, char* b, size_t n) {
     NSString* p = [NSSearchPathForDirectoriesInDomains(
         NSDocumentDirectory, NSUserDomainMask, YES).firstObject
-        stringByAppendingPathComponent:@"state.txt"];
+        stringByAppendingPathComponent:@(f)];
     strncpy(b, p.UTF8String, n - 1);
 }
+static int load_step(void) {
+    char b[512]; doc_path("step.txt", b, sizeof(b));
+    NSString* s = [NSString stringWithContentsOfFile:@(b) encoding:NSUTF8StringEncoding error:nil];
+    return s ? s.intValue : 0;
+}
+static void save_step(int v) {
+    char b[512]; doc_path("step.txt", b, sizeof(b));
+    [[NSString stringWithFormat:@"%d", v] writeToFile:@(b) atomically:YES
+        encoding:NSUTF8StringEncoding error:nil];
+}
 static void load_state(void) {
-    char b[512]; state_path(b, sizeof(b));
+    char b[512]; doc_path("state.txt", b, sizeof(b));
     NSString* s = [NSString stringWithContentsOfFile:@(b) encoding:NSUTF8StringEncoding error:nil];
     for (NSString* ln in [s componentsSeparatedByString:@"\n"]) {
         if (ln.length < 5) continue;
@@ -108,6 +125,7 @@ static kern_return_t callp(const char* tag, io_connect_t c, uint32_t t, uint32_t
                            const uint8_t* in, size_t sz, size_t outsz, BOOL always) {
     NSString* key = [NSString stringWithFormat:@"%u:%u:%zu:%zu:%s", t, sel, sz, outsz, tag];
     if (seen_key(key)) return (kern_return_t)0xdeadbeef;
+    bread(tag);
     uint8_t out[4096]; size_t oSz = outsz;
     memset(out, 0xCC, sizeof(out));
     kern_return_t kr = IOConnectCallStructMethod(c, sel, in, sz, outsz ? out : NULL, &oSz);
@@ -116,107 +134,117 @@ static kern_return_t callp(const char* tag, io_connect_t c, uint32_t t, uint32_t
         persist([NSString stringWithFormat:@"OK %s t%u s%u out=%zu %@ IN %@",
                  tag, t, sel, oSz, hex(out, oSz), hex(in, sz)]);
         __sync_fetch_and_add(&g_hits, 1);
-        ui([NSString stringWithFormat:@"!!! OK %s t%u s%u out=%zu %@",
-            tag, t, sel, oSz, hex(out, oSz)]);
+        ui([NSString stringWithFormat:@"!!! OK %s out=%zu %@", tag, oSz, hex(out, oSz)]);
     } else if (kr != 0xe00002c2 && kr != 0xe00002c7) {
-        persist([NSString stringWithFormat:@"%u %u %zu %@ %zu %@ | %s",
-                 t, sel, sz, kr_name(kr), oSz, hex(out, 24), tag]);
+        persist([NSString stringWithFormat:@"%u %u %zu %@ | %s",
+                 t, sel, sz, kr_name(kr), tag]);
         __sync_fetch_and_add(&g_hits, 1);
-        ui([NSString stringWithFormat:@"!! %s t%u s%u -> %@ %@",
-            tag, t, sel, kr_name(kr), hex(out, 24)]);
+        ui([NSString stringWithFormat:@"!! %s -> %@", tag, kr_name(kr)]);
     } else {
-        persist([NSString stringWithFormat:@"%u %u %zu %@ %zu - | %s",
-                 t, sel, sz, kr_name(kr), oSz, tag]);
-        if (always) ui([NSString stringWithFormat:@"%s t%u s%u -> %@",
-                        tag, t, sel, kr_name(kr)]);
+        persist([NSString stringWithFormat:@"%u %u %zu %@ | %s", t, sel, sz, kr_name(kr), tag]);
+        if (always) ui([NSString stringWithFormat:@"%s -> %@", tag, kr_name(kr)]);
     }
     usleep(300);
     return kr;
 }
 
-static void cmd_hunt(io_connect_t c, uint32_t t, uint32_t sel) {
-    int offs[] = { 120, 124, 126, 128 };
-    for (int o = 0; o < 4; o++) {
-        for (uint32_t v = 0; v <= 255; v++) {
-            uint8_t* in = calloc(1, 4096);
-            if (offs[o] == 126) { uint16_t h = v; memcpy(in + 126, &h, 2); }
-            else memcpy(in + offs[o], &v, 4);
-            char tg[40]; snprintf(tg, sizeof(tg), "cmd%u.%u", offs[o], v);
-            callp(tg, c, t, sel, in, 4096, 4096, NO);
-            free(in);
+static void open_n(int n) {
+    io_iterator_t it = 0;
+    if (IOServiceGetMatchingServices(kIOMainPortDefault,
+            IOServiceMatching("AppleJPEGDriver"), &it) != KERN_SUCCESS) return;
+    io_service_t s = IOIteratorNext(it);
+    if (!s) { IOObjectRelease(it); return; }
+    for (int t = 0; t <= 40 && g_nconn < n && g_nconn < MAXC; t++) {
+        io_connect_t c = 0;
+        if (IOServiceOpen(s, mach_task_self(), (uint32_t)t, &c) == KERN_SUCCESS) {
+            g_conn[g_nconn] = c; g_ctype[g_nconn] = (uint32_t)t; g_nconn++;
         }
     }
-    ui([NSString stringWithFormat:@"cmd_hunt s%u done", sel]);
+    IOObjectRelease(s); IOObjectRelease(it);
 }
 
-static int shard_n(void) {
-    int n = g_nconn < USE_CONNS ? g_nconn : USE_CONNS;
-    return n < 1 ? 1 : n;
+static void s_zero(uint32_t sel) {
+    uint8_t* in = calloc(1, 4096);
+    char tg[32]; snprintf(tg, sizeof(tg), "z%u", sel);
+    callp(tg, g_conn[0], g_ctype[0], sel, in, 4096, 4096, YES);
+    free(in);
 }
 
-static void par_hmap(io_connect_t c, uint32_t t, uint32_t sel) {
-    int sh = shard_n();
-    dispatch_group_t g = dispatch_group_create();
-    int lo = 128, hi = 4095, span = (hi - lo) / sh + 1;
-    for (int n = 0; n < sh; n++) {
-        dispatch_group_async(g, dispatch_get_global_queue(0,0), ^{
-            int a = lo + n * span, b = a + span; if (b > hi + 1) b = hi + 1;
-            uint8_t* in = calloc(1, 4096);
-            for (int i = a; i < b; i++) {
-                in[i] = 0xFF;
-                char tg[40]; snprintf(tg, sizeof(tg), "h%u.%d", sel, i);
-                callp(tg, g_conn[n], g_ctype[n], sel, in, 4096, 4096, NO);
-                in[i] = 0;
-            }
-            free(in);
-        });
+static size_t map_extent(mach_vm_address_t addr, mach_vm_size_t claim, BOOL* wr) {
+    *wr = NO;
+    mach_vm_address_t q = addr; mach_vm_size_t qsz = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_port_t obj = MACH_PORT_NULL;
+    mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+    kern_return_t r = mach_vm_region(mach_task_self(), &q, &qsz, VM_REGION_BASIC_INFO_64,
+                                     (vm_region_info_t)&info, &cnt, &obj);
+    if (obj != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), obj);
+    if (r != KERN_SUCCESS) return 0;
+    *wr = (info.protection & VM_PROT_WRITE) != 0;
+    size_t real = (size_t)qsz;
+    if (real > (size_t)claim) real = (size_t)claim;
+    if (real > (1u << 20)) real = 1u << 20;
+    return real;
+}
+
+static void mm_range(uint32_t lo, uint32_t hi) {
+    for (uint32_t mt = lo; mt <= hi; mt++) {
+        char tg[32]; snprintf(tg, sizeof(tg), "mm%u", mt);
+        bread(tg);
+        mach_vm_address_t addr = 0; mach_vm_size_t size = 0;
+        kern_return_t kr = IOConnectMapMemory64(g_conn[0], mt, mach_task_self(),
+                                                &addr, &size, kIOMapAnywhere);
+        persist([NSString stringWithFormat:@"map %u %@ %llu | %s", mt, kr_name(kr), size, tg]);
+        if (kr != KERN_SUCCESS) { ui([NSString stringWithFormat:@"%s -> %@", tg, kr_name(kr)]); continue; }
+        __sync_fetch_and_add(&g_hits, 1);
+        BOOL wr = NO; size_t ext = map_extent(addr, size, &wr);
+        ui([NSString stringWithFormat:@"!!! %s claim=%llu real=%zu wr=%d", tg, size, ext, (int)wr]);
+        if (ext >= 64 && wr) {
+            uint8_t* p = (uint8_t*)addr;
+            ui([NSString stringWithFormat:@"    pre %@", hex(p, ext > 64 ? 64 : ext)]);
+            memset(p, 0xFF, ext > 4096 ? 4096 : ext);
+            s_zero(5); s_zero(4);
+            ui([NSString stringWithFormat:@"    post %@", hex(p, ext > 64 ? 64 : ext)]);
+        } else if (ext >= 64) ui(@"    read-only");
+        IOConnectUnmapMemory64(g_conn[0], mt, mach_task_self(), addr);
     }
-    dispatch_group_wait(g, DISPATCH_TIME_FOREVER);
-    ui([NSString stringWithFormat:@"par_hmap s%u done", sel]);
 }
 
-static void par_imap(io_connect_t c, uint32_t t, uint32_t sel) {
-    int sh = shard_n();
-    dispatch_group_t g = dispatch_group_create();
-    int lo = 0, hi = 511, span = (hi - lo) / sh + 1;
-    for (int n = 0; n < sh; n++) {
-        dispatch_group_async(g, dispatch_get_global_queue(0,0), ^{
-            int a = lo + n * span, b = a + span; if (b > hi + 1) b = hi + 1;
-            uint8_t* in = malloc(4096);
-            memset(in, 0xFF, 4096);
-            for (int i = a; i < b; i++) {
-                in[i] = 0;
-                char tg[40]; snprintf(tg, sizeof(tg), "i%u.%d", sel, i);
-                callp(tg, g_conn[n], g_ctype[n], sel, in, 4096, 4096, NO);
-                in[i] = 0xFF;
-            }
-            free(in);
-        });
-    }
-    dispatch_group_wait(g, DISPATCH_TIME_FOREVER);
-    ui([NSString stringWithFormat:@"par_imap s%u done", sel]);
-}
-
-static void mixed(io_connect_t c, uint32_t t, uint32_t sel) {
-    for (uint32_t ic = 0; ic <= 6; ic++) {
-        uint64_t inS[8] = {0}, outS[16] = {0}; uint32_t oc = 16;
+static void cmd_at(uint32_t off, uint32_t from, uint32_t to) {
+    for (uint32_t v = from; v <= to; v++) {
         uint8_t* in = calloc(1, 4096);
-        uint8_t out[4096]; size_t oSz = sizeof(out);
-        memset(out, 0xCC, sizeof(out));
-        kern_return_t kr = IOConnectCallMethod(c, sel, inS, ic, in, 4096,
-                                              outS, &oc, out, &oSz);
+        if (off == 126) { uint16_t h = v; memcpy(in + 126, &h, 2); }
+        else memcpy(in + off, &v, 4);
+        char tg[40]; snprintf(tg, sizeof(tg), "cmd%u.%u", off, v);
+        callp(tg, g_conn[0], g_ctype[0], 5, in, 4096, 4096, NO);
         free(in);
-        char tg[32]; snprintf(tg, sizeof(tg), "m%u.%u", sel, ic);
-        persist([NSString stringWithFormat:@"%u %u mixed %@ | %s", t, sel, kr_name(kr), tg]);
-        if (kr != 0xe00002c2 && kr != 0xe00002c7) {
-            ui([NSString stringWithFormat:@"!! %s -> %@ oc=%u %@", tg, kr_name(kr), oc, hex(out, oSz)]);
-        } else {
-            ui([NSString stringWithFormat:@"%s -> %@", tg, kr_name(kr)]);
-        }
     }
 }
 
-static void fuzz(io_connect_t c, uint32_t t, uint32_t sel, int rounds) {
+static void hmap(uint32_t sel, int lo, int hi) {
+    uint8_t* in = calloc(1, 4096);
+    for (int i = lo; i <= hi; i++) {
+        in[i] = 0xFF;
+        char tg[40]; snprintf(tg, sizeof(tg), "h%u.%d", sel, i);
+        callp(tg, g_conn[0], g_ctype[0], sel, in, 4096, 4096, NO);
+        in[i] = 0;
+    }
+    free(in);
+}
+
+static void imap(uint32_t sel) {
+    uint8_t* in = malloc(4096);
+    memset(in, 0xFF, 4096);
+    for (int i = 0; i < 512; i++) {
+        in[i] = 0;
+        char tg[40]; snprintf(tg, sizeof(tg), "i%u.%d", sel, i);
+        callp(tg, g_conn[0], g_ctype[0], sel, in, 4096, 4096, NO);
+        in[i] = 0xFF;
+    }
+    free(in);
+}
+
+static void fuzz(int rounds) {
     for (int r = 0; r < rounds; r++) {
         uint8_t* in = calloc(1, 4096);
         uint32_t n = 1 + arc4random_uniform(6);
@@ -226,158 +254,62 @@ static void fuzz(io_connect_t c, uint32_t t, uint32_t sel, int rounds) {
                                        0x100000,0x7fffffff,0xffffffff }[arc4random_uniform(12)];
             memcpy(in + off, &v, 4);
         }
-        char tg[32]; snprintf(tg, sizeof(tg), "f%u.%d", sel, r);
-        callp(tg, c, t, sel, in, 4096, 4096, NO);
+        char tg[32]; snprintf(tg, sizeof(tg), "f.%d", r);
+        callp(tg, g_conn[0], g_ctype[0], 5, in, 4096, 4096, NO);
         free(in);
     }
-    ui([NSString stringWithFormat:@"fuzz s%u done", sel]);
-}
-
-static void open_all(void) {
-    io_iterator_t it = 0;
-    if (IOServiceGetMatchingServices(kIOMainPortDefault,
-            IOServiceMatching("AppleJPEGDriver"), &it) != KERN_SUCCESS) return;
-    io_service_t s; int nodes = 0;
-    while ((s = IOIteratorNext(it)) && nodes < 1 && g_nconn < MAXC) {
-        nodes++;
-        for (int t = 0; t <= 40 && g_nconn < MAXC; t++) {
-            io_connect_t c = 0;
-            if (IOServiceOpen(s, mach_task_self(), (uint32_t)t, &c) == KERN_SUCCESS) {
-                g_conn[g_nconn] = c; g_ctype[g_nconn] = (uint32_t)t; g_nconn++;
-            }
-        }
-        IOObjectRelease(s);
-    }
-    IOObjectRelease(it);
-}
-
-// sprawdza realny zasieg mapy zanim cokolwiek dotknie
-static size_t map_extent(mach_vm_address_t addr, mach_vm_size_t claim, BOOL* writable) {
-    *writable = NO;
-    mach_vm_address_t q = addr;
-    mach_vm_size_t qsz = 0;
-    vm_region_basic_info_data_64_t info;
-    mach_port_t obj = MACH_PORT_NULL;
-    mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
-    kern_return_t r = mach_vm_region(mach_task_self(), &q, &qsz, VM_REGION_BASIC_INFO_64,
-                                     (vm_region_info_t)&info, &cnt, &obj);
-    if (obj != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), obj);
-    if (r != KERN_SUCCESS) return 0;
-    *writable = (info.protection & VM_PROT_WRITE) != 0;
-    size_t real = (size_t)qsz;
-    if (real > (size_t)claim) real = (size_t)claim;
-    if (real > (16u << 20)) real = 16u << 20;
-    return real;
-}
-
-static void memmap_sweep(io_connect_t c, uint32_t t) {
-    for (uint32_t mt = 0; mt < 32; mt++) {
-        mach_vm_address_t addr = 0;
-        mach_vm_size_t size = 0;
-        kern_return_t kr = IOConnectMapMemory64(c, mt, mach_task_self(),
-                                                &addr, &size, kIOMapAnywhere);
-        char tg[32]; snprintf(tg, sizeof(tg), "mm%u", mt);
-        persist([NSString stringWithFormat:@"%u map %u %@ %llu %llu | %s",
-                 t, mt, kr_name(kr), addr, size, tg]);
-        if (kr != KERN_SUCCESS) {
-            ui([NSString stringWithFormat:@"%s -> %@", tg, kr_name(kr)]);
-            continue;
-        }
-        __sync_fetch_and_add(&g_hits, 1);
-
-        BOOL wr = NO;
-        size_t ext = map_extent(addr, size, &wr);
-        ui([NSString stringWithFormat:@"!!! %s MAPPED claim=%llu real=%zu wr=%d @%llx",
-            tg, size, ext, (int)wr, addr]);
-
-        if (ext >= 64 && wr) {
-            uint8_t* p = (uint8_t*)addr;
-            size_t dump = ext > 64 ? 64 : ext;
-            NSMutableString* hx = [NSMutableString string];
-            for (size_t i = 0; i < dump; i++) [hx appendFormat:@"%02x", p[i]];
-            ui([NSString stringWithFormat:@"    pre %@", hx]);
-
-            size_t touch = ext > 4096 ? 4096 : ext;
-            memset(p, 0xFF, touch);
-
-            uint8_t* in = calloc(1, 4096);
-            callp("post_mm", c, t, 5, in, 4096, 4096, YES);
-            callp("post_mm4", c, t, 4, in, 4096, 4096, YES);
-            free(in);
-
-            hx = [NSMutableString string];
-            for (size_t i = 0; i < dump; i++) [hx appendFormat:@"%02x", p[i]];
-            ui([NSString stringWithFormat:@"    post %@", hx]);
-        } else if (ext >= 64) {
-            ui(@"    read-only, skip memset");
-        }
-        IOConnectUnmapMemory64(c, mt, mach_task_self(), addr);
-    }
-    ui(@"memmap_sweep done");
 }
 
 static void run(void) {
-    char b[512]; state_path(b, sizeof(b));
+    char b[512]; doc_path("state.txt", b, sizeof(b));
     g_fd = open(b, O_CREAT | O_WRONLY | O_APPEND, 0644);
     g_seen = [NSMutableSet set];
     load_state();
-    phase(@"boot");
-    ui([NSString stringWithFormat:@"resume=%lu", (unsigned long)g_seen.count]);
+    g_step = load_step();
 
-    VTCompressionSessionRef v = NULL;
-    VTCompressionSessionCreate(NULL, 1920, 1080, kCMVideoCodecType_H264,
-        NULL, NULL, NULL, NULL, NULL, &v);
-    if (v) VTCompressionSessionPrepareToEncodeFrames(v);
-    usleep(200000);
+    persist([NSString stringWithFormat:@"=== LAUNCH step=%d %s", g_step,
+             STEP_NAME[g_step < STEP_MAX+1 ? g_step : STEP_MAX]]);
+    if (g_fd >= 0) fsync(g_fd);
+    ui([NSString stringWithFormat:@"STEP %d: %s", g_step, STEP_NAME[g_step < STEP_MAX+1 ? g_step : STEP_MAX]]);
 
-    phase(@"open");
-    open_all();
-    ui([NSString stringWithFormat:@"conns=%d shard=%d", g_nconn, shard_n()]);
-    if (!g_nconn) return;
+    if (g_step > STEP_MAX) { ui(@"ALL STEPS DONE"); return; }
 
-    io_connect_t c = g_conn[0]; uint32_t t = g_ctype[0];
+    if (g_step >= 1) {
+        VTCompressionSessionRef v = NULL;
+        VTCompressionSessionCreate(NULL, 1920, 1080, kCMVideoCodecType_H264,
+            NULL, NULL, NULL, NULL, NULL, &v);
+        if (v) VTCompressionSessionPrepareToEncodeFrames(v);
+        usleep(200000);
+        open_n(g_step >= 2 ? MAXC : 1);
+        ui([NSString stringWithFormat:@"conns=%d", g_nconn]);
+        if (!g_nconn) { ui(@"NO CONN"); return; }
+    }
 
-#if PH_MEMMAP
-    phase(@"memmap");
-    memmap_sweep(g_conn[0], g_ctype[0]);
-    if (g_nconn > 1) memmap_sweep(g_conn[1], g_ctype[1]);
-#endif
+    switch (g_step) {
+        case 0: break;
+        case 1: case 2: break;
+        case 3: s_zero(4); break;
+        case 4: s_zero(5); break;
+        case 5: mm_range(0, 0); break;
+        case 6: mm_range(0, 7); break;
+        case 7: mm_range(8, 31); break;
+        case 8: cmd_at(124, 0, 31); break;
+        case 9: cmd_at(124, 32, 255); break;
+        case 10: cmd_at(126, 0, 255); break;
+        case 11: cmd_at(128, 0, 255); break;
+        case 12: hmap(5, 128, 255); break;
+        case 13: hmap(5, 256, 511); break;
+        case 14: hmap(5, 512, 4095); break;
+        case 15: hmap(4, 128, 511); break;
+        case 16: imap(5); break;
+        case 17: imap(4); break;
+        case 18: fuzz(200); break;
+    }
 
-#if PH_CMD
-    phase(@"cmd5");
-    cmd_hunt(c, t, 5);
-    phase(@"cmd4");
-    cmd_hunt(c, t, 4);
-#endif
-
-#if PH_HMAP
-    phase(@"hmap5");
-    par_hmap(c, t, 5);
-    phase(@"hmap4");
-    par_hmap(c, t, 4);
-#endif
-
-#if PH_INV
-    phase(@"inv5");
-    par_imap(c, t, 5);
-    phase(@"inv4");
-    par_imap(c, t, 4);
-#endif
-
-#if PH_MIX
-    phase(@"mix");
-    mixed(c, t, 5);
-    mixed(c, t, 4);
-#endif
-
-#if PH_FUZZ
-    phase(@"fuzz");
-    fuzz(c, t, 5, 400);
-    fuzz(c, t, 4, 400);
-#endif
-
-    phase(@"done");
-    ui([NSString stringWithFormat:@"FINISHED calls=%d hits=%d", g_done, g_hits]);
+    persist([NSString stringWithFormat:@"STEP %d OK calls=%d hits=%d", g_step, g_done, g_hits]);
+    if (g_fd >= 0) fsync(g_fd);
+    save_step(g_step + 1);
+    ui([NSString stringWithFormat:@"STEP %d SURVIVED — relaunch for %d", g_step, g_step + 1]);
     close(g_fd); g_fd = -1;
 }
 
@@ -388,20 +320,22 @@ static void run(void) {
 @implementation AppDelegate
 - (BOOL)application:(UIApplication*)a didFinishLaunchingWithOptions:(NSDictionary*)o {
     g_lines = [NSMutableArray array];
+    signal(SIGSEGV, sigh); signal(SIGBUS, sigh); signal(SIGABRT, sigh);
+    signal(SIGILL, sigh); signal(SIGFPE, sigh);
 
-    NSSetUncaughtExceptionHandler(NULL);
     self.w = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
     UIViewController* vc = [UIViewController new];
     vc.view.backgroundColor = UIColor.blackColor;
 
-    g_hb = [[UILabel alloc] initWithFrame:CGRectMake(8, 50, 340, 18)];
+    g_hb = [[UILabel alloc] initWithFrame:CGRectMake(8, 44, 344, 44)];
     g_hb.textColor = UIColor.systemYellowColor;
-    g_hb.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
-    g_hb.text = @"idle";
+    g_hb.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
+    g_hb.numberOfLines = 2;
+    g_hb.text = @"boot";
     [vc.view addSubview:g_hb];
 
     CGRect r = vc.view.bounds;
-    r.origin.y = 72; r.size.height -= 80;
+    r.origin.y = 92; r.size.height -= 100;
     g_tv = [[UITextView alloc] initWithFrame:r];
     g_tv.backgroundColor = UIColor.blackColor;
     g_tv.textColor = UIColor.greenColor;
@@ -415,7 +349,8 @@ static void run(void) {
     [self.w makeKeyAndVisible];
 
     [NSTimer scheduledTimerWithTimeInterval:0.25 repeats:YES block:^(NSTimer* tm) {
-        g_hb.text = [NSString stringWithFormat:@"%@ c=%d h=%d", g_phase, g_done, g_hits];
+        g_hb.text = [NSString stringWithFormat:@"step %d/%d c=%d h=%d",
+                     g_step, STEP_MAX, g_done, g_hits];
         flush_ui();
     }];
 
