@@ -11,9 +11,16 @@ concurrency:
 
 jobs:
   ipa:
-    runs-on: macos-latest
+    runs-on: macos-15
     timeout-minutes: 20
     steps:
+      - name: runner
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          df -h /
+
       - name: source
         run: |
           mkdir -p Sources out/Payload/probe.app
@@ -44,7 +51,7 @@ jobs:
           typedef kern_return_t (*fn_addclient)(io_connect_t, io_connect_t);
           static fn_addclient g_addclient = NULL;
 
-          #define BUILD_TAG "v48-single"
+          #define BUILD_TAG "v49-pinned"
           #define MAXC 40
           #define STEP_MAX 27
           #define TRY_MAX 2
@@ -1327,10 +1334,10 @@ jobs:
             <key>CFBundleIdentifier</key><string>com.buurza47.probe</string>
             <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
             <key>CFBundleName</key><string>probe</string>
-            <key>CFBundleDisplayName</key><string>buurd48</string>
+            <key>CFBundleDisplayName</key><string>buurd49</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleShortVersionString</key><string>1.0</string>
-            <key>CFBundleVersion</key><string>50</string>
+            <key>CFBundleVersion</key><string>51</string>
             <key>MinimumOSVersion</key><string>16.0</string>
             <key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
             <key>UILaunchScreen</key><dict/>
@@ -1385,4 +1392,3 @@ jobs:
           path: out/probe.ipa
           if-no-files-found: error
           retention-days: 3
-          compression-level: 0
