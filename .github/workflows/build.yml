@@ -58,9 +58,6 @@ jobs:
           #include <fcntl.h>
           #include <pthread.h>
 
-          extern int csops(pid_t, unsigned int, void *, size_t);
-          #define CS_OPS_STATUS 0
-
           static UITextView* g_tv;
           static UILabel* g_hb;
           static int g_hits = 0, g_done = 0;
@@ -73,8 +70,8 @@ jobs:
           static uint32_t g_ctype[MAXC];
           static int g_nconn = 0;
 
-          static int g_off5[128]; static int g_n5 = 0;
-          static int g_off4[128]; static int g_n4 = 0;
+          static int g_o5[512]; static int g_n5 = 0;
+          static int g_o4[1024]; static int g_n4 = 0;
 
           static void ui(NSString* s) {
               dispatch_async(dispatch_get_main_queue(), ^{
@@ -107,7 +104,7 @@ jobs:
           }
           static NSString* hex(const uint8_t* p, size_t n) {
               if (!n) return @"-";
-              if (n > 32) n = 32;
+              if (n > 24) n = 24;
               NSMutableString* s = [NSMutableString string];
               for (size_t i = 0; i < n; i++) [s appendFormat:@"%02x", p[i]];
               return s;
@@ -152,62 +149,94 @@ jobs:
               } else if (always) {
                   ui([NSString stringWithFormat:@"%s t%u s%u -> %@", tag, t, sel, kr_name(kr)]);
               }
-              usleep(1200);
+              usleep(1000);
               return kr;
           }
 
-          static void ladder(io_connect_t c, uint32_t t, uint32_t sel) {
-              size_t L[] = { 4096, 4097, 4112, 4224, 4608, 8192, 16384, 65536 };
-              for (int i = 0; i < 8; i++) {
-                  uint8_t* in = calloc(1, L[i]);
-                  char tg[24]; snprintf(tg, sizeof(tg), "lad%u", sel);
-                  callp(tg, c, t, sel, in, L[i], 4096, YES);
-                  free(in);
-              }
-          }
-
-          static void hitmap(io_connect_t c, uint32_t t, uint32_t sel, int* store, int* nstore) {
+          // hitmap: jeden bajt 0xFF w zerach
+          static void hmap(io_connect_t c, uint32_t t, uint32_t sel, int from, int to, int step,
+                           const char* pfx, int* store, int* nst) {
               uint8_t* in = calloc(1, 4096);
-              for (int i = 0; i < 128; i++) {
+              for (int i = from; i < to; i += step) {
                   in[i] = 0xFF;
-                  char tg[28]; snprintf(tg, sizeof(tg), "hm%u.%d", sel, i);
-                  kern_return_t kr = callp(tg, c, t, sel, in, 4096, 4096, YES);
-                  if (kr == 0xe00002c2) {
-                      if (*nstore < 128) store[(*nstore)++] = i;
-                  }
+                  char tg[40]; snprintf(tg, sizeof(tg), "%s.%d", pfx, i);
+                  kern_return_t kr = callp(tg, c, t, sel, in, 4096, 4096, NO);
+                  if (kr == 0xe00002c2) { if (*nst < 1024) store[(*nst)++] = i; }
                   in[i] = 0;
               }
               free(in);
-              ui([NSString stringWithFormat:@"s%u read-offsets=%d", sel, *nstore]);
+              ui([NSString stringWithFormat:@"%s done read=%d", pfx, *nst]);
+          }
+
+          // hitmap odwrocony: wszystko 0xFF, jeden bajt zero
+          static void imap(io_connect_t c, uint32_t t, uint32_t sel, int from, int to, int step,
+                           const char* pfx, int* store, int* nst) {
+              uint8_t* in = malloc(4096);
+              memset(in, 0xFF, 4096);
+              for (int i = from; i < to; i += step) {
+                  in[i] = 0;
+                  char tg[40]; snprintf(tg, sizeof(tg), "%s.%d", pfx, i);
+                  kern_return_t kr = callp(tg, c, t, sel, in, 4096, 4096, NO);
+                  if (kr != 0xe00002c2) { if (*nst < 1024) store[(*nst)++] = i; }
+                  in[i] = 0xFF;
+              }
+              free(in);
+              ui([NSString stringWithFormat:@"%s done hit=%d", pfx, *nst]);
+          }
+
+          static void dense(io_connect_t c, uint32_t t, uint32_t sel, int off) {
+              static const uint32_t V[] = { 0,1,2,3,4,5,6,7,8,12,16,24,32,48,64,96,128,192,
+                                            256,512,1024,2048,3072,3968,4096,4097,8192,
+                                            0x7fffffffu,0xffffffffu };
+              int n = sizeof(V)/sizeof(V[0]);
+              for (int i = 0; i < n; i++) {
+                  uint8_t* in = calloc(1, 4096);
+                  memcpy(in + off, &V[i], 4);
+                  char tg[48]; snprintf(tg, sizeof(tg), "d%u.%d.%u", sel, off, V[i]);
+                  callp(tg, c, t, sel, in, 4096, 4096, NO);
+                  free(in);
+              }
           }
 
           static void valsweep(io_connect_t c, uint32_t t, uint32_t sel, int off) {
-              uint32_t v32[] = { 1, 8, 0x1000, 0x10000, 0x100000, 0x7fffffffu, 0xffffffffu };
-              uint64_t v64[] = { 0x1000, 0x10000, 0x7fffffffULL, 0xffffffffffffffffULL };
-              for (int i = 0; i < 7; i++) {
+              static const uint32_t V32[] = { 1, 0x1000, 0x10000, 0x100000, 0x7fffffffu, 0xffffffffu };
+              static const uint64_t V64[] = { 0x1000, 0xffffffffULL, 0xffffffffffffffffULL };
+              for (int i = 0; i < 6; i++) {
                   uint8_t* in = calloc(1, 4096);
-                  memcpy(in + off, &v32[i], 4);
-                  char tg[32]; snprintf(tg, sizeof(tg), "v%u.%d.u32", sel, off);
-                  callp(tg, c, t, sel, in, 4096, 4096, YES);
+                  memcpy(in + off, &V32[i], 4);
+                  char tg[48]; snprintf(tg, sizeof(tg), "s%u.%d.%u", sel, off, V32[i]);
+                  callp(tg, c, t, sel, in, 4096, 4096, NO);
                   free(in);
               }
-              for (int i = 0; i < 4; i++) {
+              for (int i = 0; i < 3; i++) {
                   uint8_t* in = calloc(1, 4096);
-                  memcpy(in + off, &v64[i], 8);
-                  char tg[32]; snprintf(tg, sizeof(tg), "v%u.%d.u64", sel, off);
-                  callp(tg, c, t, sel, in, 4096, 4096, YES);
+                  memcpy(in + off, &V64[i], 8);
+                  char tg[48]; snprintf(tg, sizeof(tg), "q%u.%d.%llu", sel, off, V64[i]);
+                  callp(tg, c, t, sel, in, 4096, 4096, NO);
                   free(in);
               }
           }
 
-          static void cross_state(void) {
-              ui(@"[E] state cross-check");
-              uint8_t* in = calloc(1, 4096);
-              for (int n = 1; n < g_nconn; n++)
-                  callp("pre4", g_conn[n], g_ctype[n], 4, in, 4096, 4096, YES);
-              for (int n = 0; n < g_nconn; n++)
-                  callp("post5", g_conn[n], g_ctype[n], 5, in, 4096, 4096, YES);
-              free(in);
+          // mieszany ABI: skalar + struct
+          static void mixed(io_connect_t c, uint32_t t, uint32_t sel) {
+              for (uint32_t ic = 0; ic <= 4; ic++) {
+                  uint64_t inS[8] = {0}, outS[16] = {0}; uint32_t oc = 16;
+                  uint8_t* in = calloc(1, 4096);
+                  uint8_t out[4096]; size_t oSz = sizeof(out);
+                  memset(out, 0xCC, sizeof(out));
+                  kern_return_t kr = IOConnectCallMethod(c, sel, inS, ic, in, 4096,
+                                                        outS, &oc, out, &oSz);
+                  free(in);
+                  char tg[32]; snprintf(tg, sizeof(tg), "m%u.%u", sel, ic);
+                  persist([NSString stringWithFormat:@"%u %u mixed %@ | %s", t, sel, kr_name(kr), tg]);
+                  if (kr != 0xe00002c2 && kr != 0xe00002c7) {
+                      g_hits++;
+                      ui([NSString stringWithFormat:@"!! %s -> %@ sc=%u oc=%u %@",
+                          tg, kr_name(kr), ic, oc, hex(out, oSz)]);
+                  } else {
+                      ui([NSString stringWithFormat:@"%s -> %@", tg, kr_name(kr)]);
+                  }
+              }
           }
 
           static void open_all(void) {
@@ -221,7 +250,6 @@ jobs:
                       io_connect_t c = 0;
                       if (IOServiceOpen(s, mach_task_self(), (uint32_t)t, &c) == KERN_SUCCESS) {
                           g_conn[g_nconn] = c; g_ctype[g_nconn] = (uint32_t)t; g_nconn++;
-                          persist([NSString stringWithFormat:@"OPEN %d", t]);
                       }
                   }
                   IOObjectRelease(s);
@@ -243,33 +271,44 @@ jobs:
               usleep(250000);
 
               open_all();
-              NSMutableString* tl = [NSMutableString string];
-              for (int i = 0; i < g_nconn; i++) [tl appendFormat:@"%u,", g_ctype[i]];
-              ui([NSString stringWithFormat:@"conns=%d types=%@", g_nconn, tl]);
+              ui([NSString stringWithFormat:@"conns=%d", g_nconn]);
               if (!g_nconn) return;
 
               io_connect_t c = g_conn[0]; uint32_t t = g_ctype[0];
 
-              ui(@"[0] size ladder");
-              ladder(c, t, 4); ladder(c, t, 5);
+              ui(@"[A] s5 hmap 128-511");
+              hmap(c, t, 5, 128, 511, 1, "hA", g_o5, &g_n5);
 
-              ui(@"[A] s5 byte hitmap 0-127");
-              hitmap(c, t, 5, g_off5, &g_n5);
+              ui(@"[B] s4 hmap 128-511");
+              hmap(c, t, 4, 128, 511, 1, "hB", g_o4, &g_n4);
 
-              ui(@"[B] s4 byte hitmap 0-127");
-              hitmap(c, t, 4, g_off4, &g_n4);
+              ui(@"[C] s4 hmap 512-4095 /4");
+              hmap(c, t, 4, 512, 4095, 4, "hC", g_o4, &g_n4);
 
-              ui(@"[C] s5 value sweep");
-              for (int i = 0; i < g_n5; i++) valsweep(c, t, 5, g_off5[i]);
+              ui(@"[D] s5 inverse 0-255");
+              imap(c, t, 5, 0, 255, 1, "iD", g_o5, &g_n5);
 
-              ui(@"[D] s4 value sweep");
-              int use4 = g_n4 ? g_n4 : g_n5;
-              int* src = g_n4 ? g_off4 : g_off5;
-              for (int i = 0; i < use4; i++) valsweep(c, t, 4, src[i]);
+              ui(@"[E] s4 inverse 0-255");
+              imap(c, t, 4, 0, 255, 1, "iE", g_o4, &g_n4);
 
-              cross_state();
+              ui(@"[F] dense 124 s4/s5");
+              dense(c, t, 5, 124);
+              dense(c, t, 4, 124);
+              dense(c, t, 5, 127);
+              dense(c, t, 4, 127);
 
-              ui([NSString stringWithFormat:@"FINISHED calls=%d hits=%d", g_done, g_hits]);
+              ui(@"[G] mixed ABI");
+              mixed(c, t, 4);
+              mixed(c, t, 5);
+
+              ui(@"[H] value sweep s4 offsets");
+              for (int i = 0; i < g_n4 && i < 64; i++) valsweep(c, t, 4, g_o4[i]);
+
+              ui(@"[I] value sweep s5 offsets");
+              for (int i = 0; i < g_n5 && i < 64; i++) valsweep(c, t, 5, g_o5[i]);
+
+              ui([NSString stringWithFormat:@"FINISHED calls=%d hits=%d n4=%d n5=%d",
+                  g_done, g_hits, g_n4, g_n5]);
               close(g_fd); g_fd = -1;
           }
 
