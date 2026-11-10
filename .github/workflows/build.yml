@@ -32,6 +32,7 @@ jobs:
                 CODE_SIGN_IDENTITY: ""
                 CODE_SIGNING_REQUIRED: "NO"
                 CODE_SIGNING_ALLOWED: "NO"
+                OTHER_CFLAGS: "-Wno-implicit-function-declaration"
               dependencies:
                 - sdk: IOKit.framework
                 - sdk: UIKit.framework
@@ -57,6 +58,14 @@ jobs:
           #import <CoreVideo/CoreVideo.h>
           #import <Security/Security.h>
           #include <unistd.h>
+          #include <dlfcn.h>
+
+          // SecTask nie jest w publicznych naglowkach iOS
+          typedef struct __SecTask *SecTaskRef;
+          extern SecTaskRef SecTaskCreateFromSelf(CFAllocatorRef);
+          extern CFTypeRef SecTaskCopyValueForEntitlement(SecTaskRef, CFStringRef, CFErrorRef *);
+
+          typedef kern_return_t (*fn_auth)(io_service_t, IOOptionBits);
 
           static UITextView* g_tv;
           static UILabel* g_hb;
@@ -104,8 +113,6 @@ jobs:
                           : @"IOUserClientClass: absent");
               CFTypeRef acc = IORegistryEntryCreateCFProperty(svc, CFSTR("IOKitUserClientAccess"), kCFAllocatorDefault, 0);
               if (acc) { add_line(@"IOKitUserClientAccess present"); CFRelease(acc); }
-              CFTypeRef pers = IORegistryEntryCreateCFProperty(svc, CFSTR("IOKitPersonalities"), kCFAllocatorDefault, 0);
-              if (pers) { add_line(@"IOKitPersonalities present"); CFRelease(pers); }
               CFRelease(props);
           }
 
@@ -154,13 +161,18 @@ jobs:
               add_line(@"[+] probe start");
               check_entitlements();
 
+              fn_auth auth = (fn_auth)dlsym(RTLD_DEFAULT, "IOServiceAuthorize");
+              add_line(auth ? @"authorize symbol = present" : @"authorize symbol = absent");
+
               io_service_t ave = find_one("AppleAVE2Driver");
               if (!ave) { add_line(@"no driver node"); dump_file(); return; }
 
               dump_props(ave);
 
-              kern_return_t az = IOServiceAuthorize(ave, 0);
-              add_line([NSString stringWithFormat:@"authorize=0x%x", az]);
+              if (auth) {
+                  kern_return_t az = auth(ave, 0);
+                  add_line([NSString stringWithFormat:@"authorize=0x%x", az]);
+              }
 
               add_line(@"[*] encode");
               vt_full();
@@ -245,6 +257,7 @@ jobs:
             CONFIGURATION_BUILD_DIR=$PWD/out/Payload \
             SUPPORTED_PLATFORMS=iphoneos \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            OTHER_CFLAGS="-Wno-implicit-function-declaration" \
             build
 
       - name: ipa
