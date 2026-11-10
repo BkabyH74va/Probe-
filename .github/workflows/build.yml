@@ -976,10 +976,20 @@ jobs:
       - name: ipa
         run: |
           ls -la out/Payload
-          cd out && zip -r probe.ipa Payload
+          test -d out/Payload/probe.app || { echo "NO APP BUNDLE"; ls -la out/Payload; exit 1; }
+          test -f out/Payload/probe.app/probe || { echo "NO BINARY"; ls -la out/Payload/probe.app; exit 1; }
+          cd out
+          rm -f probe.ipa
+          zip -r -q probe.ipa Payload
+          ls -la probe.ipa
+          test -s probe.ipa || { echo "ZIP EMPTY"; exit 1; }
+          cd ..
 
       - uses: actions/upload-artifact@v4
         with:
-          name: probe
+          name: probe-ipa-${{ github.run_number }}
           path: out/probe.ipa
-          if-no-files-found: never
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
+          compression-level: 0
