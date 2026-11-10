@@ -13,27 +13,40 @@ jobs:
           #import <UIKit/UIKit.h>
           #import <mach/mach.h>
           #import <mach-o/dyld.h>
+          #import <mach-o/loader.h>
           #import <dlfcn.h>
           #include <string.h>
-
-          // ================= USTAWIENIA =================
-          #define OFF_LIST      0x00000000ULL   // wskaznik do listy chunkow
-          #define OFF_COUNT     0x00000000ULL   // uint32 liczba entity (0 = uzyj MAX_ENT)
-          #define OFF_MATRIX    0x00000000ULL   // float[16] row-major view matrix
-          #define OFF_ENT_POS   0x00000000ULL   // float x,y,z w entity
-          // ==============================================
+          #include <stdlib.h>
+          #include <math.h>
 
           #define STRIDE      0x78
           #define CHUNK_BITS  9
           #define MAX_ENT     4096
-          #define MAX_DRAW    28
+          #define MAX_DRAW    24
+          #define SCAN_CAP    2500000
+          #define SEG_CAP     (16u * 1024u * 1024u)
 
-          static uintptr_t g_base = 0;
-          static uint32_t  g_ents = 0;
-          static BOOL      g_ready = NO;
+          typedef struct {
+              char     module[128];
+              uint64_t off_list;
+              uint64_t off_count;
+              uint64_t off_matrix;
+              uint64_t off_ent_pos;
+          } BUConf;
+
+          static BUConf g_conf;
+
+          static uintptr_t g_base   = 0;
+          static uintptr_t g_list   = 0;
+          static uintptr_t g_matrix = 0;
+          static uint32_t  g_count  = 0;
+          static volatile int g_scanning = 0;
+          static volatile int g_stop     = 0;
+          static NSString* g_status = @"boot";
+          static NSMutableArray<NSString*>* g_mods;
 
           static inline BOOL rd(uintptr_t a, void* b, size_t n) {
-              if (!a || a < 0x100000000ULL) return NO;
+              if (a < 0x100000000ULL) return NO;
               vm_size_t got = 0;
               return vm_read_overwrite(mach_task_self(), (vm_address_t)a,
                        (vm_size_t)n, (vm_address_t)b, &got) == KERN_SUCCESS && got == n;
@@ -47,12 +60,174 @@ jobs:
               if (w <= 0.001f) return NO;
               float cx = m[0]*x + m[4]*y + m[8]*z  + m[12];
               float cy = m[1]*x + m[5]*y + m[9]*z  + m[13];
-              float nx = cx / w, ny = cy / w;
-              o->x = (s.width  * 0.5f) * (1.0f + nx);
-              o->y = (s.height * 0.5f) * (1.0f - ny);
+              o->x = (s.width  * 0.5f) * (1.0f + cx / w);
+              o->y = (s.height * 0.5f) * (1.0f - cy / w);
               return YES;
           }
 
+          // ---------- konfiguracja ----------
+          static void load_conf(void) {
+              NSString* p = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/buurd.plist"];
+              NSDictionary* d = [NSDictionary dictionaryWithContentsOfFile:p];
+              if (!d) return;
+              NSString* m = d[@"module"];
+              if (m) strncpy(g_conf.module, m.UTF8String, sizeof(g_conf.module) - 1);
+              g_conf.off_list   = [d[@"off_list"]   unsignedLongLongValue];
+              g_conf.off_count  = [d[@"off_count"]  unsignedLongLongValue];
+              g_conf.off_matrix = [d[@"off_matrix"] unsignedLongLongValue];
+              g_conf.off_ent_pos= [d[@"off_ent_pos"]unsignedLongLongValue];
+              g_status = @"conf loaded";
+          }
+
+          // ---------- chodzenie po segmentach ----------
+          static void each_writable(int idx, void (^blk)(uintptr_t, size_t)) {
+              const struct mach_header_64* h = (const struct mach_header_64*)_dyld_get_image_header(idx);
+              if (!h || h->magic != MH_MAGIC_64) return;
+              intptr_t slide = _dyld_get_image_vmaddr_slide(idx);
+              uintptr_t p = (uintptr_t)h + sizeof(struct mach_header_64);
+              uintptr_t end = p + h->sizeofcmds;
+              for (uint32_t i = 0; i < h->ncmds && p < end; i++) {
+                  struct load_command* lc = (struct load_command*)p;
+                  if (lc->cmdsize < sizeof(struct load_command)) break;
+                  if (lc->cmd == LC_SEGMENT_64) {
+                      struct segment_command_64* sg = (struct segment_command_64*)lc;
+                      if ((sg->initprot & VM_PROT_WRITE) && sg->vmsize > 64) {
+                          uintptr_t a = (uintptr_t)(sg->vmaddr + slide);
+                          size_t n = sg->vmsize > SEG_CAP ? SEG_CAP : (size_t)sg->vmsize;
+                          blk(a, n);
+                      }
+                  }
+                  p += lc->cmdsize;
+              }
+          }
+
+          // ---------- heurystyka macierzy ----------
+          static BOOL matrix_ok(const float* m) {
+              if (fabsf(m[15]) < 0.85f || fabsf(m[15]) > 1.15f) return NO;
+              if (fabsf(m[3]) > 0.02f || fabsf(m[7]) > 0.02f || fabsf(m[11]) > 0.02f) return NO;
+              if (fabsf(m[0]) < 0.4f || fabsf(m[5]) < 0.4f) return NO;
+              if (!isfinite(m[12]) || !isfinite(m[13])) return NO;
+              if (fabsf(m[12]) > 20000.f || fabsf(m[13]) > 20000.f) return NO;
+              float d = m[0]*m[5] - m[1]*m[4];
+              if (fabsf(d) < 0.05f) return NO;
+              return YES;
+          }
+
+          static uintptr_t find_matrix(int idx) {
+              __block uintptr_t hit = 0;
+              each_writable(idx, ^(uintptr_t a, size_t n) {
+                  if (hit || g_stop) return;
+                  float buf[16];
+                  for (size_t o = 0; o + 64 < n; o += 4) {
+                      if (!rd(a + o, buf, 64)) continue;
+                      if (matrix_ok(buf)) { hit = a + o; return; }
+                  }
+              });
+              return hit;
+          }
+
+          // ---------- heurystyka listy chunkow ----------
+          static BOOL ent_ok(uintptr_t e) {
+              float x = rdf(e), y = rdf(e + 4), z = rdf(e + 8);
+              if (!isfinite(x) || !isfinite(y) || !isfinite(z)) return NO;
+              if (fabsf(x) > 200000.f || fabsf(y) > 200000.f || fabsf(z) > 200000.f) return NO;
+              if (fabsf(x) + fabsf(y) + fabsf(z) < 0.001f) return NO;
+              return YES;
+          }
+
+          static uintptr_t find_list(int idx) {
+              __block uintptr_t hit = 0;
+              __block size_t budget = SCAN_CAP;
+              each_writable(idx, ^(uintptr_t a, size_t n) {
+                  if (hit || g_stop) return;
+                  for (size_t o = 0; o + 8 < n && budget; o += 8, budget--) {
+                      uint64_t cand = 0;
+                      if (!rd(a + o, &cand, 8)) continue;
+                      uintptr_t c = (uintptr_t)cand;
+                      if (c < 0x100000000ULL || (c & 7)) continue;
+                      uintptr_t chunk = (uintptr_t)rd64(c);
+                      if (chunk < 0x100000000ULL || (chunk & 7)) continue;
+                      uintptr_t e0 = (uintptr_t)rd64(chunk);
+                      if (e0 < 0x100000000ULL) continue;
+                      uintptr_t eLast = (uintptr_t)rd64(chunk + 0x1FF * STRIDE);
+                      if (eLast < 0x100000000ULL) continue;
+                      if (!ent_ok(e0) || !ent_ok(eLast)) continue;
+                      hit = a + o;
+                      return;
+                  }
+              });
+              return hit;
+          }
+
+          // ---------- wybor obrazu ----------
+          static BOOL sys_image(const char* path) {
+              return !path || strncmp(path, "/System", 7) == 0 ||
+                     strncmp(path, "/usr/lib", 8) == 0 ||
+                     strncmp(path, "/Developer", 10) == 0;
+          }
+
+          static int pick_image(void) {
+              uint32_t total = _dyld_image_count();
+              if (g_conf.module[0]) {
+                  for (uint32_t i = 0; i < total; i++) {
+                      const char* nm = _dyld_get_image_name(i);
+                      if (nm && strstr(nm, g_conf.module)) return (int)i;
+                  }
+                  return -1;
+              }
+              for (uint32_t i = 0; i < total; i++) {
+                  if (sys_image(_dyld_get_image_name(i))) continue;
+                  if (i == 0) return 0;
+              }
+              return 0;
+          }
+
+          static void scan_all(void) {
+              if (g_scanning) return;
+              g_scanning = 1; g_stop = 0;
+              dispatch_async(dispatch_get_global_queue(0, 0), ^{
+                  g_matrix = 0; g_list = 0;
+                  g_mods = [NSMutableArray array];
+
+                  uint32_t total = _dyld_image_count();
+                  for (uint32_t i = 0; i < total && g_mods.count < 40; i++) {
+                      const char* nm = _dyld_get_image_name(i);
+                      if (sys_image(nm)) continue;
+                      [g_mods addObject:[NSString stringWithFormat:@"%u %s", i,
+                          nm ? strrchr(nm, '/') + 1 : "?"]];
+                  }
+
+                  int first = pick_image();
+                  if (first >= 0) {
+                      const struct mach_header_64* h =
+                          (const struct mach_header_64*)_dyld_get_image_header((uint32_t)first);
+                      if (h) g_base = (uintptr_t)h + _dyld_get_image_vmaddr_slide((uint32_t)first);
+
+                      if (g_conf.off_matrix) g_matrix = g_base + g_conf.off_matrix;
+                      if (g_conf.off_list)   g_list   = g_base + g_conf.off_list;
+                      if (g_conf.off_count)  g_count  = rd32(g_base + g_conf.off_count);
+
+                      if (!g_matrix) {
+                          uint32_t total2 = _dyld_image_count();
+                          for (uint32_t i = 0; i < total2 && !g_matrix && !g_stop; i++) {
+                              if (sys_image(_dyld_get_image_name(i))) continue;
+                              g_matrix = find_matrix((int)i);
+                          }
+                      }
+                      if (!g_list) {
+                          uint32_t total3 = _dyld_image_count();
+                          for (uint32_t i = 0; i < total3 && !g_list && !g_stop; i++) {
+                              if (sys_image(_dyld_get_image_name(i))) continue;
+                              g_list = find_list((int)i);
+                          }
+                      }
+                  }
+                  g_status = [NSString stringWithFormat:@"m=%d l=%d", g_matrix ? 1 : 0, g_list ? 1 : 0];
+                  g_scanning = 0;
+              });
+          }
+
+          // ---------- rysowanie ----------
           @interface BUView : UIView
           @property (nonatomic, strong) NSMutableArray<NSString*>* lines;
           @end
@@ -61,60 +236,81 @@ jobs:
           - (instancetype)initWithFrame:(CGRect)f {
               if ((self = [super initWithFrame:f])) {
                   self.backgroundColor = UIColor.clearColor;
-                  self.userInteractionEnabled = NO;
                   self.opaque = NO;
+                  self.userInteractionEnabled = YES;
                   _lines = [NSMutableArray array];
+                  UITapGestureRecognizer* g =
+                      [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(tap:)];
+                  [self addGestureRecognizer:g];
               }
               return self;
+          }
+          - (void)tap:(id)s {
+              CGPoint p = [s locationInView:self];
+              if (p.x > self.bounds.size.width - 90 && p.y < 60) scan_all();
           }
           - (void)drawRect:(CGRect)r {
               NSDictionary* at = @{
                   NSFontAttributeName: [UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightRegular],
                   NSForegroundColorAttributeName: UIColor.greenColor };
-              CGFloat y = 34;
+              NSDictionary* hd = @{
+                  NSFontAttributeName: [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightBold],
+                  NSForegroundColorAttributeName: UIColor.systemYellowColor };
+              [@"SCAN" drawAtPoint:CGPointMake(r.size.width - 52, 26) withAttributes:hd];
+              CGFloat y = 26;
               for (NSString* s in self.lines) {
                   [s drawAtPoint:CGPointMake(6, y) withAttributes:at];
                   y += 11;
-                  if (y > r.size.height - 40) break;
+                  if (y > r.size.height - 30) break;
               }
           }
           @end
 
-          static BUView* g_view = NULL;
+          static BUView* g_view;
 
           static void tick(void) {
-              if (!g_ready || !g_base) return;
+              if (!g_view) return;
               CGSize sz = UIScreen.mainScreen.bounds.size;
               NSMutableArray* out = [NSMutableArray array];
 
-              float m[16];
-              if (!rd(g_base + OFF_MATRIX, m, sizeof(m))) {
-                  [out addObject:@"matrix unreadable"];
-              }
-              uintptr_t list = rd64(g_base + OFF_LIST);
-              uint32_t cnt = OFF_COUNT ? rd32(g_base + OFF_COUNT) : 0;
-              if (!cnt || cnt > MAX_ENT) cnt = MAX_ENT;
-              g_ents = cnt;
+              [out addObject:[NSString stringWithFormat:@"base=%p %@", (void*)g_base, g_status]];
 
-              [out addObject:[NSString stringWithFormat:@"base=%p list=%p n=%u", (void*)g_base, (void*)list, cnt]];
+              if (g_scanning) [out addObject:@"scanning…"];
 
-              int shown = 0, live = 0;
-              for (uint32_t i = 0; i < cnt && shown < MAX_DRAW; i++) {
-                  uintptr_t chunk = rd64(list + ((i >> CHUNK_BITS) * 8));
-                  if (!chunk) continue;
-                  uintptr_t ent = rd64(chunk + ((i & 0x1FF) * STRIDE));
-                  if (!ent) continue;
-                  live++;
-                  float x = rdf(ent + OFF_ENT_POS);
-                  float y = rdf(ent + OFF_ENT_POS + 4);
-                  float z = rdf(ent + OFF_ENT_POS + 8);
-                  CGPoint p;
-                  if (!w2s(m, x, y, z, &p, sz)) continue;
-                  [out addObject:[NSString stringWithFormat:@"#%u %4.0f,%4.0f | %.0f %.0f %.0f",
-                                 i, p.x, p.y, x, y, z]];
-                  shown++;
+              if (!g_matrix) {
+                  [out addObject:@"no matrix"];
               }
-              [out addObject:[NSString stringWithFormat:@"live=%d shown=%d", live, shown]];
+              if (!g_list) {
+                  [out addObject:@"no list"];
+              }
+              for (NSString* m in g_mods) {
+                  if (out.count > 14) break;
+                  [out addObject:[NSString stringWithFormat:@" mod %@", m]];
+              }
+
+              if (g_matrix && g_list) {
+                  float m[16];
+                  if (!rd(g_matrix, m, sizeof(m))) {
+                      [out addObject:@"matrix gone"];
+                  } else {
+                      uint32_t cnt = g_count;
+                      if (!cnt || cnt > MAX_ENT) cnt = MAX_ENT;
+                      int shown = 0, live = 0;
+                      for (uint32_t i = 0; i < cnt && shown < MAX_DRAW; i++) {
+                          uintptr_t chunk = (uintptr_t)rd64(g_list + ((i >> CHUNK_BITS) * 8));
+                          if (!chunk) continue;
+                          uintptr_t ent = (uintptr_t)rd64(chunk + ((i & 0x1FF) * STRIDE));
+                          if (!ent) continue;
+                          live++;
+                          float x = rdf(ent + 0), y = rdf(ent + 4), z = rdf(ent + 8);
+                          CGPoint p;
+                          if (!w2s(m, x, y, z, &p, sz)) continue;
+                          [out addObject:[NSString stringWithFormat:@"#%u %4.0f,%4.0f", i, p.x, p.y]];
+                          shown++;
+                      }
+                      [out addObject:[NSString stringWithFormat:@"live=%d shown=%d", live, shown]];
+                  }
+              }
 
               dispatch_async(dispatch_get_main_queue(), ^{
                   g_view.lines = out;
@@ -135,19 +331,18 @@ jobs:
                   [vc.view addSubview:g_view];
                   w.rootViewController = vc;
                   [w makeKeyAndVisible];
-
                   [NSTimer scheduledTimerWithTimeInterval:0.05 repeats:YES block:^(NSTimer* t) { tick(); }];
-                  NSLog(@"BUURD: overlay up, base=%p", (void*)g_base);
+                  NSLog(@"BUURD: overlay up base=%p", (void*)g_base);
+                  scan_all();
               });
           }
 
           __attribute__((constructor))
           static void buurd_init(void) {
+              load_conf();
               const struct mach_header_64* h = (const struct mach_header_64*)_dyld_get_image_header(0);
-              intptr_t slide = _dyld_get_image_vmaddr_slide(0);
-              if (h) g_base = (uintptr_t)h + (uintptr_t)slide;
-              NSLog(@"BUURD: loaded, hdr=%p slide=%ld base=%p", h, (long)slide, (void*)g_base);
-              g_ready = YES;
+              if (h) g_base = (uintptr_t)h + _dyld_get_image_vmaddr_slide(0);
+              NSLog(@"BUURD: loaded base=%p", (void*)g_base);
               dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
                              dispatch_get_main_queue(), ^{ install(); });
           }
@@ -163,7 +358,6 @@ jobs:
             -Wl,-undefined,dynamic_lookup \
             -o out/buurd.dylib buurd.m
           lipo -info out/buurd.dylib
-          otool -L out/buurd.dylib
           file out/buurd.dylib
 
       - uses: actions/upload-artifact@v4
