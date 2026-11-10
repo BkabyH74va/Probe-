@@ -60,7 +60,7 @@ jobs:
           typedef kern_return_t (*fn_addclient)(io_connect_t, io_connect_t);
           static fn_addclient g_addclient = NULL;
 
-          #define BUILD_TAG "v41-latest"
+          #define BUILD_TAG "v42-grepfix"
           #define MAXC 40
           #define STEP_MAX 27
           #define TRY_MAX 2
@@ -1341,13 +1341,13 @@ jobs:
           <plist version="1.0"><dict>
             <key>CFBundleDevelopmentRegion</key><string>en</string>
             <key>CFBundleExecutable</key><string>probe</string>
-            <key>CFBundleIdentifier</key><string>com.buurza41.probe</string>
+            <key>CFBundleIdentifier</key><string>com.buurza42.probe</string>
             <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
             <key>CFBundleName</key><string>probe</string>
-            <key>CFBundleDisplayName</key><string>buurd41</string>
+            <key>CFBundleDisplayName</key><string>buurd42</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleShortVersionString</key><string>1.0</string>
-            <key>CFBundleVersion</key><string>43</string>
+            <key>CFBundleVersion</key><string>44</string>
             <key>MinimumOSVersion</key><string>17.0</string>
             <key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
             <key>UILaunchScreen</key><dict/>
@@ -1370,7 +1370,8 @@ jobs:
             Sources/main.m > s.log 2>&1
           rc=$?
           set -e
-          grep -nE "error:" -A2 s.log | head -60
+          grep -nE "error:" -A2 s.log | head -60 || true
+          tail -5 s.log || true
           exit $rc
 
       - name: build
@@ -1390,7 +1391,8 @@ jobs:
           rc=$?
           set -e
           echo "=== cc rc=$rc ==="
-          grep -nE "error:|undefined|Undefined" c.log | head -40
+          grep -nE "error:|undefined|Undefined" c.log | head -40 || true
+          tail -15 c.log || true
           echo "=== end ==="
           test $rc -eq 0
           chmod +x "$APP/probe"
