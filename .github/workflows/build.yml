@@ -35,6 +35,8 @@ jobs:
               dependencies:
                 - sdk: IOKit.framework
                 - sdk: UIKit.framework
+                - sdk: VideoToolbox.framework
+                - sdk: CoreMedia.framework
           EOF
           cat > probe.entitlements <<'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
@@ -47,11 +49,12 @@ jobs:
           cat > Sources/main.m <<'EOF'
           #import <UIKit/UIKit.h>
           #import <IOKit/IOKitLib.h>
+          #import <VideoToolbox/VideoToolbox.h>
 
           static UITextView* g_tv;
           static UILabel* g_hb;
-          static NSTimer* g_timer;
           static NSUInteger g_ticks = 0;
+          static VTCompressionSessionRef g_vt = NULL;
 
           static void add_line(NSString* s) {
               dispatch_async(dispatch_get_main_queue(), ^{
@@ -60,30 +63,84 @@ jobs:
               });
           }
 
-          static void run_probe(void) {
-              add_line(@"[+] probe start");
-              io_iterator_t it = 0;
-              kern_return_t k = IOServiceGetMatchingServices(kIOMainPortDefault,
-                      IOServiceMatching("AVEVideoEncoder"), &it);
-              if (k != KERN_SUCCESS) {
-                  add_line([NSString stringWithFormat:@"NO SERVICE kr=0x%x", k]); return;
-              }
-              io_service_t svc = IOIteratorNext(it);
-              IOObjectRelease(it);
-              if (!svc) { add_line(@"NO INSTANCE"); return; }
-
-              io_connect_t c = 0;
-              kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &c);
-              if (kr == KERN_SUCCESS)
-                  add_line([NSString stringWithFormat:@"REACHABLE kr=0x%x conn=%u", kr, c]);
-              else
-                  add_line([NSString stringWithFormat:@"BLOCKED kr=0x%x", kr]);
-
+          static void dump_file(void) {
               NSString* p = [NSSearchPathForDirectoriesInDomains(
                   NSDocumentDirectory, NSUserDomainMask, YES).firstObject
                   stringByAppendingPathComponent:@"probe.txt"];
               [g_tv.text writeToFile:p atomically:YES
                           encoding:NSUTF8StringEncoding error:nil];
+          }
+
+          // proba otwarcia podana nazwa; 1 = sukces
+          static int try_open(NSString* cls) {
+              io_iterator_t it = 0;
+              if (IOServiceGetMatchingServices(kIOMainPortDefault,
+                      IOServiceMatching(cls.UTF8String), &it) != KERN_SUCCESS) return -1;
+              io_service_t svc = IOIteratorNext(it);
+              IOObjectRelease(it);
+              if (!svc) return 0;
+              io_connect_t c = 0;
+              kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &c);
+              IOObjectRelease(svc);
+              add_line([NSString stringWithFormat:@"%@ open=0x%x conn=%u", cls, kr, c]);
+              return kr == KERN_SUCCESS;
+          }
+
+          static void vt_warmup(void) {
+              OSStatus st = VTCompressionSessionCreate(NULL, 1920, 1080,
+                      kCMVideoCodecType_H264, NULL, NULL, NULL, NULL, NULL, &g_vt);
+              add_line([NSString stringWithFormat:@"vt create=%d", (int)st]);
+              if (g_vt) VTCompressionSessionPrepareToEncodeFrames(g_vt);
+          }
+
+          static void dump_registry(void) {
+              add_line(@"[*] enumerating registry");
+              io_iterator_t it = 0;
+              if (IOServiceGetMatchingServices(kIOMainPortDefault,
+                      IOServiceMatching("IOService"), &it) != KERN_SUCCESS) {
+                  add_line(@"enum failed"); return;
+              }
+              io_service_t s; int n = 0, hits = 0;
+              while ((s = IOIteratorNext(it)) && n < 8000) {
+                  io_name_t cls; IOObjectGetClass(s, cls);
+                  NSString* c = @(cls);
+                  if ([c containsString:@"AVE"] || [c containsString:@"Video"] ||
+                      [c containsString:@"Encode"] || [c containsString:@"Codec"] ||
+                      [c containsString:@"H264"] || [c containsString:@"HEVC"]) {
+                      hits++;
+                      io_connect_t conn = 0;
+                      kern_return_t kr = IOServiceOpen(s, mach_task_self(), 0, &conn);
+                      add_line([NSString stringWithFormat:@"HIT %@ open=0x%x", c, kr]);
+                  }
+                  IOObjectRelease(s); n++;
+              }
+              IOObjectRelease(it);
+              add_line([NSString stringWithFormat:@"scanned=%d hits=%d", n, hits]);
+          }
+
+          static void run_probe(void) {
+              add_line(@"[+] probe start");
+              int r = try_open(@"AVEVideoEncoder");
+              if (r == -1) add_line(@"NO SERVICE");
+              if (r > 0) { dump_file(); return; }
+
+              add_line(@"[*] warmup VT");
+              vt_warmup();
+
+              for (int i = 0; i < 6; i++) {
+                  usleep(300000);
+                  r = try_open(@"AVEVideoEncoder");
+                  if (r > 0) { add_line(@"[+] GOT IT"); dump_file(); return; }
+                  add_line([NSString stringWithFormat:@"retry %d -> %d", i, r]);
+              }
+
+              try_open(@"AVEVideoEncoderUserClient");
+              try_open(@"AppleAVE2Driver");
+              try_open(@"AppleAVE2");
+
+              dump_registry();
+              dump_file();
+              add_line(@"[*] done");
           }
 
           @interface AppDelegate : UIResponder <UIApplicationDelegate>
@@ -96,7 +153,7 @@ jobs:
               UIViewController* vc = [UIViewController new];
               vc.view.backgroundColor = UIColor.blackColor;
 
-              g_hb = [[UILabel alloc] initWithFrame:CGRectMake(8, 50, 320, 18)];
+              g_hb = [[UILabel alloc] initWithFrame:CGRectMake(8, 50, 340, 18)];
               g_hb.textColor = UIColor.systemYellowColor;
               g_hb.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
               g_hb.text = @"alive ticks=0";
@@ -108,7 +165,7 @@ jobs:
               g_tv = [[UITextView alloc] initWithFrame:r];
               g_tv.backgroundColor = UIColor.blackColor;
               g_tv.textColor = UIColor.greenColor;
-              g_tv.font = [UIFont monospacedSystemFontOfSize:14 weight:UIFontWeightRegular];
+              g_tv.font = [UIFont monospacedSystemFontOfSize:13 weight:UIFontWeightRegular];
               g_tv.editable = NO;
               g_tv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
               g_tv.text = @"boot ok";
@@ -117,7 +174,7 @@ jobs:
               self.w.rootViewController = vc;
               [self.w makeKeyAndVisible];
 
-              g_timer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer* t) {
+              [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer* t) {
                   g_ticks++;
                   g_hb.text = [NSString stringWithFormat:@"alive ticks=%lu",
                                (unsigned long)g_ticks];
