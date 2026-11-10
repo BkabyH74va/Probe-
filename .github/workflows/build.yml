@@ -11,7 +11,7 @@ jobs:
           mkdir -p Sources
           cat > project.yml <<'PROJEOF'
           name: probe
-          options: { bundleIdPrefix: com.buurza9, deploymentTarget: { iOS: "18.0" } }
+          options: { bundleIdPrefix: com.buurza10, deploymentTarget: { iOS: "18.0" } }
           targets:
             probe:
               type: application
@@ -21,9 +21,9 @@ jobs:
               info:
                 path: Info.plist
                 properties:
-                  CFBundleDisplayName: buurd9
+                  CFBundleDisplayName: buurd10
                   CFBundleShortVersionString: "1.0"
-                  CFBundleVersion: "9"
+                  CFBundleVersion: "10"
                   UILaunchScreen: {}
               settings:
                 ARCHS: "arm64"
@@ -62,8 +62,9 @@ jobs:
           #include <pthread.h>
           #include <stdlib.h>
           #include <string.h>
+          #include <stdio.h>
 
-          #define BUILD_TAG "v9-fix"
+          #define BUILD_TAG "v10-hdr"
           #define MAXC 24
           #define STEP_MAX 21
 
@@ -79,6 +80,10 @@ jobs:
           static io_connect_t g_conn[MAXC];
           static uint32_t g_ctype[MAXC];
           static int g_nconn = 0;
+
+          static const uint32_t FUZZ_VALS[12] = {
+              1, 8, 16, 64, 256, 1024, 4096, 8192, 0x10000, 0x100000, 0x7fffffff, 0xffffffff
+          };
 
           static const char* STEP_NAME[STEP_MAX + 1] = {
               "boot-only", "open-1", "open-all", "s4-zero", "s5-zero",
@@ -319,8 +324,7 @@ jobs:
                   uint32_t n = 1 + arc4random_uniform(6);
                   for (uint32_t k = 0; k < n; k++) {
                       uint32_t off = arc4random_uniform(1024) & ~3u;
-                      uint32_t v = (uint32_t[]){ 1,8,16,64,256,1024,4096,8192,0x10000,
-                                                 0x100000,0x7fffffff,0xffffffff }[arc4random_uniform(12)];
+                      uint32_t v = FUZZ_VALS[arc4random_uniform(12)];
                       memcpy(in + off, &v, 4);
                   }
                   char tg[32]; snprintf(tg, sizeof(tg), "f.%d", r);
@@ -444,10 +448,23 @@ jobs:
           brew install xcodegen
           xcodegen generate
 
+      - name: syntax
+        run: |
+          set +e
+          xcrun -sdk iphoneos clang -fsyntax-only -x objective-c \
+            -arch arm64 -miphoneos-version-min=18.0 \
+            -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" \
+            -Wno-implicit-function-declaration \
+            Sources/main.m > s.log 2>&1
+          rc=$?
+          set -e
+          grep -nE "error:" s.log | head -40
+          exit $rc
+
       - name: build
         run: |
-          set -o pipefail
           mkdir -p out/Payload
+          set +e
           xcodebuild -project probe.xcodeproj -target probe \
             -sdk iphoneos -configuration Release \
             -arch arm64 \
@@ -455,8 +472,13 @@ jobs:
             SUPPORTED_PLATFORMS=iphoneos \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
             OTHER_CFLAGS="-Wno-implicit-function-declaration" \
-            build 2>&1 | tee b.log
-          grep -nE "error:|fatal error:" b.log || true
+            build > b.log 2>&1
+          rc=$?
+          set -e
+          echo "=== rc=$rc ==="
+          grep -nE "error:|fatal error:" b.log | head -40
+          echo "=== end ==="
+          exit $rc
 
       - name: ipa
         run: |
