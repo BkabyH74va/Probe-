@@ -11,7 +11,7 @@ jobs:
           mkdir -p Sources
           cat > project.yml <<'PROJEOF'
           name: probe
-          options: { bundleIdPrefix: com.buurza13, deploymentTarget: { iOS: "18.0" } }
+          options: { bundleIdPrefix: com.buurza14, deploymentTarget: { iOS: "18.0" } }
           targets:
             probe:
               type: application
@@ -21,9 +21,9 @@ jobs:
               info:
                 path: Info.plist
                 properties:
-                  CFBundleDisplayName: buurd13
+                  CFBundleDisplayName: buurd14
                   CFBundleShortVersionString: "1.0"
-                  CFBundleVersion: "13"
+                  CFBundleVersion: "14"
                   UILaunchScreen: {}
               settings:
                 ARCHS: "arm64"
@@ -68,7 +68,7 @@ jobs:
               mach_vm_size_t *, vm_region_flavor_t, vm_region_info_t,
               mach_msg_type_number_t *, mach_port_t *);
 
-          #define BUILD_TAG "v13-tryfix"
+          #define BUILD_TAG "v14-latch"
           #define MAXC 24
           #define STEP_MAX 21
           #define TRY_MAX 2
@@ -172,6 +172,7 @@ jobs:
                   atomically:YES encoding:NSUTF8StringEncoding error:nil];
           }
           static void load_try(void) {
+              g_try = 0;
               NSString* s = [NSString stringWithContentsOfFile:doc_file("try.txt")
                   encoding:NSUTF8StringEncoding error:nil];
               if (!s) return;
@@ -183,6 +184,17 @@ jobs:
           }
           static void save_try(void) {
               [[NSString stringWithFormat:@"%d:%d", g_step, g_try] writeToFile:doc_file("try.txt")
+                  atomically:YES encoding:NSUTF8StringEncoding error:nil];
+          }
+          static void latch_build(void) {
+              NSString* bt = [NSString stringWithContentsOfFile:doc_file("build.txt")
+                  encoding:NSUTF8StringEncoding error:nil];
+              if ([bt isEqualToString:@BUILD_TAG]) return;
+              unlink(doc_file("state.txt").UTF8String);
+              save_step(0);
+              g_try = 0;
+              save_try();
+              [@BUILD_TAG writeToFile:doc_file("build.txt")
                   atomically:YES encoding:NSUTF8StringEncoding error:nil];
           }
           static void load_state(void) {
@@ -383,6 +395,7 @@ jobs:
           }
 
           static void run(void) {
+              latch_build();
               char b[512]; doc_path("state.txt", b, sizeof(b));
               g_fd = open(b, O_CREAT | O_WRONLY | O_APPEND, 0644);
               g_seen = [NSMutableSet set];
@@ -398,16 +411,14 @@ jobs:
 
               if (g_step > STEP_MAX) { ui(@"ALL DONE"); return; }
 
-              if (g_step >= 1) {
-                  VTCompressionSessionRef v = NULL;
-                  VTCompressionSessionCreate(NULL, 1920, 1080, kCMVideoCodecType_H264,
-                      NULL, NULL, NULL, NULL, NULL, &v);
-                  if (v) VTCompressionSessionPrepareToEncodeFrames(v);
-                  usleep(200000);
-                  open_n(MAXC);
-                  ui([NSString stringWithFormat:@"conns=%d", g_nconn]);
-                  if (!g_nconn) { ui(@"NO CONN — STOP"); g_stop = 1; }
-              }
+              VTCompressionSessionRef v = NULL;
+              VTCompressionSessionCreate(NULL, 1920, 1080, kCMVideoCodecType_H264,
+                  NULL, NULL, NULL, NULL, NULL, &v);
+              if (v) VTCompressionSessionPrepareToEncodeFrames(v);
+              usleep(200000);
+              open_n(MAXC);
+              ui([NSString stringWithFormat:@"conns=%d", g_nconn]);
+              if (!g_nconn) { ui(@"NO CONN — STOP"); g_stop = 1; }
 
               while (g_step <= STEP_MAX && !g_stop) {
                   load_try();
