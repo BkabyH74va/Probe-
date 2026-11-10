@@ -1,8 +1,13 @@
 name: build
 on: [push, workflow_dispatch]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   ipa:
-    runs-on: macos-latest
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
@@ -11,7 +16,7 @@ jobs:
           mkdir -p Sources
           cat > project.yml <<'PROJEOF'
           name: probe
-          options: { bundleIdPrefix: com.buurza35, deploymentTarget: { iOS: "18.0" } }
+          options: { bundleIdPrefix: com.buurza36, deploymentTarget: { iOS: "18.0" } }
           targets:
             probe:
               type: application
@@ -21,9 +26,9 @@ jobs:
               info:
                 path: Info.plist
                 properties:
-                  CFBundleDisplayName: buurd35
+                  CFBundleDisplayName: buurd36
                   CFBundleShortVersionString: "1.0"
-                  CFBundleVersion: "37"
+                  CFBundleVersion: "38"
                   UILaunchScreen: {}
               settings:
                 ARCHS: "arm64"
@@ -85,7 +90,7 @@ jobs:
           typedef kern_return_t (*fn_addclient)(io_connect_t, io_connect_t);
           static fn_addclient g_addclient = NULL;
 
-          #define BUILD_TAG "v35-scalarpad"
+          #define BUILD_TAG "v36-mac15"
           #define MAXC 40
           #define STEP_MAX 25
           #define TRY_MAX 2
@@ -1262,7 +1267,7 @@ jobs:
 
       - name: xcodegen
         run: |
-          brew install xcodegen
+          brew install xcodegen || brew install xcodegen
           xcodegen generate
 
       - name: syntax
