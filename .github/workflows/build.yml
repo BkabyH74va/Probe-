@@ -47,8 +47,7 @@ jobs:
           <plist version="1.0"><dict>
             <key>platform-application</key><true/>
             <key>com.apple.private.security.no-container</key><true/>
-            <key>com.apple.security.iokit-user-client-class</key>
-            <array><string>AVEVideoEncoderUserClient</string></array>
+            <key>get-task-allow</key><true/>
           </dict></plist>
           EOF
           cat > Sources/main.m <<'EOF'
@@ -65,16 +64,21 @@ jobs:
           extern CFTypeRef SecTaskCopyValueForEntitlement(SecTaskRef, CFStringRef, CFErrorRef *);
           extern int csops(pid_t, unsigned int, void *, size_t);
 
-          #define CS_OPS_STATUS            0
-          #define CS_OPS_ENTITLEMENTS_BLOB 7
+          #define CS_OPS_STATUS 0
 
           static UITextView* g_tv;
           static UILabel* g_hb;
           static NSUInteger g_ticks = 0;
-          static int g_ave = 0, g_jpeg = 0;
+          static int g_hits = 0;
           static NSMutableString* g_sum;
-          static VTCompressionSessionRef g_vt = NULL;
-          static dispatch_semaphore_t g_sem;
+          static io_connect_t g_conn[4];
+          static uint32_t g_ctype[4];
+          static int g_nconn = 0;
+
+          static const size_t kSizes[] = {
+              8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096
+          };
+          static const int kNSizes = sizeof(kSizes) / sizeof(kSizes[0]);
 
           static void add_line(NSString* s) {
               dispatch_async(dispatch_get_main_queue(), ^{
@@ -87,7 +91,6 @@ jobs:
           static void sum(NSString* s) {
               dispatch_async(dispatch_get_main_queue(), ^{
                   [g_sum appendFormat:@"\n%@", s];
-                  NSLog(@"SUM: %@", s);
               });
           }
 
@@ -98,12 +101,6 @@ jobs:
               [g_tv.text writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
           }
 
-          static NSString* sysctl_str(const char* key) {
-              char b[256] = {0}; size_t l = sizeof(b);
-              if (sysctlbyname(key, b, &l, NULL, 0) != 0) return @"?";
-              return @(b);
-          }
-
           static NSString* kr_name(kern_return_t kr) {
               switch (kr) {
                   case KERN_SUCCESS: return @"OK";
@@ -111,139 +108,111 @@ jobs:
                   case 0xe00002c7:   return @"Unsup";
                   case 0xe00002be:   return @"NoRes";
                   case 0xe00002bd:   return @"NoMem";
-                  case 0xe00002c5:   return @"Excl";
                   case 0xe00002c1:   return @"NotPriv";
                   case 0xe00002e2:   return @"NotPerm";
                   default:           return [NSString stringWithFormat:@"0x%x", kr];
               }
           }
 
+          static NSString* hex(const uint8_t* p, size_t n) {
+              if (!n) return @"-";
+              if (n > 48) n = 48;
+              NSMutableString* s = [NSMutableString string];
+              for (size_t i = 0; i < n; i++) [s appendFormat:@"%02x", p[i]];
+              return s;
+          }
+
           static void check_sig(void) {
               uint32_t f = 0;
               if (csops(getpid(), CS_OPS_STATUS, &f, sizeof(f)) == 0)
-                  sum([NSString stringWithFormat:@"csflags=0x%08x platform=%d gettaskallow=%d",
-                       f, !!(f & 0x04000000), !!(f & 0x00000004)]);
-              SecTaskRef t = SecTaskCreateFromSelf(kCFAllocatorDefault);
-              if (t) {
-                  const char* k[] = { "platform-application",
-                      "com.apple.private.security.no-container", "get-task-allow" };
-                  for (int i = 0; i < 3; i++) {
-                      CFTypeRef v = SecTaskCopyValueForEntitlement(t, (__bridge CFStringRef)@(k[i]), NULL);
-                      sum([NSString stringWithFormat:@"ent %s = %@", k[i], v ? @"YES" : @"nil"]);
-                      if (v) CFRelease(v);
-                  }
-                  CFRelease(t);
-              }
+                  sum([NSString stringWithFormat:@"csflags=0x%08x platform=%d",
+                       f, !!(f & 0x04000000)]);
           }
 
-          static void vt_out(void* r, void* s, OSStatus st, VTEncodeInfoFlags f, CMSampleBufferRef sb) {
-              dispatch_semaphore_signal(g_sem);
-          }
-
+          static void vt_out(void* r, void* s, OSStatus st, VTEncodeInfoFlags f, CMSampleBufferRef sb) {}
           static void vt_warm(void) {
-              g_sem = dispatch_semaphore_create(0);
-              if (VTCompressionSessionCreate(NULL, 1920, 1080, kCMVideoCodecType_H264,
-                      NULL, NULL, NULL, vt_out, NULL, &g_vt) != noErr || !g_vt) {
-                  sum(@"vt create FAIL"); return;
-              }
-              sum(@"vt create ok");
-              VTCompressionSessionPrepareToEncodeFrames(g_vt);
-              CVPixelBufferRef pb = NULL;
-              CVPixelBufferCreate(NULL, 1920, 1080, kCVPixelFormatType_32BGRA, NULL, &pb);
-              if (!pb) return;
-              VTCompressionSessionEncodeFrame(g_vt, pb, CMTimeMake(1, 30), CMTimeMake(1, 30), NULL, NULL, NULL);
-              dispatch_semaphore_wait(g_sem, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC));
-              CVPixelBufferRelease(pb);
+              VTCompressionSessionRef v = NULL;
+              OSStatus st = VTCompressionSessionCreate(NULL, 1920, 1080, kCMVideoCodecType_H264,
+                      NULL, NULL, NULL, vt_out, NULL, &v);
+              sum([NSString stringWithFormat:@"vt create=%d", (int)st]);
+              if (v) { VTCompressionSessionPrepareToEncodeFrames(v); }
           }
 
-          static void map_sel(io_connect_t c, const char* tag) {
-              NSMutableString* row = [NSMutableString string];
-              int live = 0;
-              for (uint32_t sel = 0; sel < 48; sel++) {
-                  uint64_t out[16] = {0}; uint32_t oc = 16;
-                  kern_return_t kr = IOConnectCallScalarMethod(c, sel, NULL, 0, out, &oc);
-                  if (kr == KERN_SUCCESS || kr == 0xe00002c2 ||
-                      kr == 0xe00002be || kr == 0xe00002bd) {
-                      live++;
-                      [row appendFormat:@" %u=%@", sel, kr_name(kr)];
-                  }
-                  usleep(3000);
-              }
-              add_line([NSString stringWithFormat:@"  %s live=%d ->%@", tag, live, row.length ? row : @" -"]);
-          }
+          static void probe_sel(io_connect_t c, uint32_t type, uint32_t sel) {
+              for (int i = 0; i < kNSizes; i++) {
+                  size_t sz = kSizes[i];
+                  uint8_t* in = calloc(1, sz);
+                  uint8_t out[4096];
+                  size_t outSz = sizeof(out);
+                  memset(out, 0xCC, sizeof(out));
+                  kern_return_t kr = IOConnectCallStructMethod(c, sel, in, sz, out, &outSz);
+                  free(in);
 
-          static void deepen(io_connect_t c, const char* tag) {
-              for (uint32_t sel = 0; sel < 48; sel++) {
-                  uint64_t o1[16] = {0}; uint32_t oc1 = 16;
-                  if (IOConnectCallScalarMethod(c, sel, NULL, 0, o1, &oc1) != 0xe00002c2) continue;
-                  for (int ic = 1; ic <= 4; ic++) {
-                      uint64_t in[8] = {0}; uint64_t out[16] = {0}; uint32_t oc = 16;
-                      kern_return_t kr = IOConnectCallScalarMethod(c, sel, in, (uint32_t)ic, out, &oc);
-                      add_line([NSString stringWithFormat:@"    %s sel %u in=%d -> %@ out0=0x%llx",
-                                tag, sel, ic, kr_name(kr), out[0]]);
-                      if (kr != 0xe00002c2) break;
+                  if (kr == 0xe00002c7) {
+                      add_line([NSString stringWithFormat:@"t%u s%u sz=%zu -> Unsup (slot dead)", type, sel, sz]);
+                      return;
                   }
-              }
-          }
+                  if (kr == 0xe00002c2) continue;
 
-          static void do_ave(void) {
-              io_iterator_t it = 0;
-              if (IOServiceGetMatchingServices(kIOMainPortDefault,
-                      IOServiceMatching("AppleAVE2Driver"), &it) != KERN_SUCCESS) return;
-              io_service_t s;
-              while ((s = IOIteratorNext(it))) {
-                  for (int t = 0; t <= 6; t++) {
-                      io_connect_t c = 0;
-                      kern_return_t kr = IOServiceOpen(s, mach_task_self(), (uint32_t)t, &c);
-                      if (kr == KERN_SUCCESS) g_ave++;
-                      add_line([NSString stringWithFormat:@"AVE t=%d -> %@", t, kr_name(kr)]);
+                  g_hits++;
+                  add_line([NSString stringWithFormat:@"!! t%u s%u sz=%zu -> %@ out=%zu %@",
+                            type, sel, sz, kr_name(kr), outSz, hex(out, outSz)]);
+                  for (int r = 0; r < 2; r++) {
+                      uint8_t* in2 = calloc(1, sz);
+                      uint8_t out2[4096]; size_t outSz2 = sizeof(out2);
+                      kern_return_t k2 = IOConnectCallStructMethod(c, sel, in2, sz, out2, &outSz2);
+                      free(in2);
+                      add_line([NSString stringWithFormat:@"   confirm %d -> %@ out=%zu %@",
+                                r, kr_name(k2), outSz2, hex(out2, outSz2)]);
+                      usleep(4000);
                   }
-                  IOObjectRelease(s);
+                  return;
               }
-              IOObjectRelease(it);
-          }
-
-          static void do_jpeg(void) {
-              io_iterator_t it = 0;
-              if (IOServiceGetMatchingServices(kIOMainPortDefault,
-                      IOServiceMatching("AppleJPEGDriver"), &it) != KERN_SUCCESS) {
-                  add_line(@"JPEG: no match"); return;
-              }
-              io_service_t s; int nodes = 0;
-              while ((s = IOIteratorNext(it)) && nodes < 3) {
-                  nodes++;
-                  add_line([NSString stringWithFormat:@"JPEG node %d", nodes]);
-                  for (int t = 20; t <= 26; t++) {
-                      io_connect_t c = 0;
-                      kern_return_t kr = IOServiceOpen(s, mach_task_self(), (uint32_t)t, &c);
-                      if (kr != KERN_SUCCESS) { add_line([NSString stringWithFormat:@"  t=%d -> %@", t, kr_name(kr)]); continue; }
-                      g_jpeg++;
-                      char tag[24]; snprintf(tag, sizeof(tag), "n%d.t%d", nodes, t);
-                      add_line([NSString stringWithFormat:@"  t=%d OPEN conn=%u", t, c]);
-                      map_sel(c, tag);
-                      deepen(c, tag);
-                  }
-                  IOObjectRelease(s);
-              }
-              IOObjectRelease(it);
+              add_line([NSString stringWithFormat:@"t%u s%u -> all sizes BadArg", type, sel]);
           }
 
           static void run_probe(void) {
               g_sum = [NSMutableString string];
-              add_line(@"[+] probe start");
+              add_line(@"[+] struct-method sweep");
               check_sig();
-              add_line(@"[*] vt");
+
               vt_warm();
-              usleep(400000);
-              add_line(@"[*] AVE");
-              do_ave();
-              add_line(@"[*] JPEG");
-              do_jpeg();
+              usleep(300000);
+
+              io_iterator_t it = 0;
+              if (IOServiceGetMatchingServices(kIOMainPortDefault,
+                      IOServiceMatching("AppleJPEGDriver"), &it) != KERN_SUCCESS) {
+                  add_line(@"no JPEG driver"); return;
+              }
+              io_service_t s;
+              while ((s = IOIteratorNext(it)) && g_nconn < 4) {
+                  for (int t = 20; t <= 26 && g_nconn < 4; t++) {
+                      io_connect_t c = 0;
+                      if (IOServiceOpen(s, mach_task_self(), (uint32_t)t, &c) == KERN_SUCCESS) {
+                          g_conn[g_nconn] = c;
+                          g_ctype[g_nconn] = (uint32_t)t;
+                          g_nconn++;
+                          add_line([NSString stringWithFormat:@"open type=%d", t]);
+                      }
+                  }
+                  IOObjectRelease(s);
+              }
+              IOObjectRelease(it);
+
+              if (!g_nconn) { add_line(@"no connections"); dump_file(); return; }
+
+              for (int n = 0; n < g_nconn; n++) {
+                  add_line([NSString stringWithFormat:@"=== sweep conn type=%u ===", g_ctype[n]]);
+                  for (uint32_t sel = 0; sel < 48; sel++) {
+                      probe_sel(g_conn[n], g_ctype[n], sel);
+                      usleep(2000);
+                  }
+              }
+
               add_line(@"=========== SUMMARY ===========");
-              add_line([NSString stringWithFormat:@"os=%@ model=%@", sysctl_str("kern.osproductversion"), sysctl_str("hw.model")]);
+              add_line([NSString stringWithFormat:@"conns=%d hits=%d", g_nconn, g_hits]);
               add_line(g_sum);
-              add_line([NSString stringWithFormat:@"ave_opens=%d jpeg_opens=%d", g_ave, g_jpeg]);
-              add_line(g_jpeg ? @"[+] JPEG CLIENT LIVE" : @"[-] JPEG dead");
+              add_line(g_hits ? @"[+] STRUCT TABLE REACHED" : @"[-] all struct sizes rejected");
               add_line(@"[*] done");
               dump_file();
           }
@@ -269,7 +238,7 @@ jobs:
               g_tv = [[UITextView alloc] initWithFrame:r];
               g_tv.backgroundColor = UIColor.blackColor;
               g_tv.textColor = UIColor.greenColor;
-              g_tv.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
+              g_tv.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
               g_tv.editable = NO;
               g_tv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
               g_tv.text = @"boot ok";
