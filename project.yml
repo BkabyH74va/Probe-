@@ -1,0 +1,12 @@
+name: probe
+options: { bundleIdPrefix: com.buurza, deploymentTarget: { iOS: "16.0" } }
+targets:
+  probe:
+    type: application
+    platform: iOS
+    sources: [Sources]
+    entitlements: { path: probe.entitlements }
+    settings: { ARCHS: "arm64e arm64", CODE_SIGN_IDENTITY: "" }
+    dependencies:
+      - sdk: IOKit.framework
+      - sdk: UIKit.framework
