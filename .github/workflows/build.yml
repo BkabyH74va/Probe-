@@ -48,7 +48,10 @@ jobs:
             <key>platform-application</key><true/>
             <key>com.apple.private.security.no-container</key><true/>
             <key>com.apple.security.iokit-user-client-class</key>
-            <array><string>AVEVideoEncoderUserClient</string></array>
+            <array>
+              <string>AVEVideoEncoderUserClient</string>
+              <string>AppleAVE2UserClient</string>
+            </array>
           </dict></plist>
           EOF
           cat > Sources/main.m <<'EOF'
@@ -59,11 +62,16 @@ jobs:
           #import <Security/Security.h>
           #include <unistd.h>
           #include <dlfcn.h>
+          #include <errno.h>
+          #include <sys/sysctl.h>
 
-          // SecTask nie jest w publicznych naglowkach iOS
           typedef struct __SecTask *SecTaskRef;
           extern SecTaskRef SecTaskCreateFromSelf(CFAllocatorRef);
           extern CFTypeRef SecTaskCopyValueForEntitlement(SecTaskRef, CFStringRef, CFErrorRef *);
+          extern int csops(pid_t, unsigned int, void *, size_t);
+
+          #define CS_OPS_STATUS            0
+          #define CS_OPS_ENTITLEMENTS_BLOB 7
 
           typedef kern_return_t (*fn_auth)(io_service_t, IOOptionBits);
 
@@ -72,6 +80,7 @@ jobs:
           static NSUInteger g_ticks = 0;
           static dispatch_semaphore_t g_sem;
           static VTCompressionSessionRef g_vt = NULL;
+          static int g_opens = 0;
 
           static void add_line(NSString* s) {
               dispatch_async(dispatch_get_main_queue(), ^{
@@ -84,38 +93,60 @@ jobs:
               NSString* p = [NSSearchPathForDirectoriesInDomains(
                   NSDocumentDirectory, NSUserDomainMask, YES).firstObject
                   stringByAppendingPathComponent:@"probe.txt"];
-              [g_tv.text writeToFile:p atomically:YES
-                          encoding:NSUTF8StringEncoding error:nil];
+              [g_tv.text writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
           }
 
-          static void check_entitlements(void) {
+          static NSString* sysctl_str(const char* key) {
+              char b[256] = {0}; size_t l = sizeof(b);
+              if (sysctlbyname(key, b, &l, NULL, 0) != 0) return @"?";
+              return @(b);
+          }
+
+          // ---- sygnatura binarnego ----
+          static void check_csflags(void) {
+              uint32_t f = 0;
+              int r = csops(getpid(), CS_OPS_STATUS, &f, sizeof(f));
+              if (r != 0) { add_line([NSString stringWithFormat:@"csops status errno=%d", errno]); return; }
+              add_line([NSString stringWithFormat:@"csflags=0x%08x", f]);
+              add_line([NSString stringWithFormat:@"  platform=%d installer=%d restrict=%d gettaskallow=%d",
+                        !!(f & 0x04000000), !!(f & 0x00080000), !!(f & 0x00000800), !!(f & 0x00000004)]);
+          }
+
+          static void dump_ent_blob(void) {
+              uint8_t buf[8192]; size_t len = sizeof(buf);
+              int r = csops(getpid(), CS_OPS_ENTITLEMENTS_BLOB, buf, len);
+              if (r != 0) { add_line([NSString stringWithFormat:@"ent blob errno=%d (BRAK = wyciete)", errno]); return; }
+              NSMutableString* s = [NSMutableString string];
+              for (size_t i = 0; i < len && s.length < 1500; i++) {
+                  uint8_t c = buf[i];
+                  if (c == '\n') [s appendString:@"\n"];
+                  else if (c >= 32 && c < 127) [s appendFormat:@"%c", c];
+              }
+              add_line(@"--- raw ent blob ---");
+              add_line(s.length ? s : @"(pusty)");
+          }
+
+          static void check_ent_keys(void) {
               SecTaskRef t = SecTaskCreateFromSelf(kCFAllocatorDefault);
-              if (!t) { add_line(@"SecTask: nil"); return; }
-              CFTypeRef plat = SecTaskCopyValueForEntitlement(t, CFSTR("platform-application"), NULL);
-              CFTypeRef nocon = SecTaskCopyValueForEntitlement(t, CFSTR("com.apple.private.security.no-container"), NULL);
-              CFTypeRef iok  = SecTaskCopyValueForEntitlement(t, CFSTR("com.apple.security.iokit-user-client-class"), NULL);
-              add_line([NSString stringWithFormat:@"ent platform-application = %@", plat ? @"YES" : @"nil"]);
-              add_line([NSString stringWithFormat:@"ent no-container = %@", nocon ? @"YES" : @"nil"]);
-              add_line([NSString stringWithFormat:@"ent iokit-user-client-class = %@", iok ? @"YES" : @"nil"]);
-              if (plat) CFRelease(plat);
-              if (nocon) CFRelease(nocon);
-              if (iok) CFRelease(iok);
+              if (!t) { add_line(@"SecTask nil"); return; }
+              const char* keys[] = {
+                  "platform-application",
+                  "com.apple.private.security.no-container",
+                  "com.apple.security.iokit-user-client-class",
+                  "application-identifier",
+                  "com.apple.developer.team-identifier",
+                  "get-task-allow"
+              };
+              for (int i = 0; i < 6; i++) {
+                  CFTypeRef v = SecTaskCopyValueForEntitlement(t, (__bridge CFStringRef)@(keys[i]), NULL);
+                  add_line([NSString stringWithFormat:@"ent %s = %@", keys[i],
+                            v ? [(__bridge id)v description] : @"nil"]);
+                  if (v) CFRelease(v);
+              }
               CFRelease(t);
           }
 
-          static void dump_props(io_service_t svc) {
-              CFMutableDictionaryRef props = NULL;
-              if (IORegistryEntryCreateCFProperties(svc, &props, kCFAllocatorDefault, 0) != KERN_SUCCESS || !props) {
-                  add_line(@"props: none"); return;
-              }
-              CFStringRef uc = CFDictionaryGetValue(props, CFSTR("IOUserClientClass"));
-              add_line(uc ? [NSString stringWithFormat:@"IOUserClientClass = %@", (__bridge NSString*)uc]
-                          : @"IOUserClientClass: absent");
-              CFTypeRef acc = IORegistryEntryCreateCFProperty(svc, CFSTR("IOKitUserClientAccess"), kCFAllocatorDefault, 0);
-              if (acc) { add_line(@"IOKitUserClientAccess present"); CFRelease(acc); }
-              CFRelease(props);
-          }
-
+          // ---- VT ----
           static void vt_out(void* r, void* s, OSStatus st, VTEncodeInfoFlags f, CMSampleBufferRef sb) {
               dispatch_semaphore_signal(g_sem);
           }
@@ -130,68 +161,96 @@ jobs:
               CVPixelBufferRef pb = NULL;
               CVPixelBufferCreate(NULL, 1920, 1080, kCVPixelFormatType_32BGRA, NULL, &pb);
               if (!pb) return;
-              VTCompressionSessionEncodeFrame(g_vt, pb, CMTimeMake(1, 30), CMTimeMake(1, 30),
-                                              NULL, NULL, NULL);
+              VTCompressionSessionEncodeFrame(g_vt, pb, CMTimeMake(1, 30), CMTimeMake(1, 30), NULL, NULL, NULL);
               long w = dispatch_semaphore_wait(g_sem, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC));
               add_line([NSString stringWithFormat:@"vt encode waited=%ld", w]);
               CVPixelBufferRelease(pb);
           }
 
-          static void sweep(io_service_t svc, const char* label) {
-              for (int t = 0; t <= 16; t++) {
+          // ---- inspekcja wezla ----
+          static void dump_props(io_service_t svc) {
+              CFMutableDictionaryRef p = NULL;
+              if (IORegistryEntryCreateCFProperties(svc, &p, kCFAllocatorDefault, 0) != KERN_SUCCESS || !p) {
+                  add_line(@"  props: brak"); return;
+              }
+              const char* keys[] = { "IOUserClientClass", "IOKitUserClientAccess",
+                                     "IOClass", "IOProviderClass", "CFBundleIdentifier",
+                                     "IOKitDebug", "IOUserClientEntitlements" };
+              for (int i = 0; i < 7; i++) {
+                  CFTypeRef v = CFDictionaryGetValue(p, (__bridge CFStringRef)@(keys[i]));
+                  if (!v) continue;
+                  NSString* d = [(__bridge id)v description];
+                  if (d.length > 300) d = [[d substringToIndex:300] stringByAppendingString:@"…"];
+                  add_line([NSString stringWithFormat:@"  %s = %@", keys[i], d]);
+              }
+              CFRelease(p);
+          }
+
+          static void sweep(io_service_t svc, const char* label, fn_auth auth) {
+              for (int t = 0; t <= 31; t++) {
                   io_connect_t c = 0;
                   kern_return_t kr = IOServiceOpen(svc, mach_task_self(), (uint32_t)t, &c);
                   if (kr == KERN_SUCCESS) {
+                      g_opens++;
                       add_line([NSString stringWithFormat:@"!! %s type=%d OPEN conn=%u", label, t, c]);
-                  } else if (t == 0 || t == 1) {
-                      add_line([NSString stringWithFormat:@"%s type=%d -> 0x%x", label, t, kr]);
+                      for (uint64_t sel = 0; sel < 3; sel++) {
+                          uint64_t out[8] = {0}; uint32_t oc = 8;
+                          kern_return_t sr = IOConnectCallScalarMethod(c, (uint32_t)sel, NULL, 0, out, &oc);
+                          add_line([NSString stringWithFormat:@"   sel %llu -> 0x%x", sel, sr]);
+                      }
+                      continue;
                   }
+                  if (t <= 3) add_line([NSString stringWithFormat:@"%s type=%d -> 0x%x", label, t, kr]);
               }
           }
 
-          static io_service_t find_one(const char* cls) {
-              io_iterator_t it = 0;
-              if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching(cls), &it) != KERN_SUCCESS) return 0;
-              io_service_t s = IOIteratorNext(it);
-              IOObjectRelease(it);
-              return s;
+          static void inspect(io_service_t svc, fn_auth auth) {
+              io_name_t cls; IOObjectGetClass(svc, cls);
+              add_line([NSString stringWithFormat:@"NODE %s", cls]);
+              io_service_t par = 0;
+              if (IORegistryEntryGetParentEntry(svc, kIOServicePlane, &par) == KERN_SUCCESS) {
+                  io_name_t pc; IOObjectGetClass(par, pc);
+                  add_line([NSString stringWithFormat:@"  parent %s", pc]);
+                  IOObjectRelease(par);
+              }
+              dump_props(svc);
+              if (auth) add_line([NSString stringWithFormat:@"  authorize=0x%x", auth(svc, 0)]);
+              sweep(svc, cls, auth);
           }
 
           static void run_probe(void) {
               add_line(@"[+] probe start");
-              check_entitlements();
+              add_line([NSString stringWithFormat:@"os=%@ model=%@", sysctl_str("kern.osproductversion"), sysctl_str("hw.model")]);
+              check_csflags();
+              check_ent_keys();
+              dump_ent_blob();
 
               fn_auth auth = (fn_auth)dlsym(RTLD_DEFAULT, "IOServiceAuthorize");
-              add_line(auth ? @"authorize symbol = present" : @"authorize symbol = absent");
+              add_line(auth ? @"authorize: present" : @"authorize: absent");
 
-              io_service_t ave = find_one("AppleAVE2Driver");
-              if (!ave) { add_line(@"no driver node"); dump_file(); return; }
-
-              dump_props(ave);
-
-              if (auth) {
-                  kern_return_t az = auth(ave, 0);
-                  add_line([NSString stringWithFormat:@"authorize=0x%x", az]);
-              }
-
-              add_line(@"[*] encode");
+              add_line(@"[*] VT warmup");
               vt_full();
-              usleep(500000);
+              usleep(600000);
 
-              add_line(@"[*] sweep AppleAVE2Driver");
-              sweep(ave, "drv");
-
-              CFTypeRef uc = IORegistryEntryCreateCFProperty(ave, CFSTR("IOUserClientClass"), kCFAllocatorDefault, 0);
-              if (uc) {
-                  NSString* name = (__bridge NSString*)uc;
-                  add_line([NSString stringWithFormat:@"[*] trying UC class %@", name]);
-                  io_service_t nub = find_one(name.UTF8String);
-                  if (nub) { sweep(nub, "uc"); IOObjectRelease(nub); }
-                  else add_line(@"no node for UC class");
-                  CFRelease(uc);
+              add_line(@"[*] registry scan");
+              io_iterator_t it = 0;
+              if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOService"), &it) != KERN_SUCCESS) {
+                  add_line(@"scan failed"); dump_file(); return;
               }
-              IOObjectRelease(ave);
+              io_service_t s; int n = 0, hits = 0;
+              while ((s = IOIteratorNext(it)) && n < 12000) {
+                  io_name_t c; IOObjectGetClass(s, c);
+                  NSString* cs = @(c);
+                  BOOL match = [cs containsString:@"AVE"] || [cs containsString:@"AVE2"] ||
+                               [cs containsString:@"VideoEncoder"] || [cs containsString:@"VideoCodec"] ||
+                               [cs containsString:@"AppleH"] ;
+                  if (match && hits < 40) { hits++; inspect(s, auth); }
+                  IOObjectRelease(s); n++;
+              }
+              IOObjectRelease(it);
+              add_line([NSString stringWithFormat:@"scanned=%d hits=%d opens=%d", n, hits, g_opens]);
 
+              add_line(g_opens ? @"[+] VERDICT: OPENABLE" : @"[-] VERDICT: no open");
               add_line(@"[*] done");
               dump_file();
           }
@@ -213,12 +272,11 @@ jobs:
               [vc.view addSubview:g_hb];
 
               CGRect r = vc.view.bounds;
-              r.origin.y = 72;
-              r.size.height -= 80;
+              r.origin.y = 72; r.size.height -= 80;
               g_tv = [[UITextView alloc] initWithFrame:r];
               g_tv.backgroundColor = UIColor.blackColor;
               g_tv.textColor = UIColor.greenColor;
-              g_tv.font = [UIFont monospacedSystemFontOfSize:13 weight:UIFontWeightRegular];
+              g_tv.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
               g_tv.editable = NO;
               g_tv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
               g_tv.text = @"boot ok";
