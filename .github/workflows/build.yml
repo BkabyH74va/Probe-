@@ -37,6 +37,7 @@ jobs:
                 - sdk: UIKit.framework
                 - sdk: VideoToolbox.framework
                 - sdk: CoreMedia.framework
+                - sdk: CoreVideo.framework
           EOF
           cat > probe.entitlements <<'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
@@ -50,11 +51,14 @@ jobs:
           #import <UIKit/UIKit.h>
           #import <IOKit/IOKitLib.h>
           #import <VideoToolbox/VideoToolbox.h>
+          #import <CoreVideo/CoreVideo.h>
+          #include <unistd.h>
 
           static UITextView* g_tv;
           static UILabel* g_hb;
           static NSUInteger g_ticks = 0;
           static VTCompressionSessionRef g_vt = NULL;
+          static dispatch_semaphore_t g_sem;
 
           static void add_line(NSString* s) {
               dispatch_async(dispatch_get_main_queue(), ^{
@@ -71,8 +75,33 @@ jobs:
                           encoding:NSUTF8StringEncoding error:nil];
           }
 
-          // proba otwarcia podana nazwa; 1 = sukces
-          static int try_open(NSString* cls) {
+          static void vt_out(void* ref, void* src, OSStatus st,
+                             VTEncodeInfoFlags fl, CMSampleBufferRef sbuf) {
+              dispatch_semaphore_signal(g_sem);
+          }
+
+          static void vt_full(void) {
+              g_sem = dispatch_semaphore_create(0);
+              OSStatus st = VTCompressionSessionCreate(NULL, 1920, 1080,
+                      kCMVideoCodecType_H264, NULL, NULL, NULL, vt_out, NULL, &g_vt);
+              add_line([NSString stringWithFormat:@"vt create=%d", (int)st]);
+              if (!g_vt) return;
+
+              VTCompressionSessionPrepareToEncodeFrames(g_vt);
+
+              CVPixelBufferRef pb = NULL;
+              CVPixelBufferCreate(NULL, 1920, 1080, kCVPixelFormatType_32BGRA, NULL, &pb);
+              if (pb) {
+                  VTCompressionSessionEncodeFrame(g_vt, pb,
+                      CMTimeMake(1, 30), CMTimeMake(1, 30), NULL, NULL, NULL);
+                  long w = dispatch_semaphore_wait(g_sem,
+                      dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC));
+                  add_line([NSString stringWithFormat:@"vt encode waited=%ld", w]);
+                  CVPixelBufferRelease(pb);
+              }
+          }
+
+          static int try_open_type(NSString* cls, int type) {
               io_iterator_t it = 0;
               if (IOServiceGetMatchingServices(kIOMainPortDefault,
                       IOServiceMatching(cls.UTF8String), &it) != KERN_SUCCESS) return -1;
@@ -80,67 +109,61 @@ jobs:
               IOObjectRelease(it);
               if (!svc) return 0;
               io_connect_t c = 0;
-              kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &c);
+              kern_return_t kr = IOServiceOpen(svc, mach_task_self(), (uint32_t)type, &c);
+              BOOL uc = IOObjectConformsTo(svc, "IOUserClient");
               IOObjectRelease(svc);
-              add_line([NSString stringWithFormat:@"%@ open=0x%x conn=%u", cls, kr, c]);
+              add_line([NSString stringWithFormat:@"%@ type=%d uc=%d open=0x%x conn=%u",
+                        cls, type, (int)uc, kr, c]);
               return kr == KERN_SUCCESS;
           }
 
-          static void vt_warmup(void) {
-              OSStatus st = VTCompressionSessionCreate(NULL, 1920, 1080,
-                      kCMVideoCodecType_H264, NULL, NULL, NULL, NULL, NULL, &g_vt);
-              add_line([NSString stringWithFormat:@"vt create=%d", (int)st]);
-              if (g_vt) VTCompressionSessionPrepareToEncodeFrames(g_vt);
-          }
-
-          static void dump_registry(void) {
-              add_line(@"[*] enumerating registry");
+          static void dump_subtree(io_service_t root, const char* plane) {
               io_iterator_t it = 0;
-              if (IOServiceGetMatchingServices(kIOMainPortDefault,
-                      IOServiceMatching("IOService"), &it) != KERN_SUCCESS) {
-                  add_line(@"enum failed"); return;
-              }
-              io_service_t s; int n = 0, hits = 0;
-              while ((s = IOIteratorNext(it)) && n < 8000) {
-                  io_name_t cls; IOObjectGetClass(s, cls);
-                  NSString* c = @(cls);
-                  if ([c containsString:@"AVE"] || [c containsString:@"Video"] ||
-                      [c containsString:@"Encode"] || [c containsString:@"Codec"] ||
-                      [c containsString:@"H264"] || [c containsString:@"HEVC"]) {
-                      hits++;
-                      io_connect_t conn = 0;
-                      kern_return_t kr = IOServiceOpen(s, mach_task_self(), 0, &conn);
-                      add_line([NSString stringWithFormat:@"HIT %@ open=0x%x", c, kr]);
-                  }
+              if (IORegistryEntryGetChildIterator(root, plane, &it) != KERN_SUCCESS) return;
+              io_service_t s; int n = 0;
+              while ((s = IOIteratorNext(it)) && n < 200) {
+                  io_name_t nm; IOObjectGetClass(s, nm);
+                  BOOL uc = IOObjectConformsTo(s, "IOUserClient");
+                  io_connect_t c = 0;
+                  kern_return_t kr = IOServiceOpen(s, mach_task_self(), 0, &c);
+                  add_line([NSString stringWithFormat:@"  child %s uc=%d open=0x%x", nm, (int)uc, kr]);
                   IOObjectRelease(s); n++;
               }
               IOObjectRelease(it);
-              add_line([NSString stringWithFormat:@"scanned=%d hits=%d", n, hits]);
+          }
+
+          static io_service_t find_one(const char* cls) {
+              io_iterator_t it = 0;
+              if (IOServiceGetMatchingServices(kIOMainPortDefault,
+                      IOServiceMatching(cls), &it) != KERN_SUCCESS) return 0;
+              io_service_t s = IOIteratorNext(it);
+              IOObjectRelease(it);
+              return s;
           }
 
           static void run_probe(void) {
               add_line(@"[+] probe start");
-              int r = try_open(@"AVEVideoEncoder");
-              if (r == -1) add_line(@"NO SERVICE");
-              if (r > 0) { dump_file(); return; }
 
-              add_line(@"[*] warmup VT");
-              vt_warmup();
-
-              for (int i = 0; i < 6; i++) {
-                  usleep(300000);
-                  r = try_open(@"AVEVideoEncoder");
-                  if (r > 0) { add_line(@"[+] GOT IT"); dump_file(); return; }
-                  add_line([NSString stringWithFormat:@"retry %d -> %d", i, r]);
+              io_service_t ave = find_one("AppleAVE2Driver");
+              if (!ave) { add_line(@"no AppleAVE2Driver node yet"); }
+              else {
+                  add_line(@"[*] subtree of AppleAVE2Driver:");
+                  dump_subtree(ave, kIOServicePlane);
+                  IOObjectRelease(ave);
               }
 
-              try_open(@"AVEVideoEncoderUserClient");
-              try_open(@"AppleAVE2Driver");
-              try_open(@"AppleAVE2");
+              add_line(@"[*] warmup VT with a real frame");
+              vt_full();
 
-              dump_registry();
-              dump_file();
+              for (int i = 0; i < 4; i++) {
+                  usleep(400000);
+                  add_line([NSString stringWithFormat:@"--- after encode %d ---", i]);
+                  try_open_type(@"AVEVideoEncoder", 0);
+                  for (int t = 0; t <= 3; t++) try_open_type(@"AppleAVE2Driver", t);
+              }
+
               add_line(@"[*] done");
+              dump_file();
           }
 
           @interface AppDelegate : UIResponder <UIApplicationDelegate>
