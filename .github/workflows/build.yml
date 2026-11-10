@@ -54,7 +54,7 @@ jobs:
           typedef kern_return_t (*fn_addclient)(io_connect_t, io_connect_t);
           static fn_addclient g_addclient = NULL;
 
-          #define BUILD_TAG "v44-linux"
+          #define BUILD_TAG "v45-linux"
           #define MAXC 40
           #define STEP_MAX 27
           #define TRY_MAX 2
@@ -1334,13 +1334,13 @@ jobs:
           <plist version="1.0"><dict>
             <key>CFBundleDevelopmentRegion</key><string>en</string>
             <key>CFBundleExecutable</key><string>probe</string>
-            <key>CFBundleIdentifier</key><string>com.buurza44.probe</string>
+            <key>CFBundleIdentifier</key><string>com.buurza45.probe</string>
             <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
             <key>CFBundleName</key><string>probe</string>
-            <key>CFBundleDisplayName</key><string>buurd44</string>
+            <key>CFBundleDisplayName</key><string>buurd45</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleShortVersionString</key><string>1.0</string>
-            <key>CFBundleVersion</key><string>46</string>
+            <key>CFBundleVersion</key><string>47</string>
             <key>MinimumOSVersion</key><string>17.0</string>
             <key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
             <key>UILaunchScreen</key><dict/>
@@ -1366,7 +1366,7 @@ jobs:
   linux:
     needs: stage
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/download-artifact@v4.1.8
         with:
@@ -1374,38 +1374,85 @@ jobs:
 
       - name: toolchain
         run: |
-          set -e
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq clang lld ldid zip unzip curl file
+          set -uo pipefail
+          sudo apt-get update -qq || true
+          PKGS="clang lld zip unzip curl file ca-certificates"
+          if ! sudo apt-get install -y -qq $PKGS; then
+            echo "first apt pass failed, refreshing"
+            sudo apt-get update || true
+            sudo apt-get install -y $PKGS
+          fi
+          for b in clang zip unzip curl file; do
+            command -v "$b" >/dev/null || { echo "MISSING $b"; exit 1; }
+          done
+          LD64="$(command -v ld64.lld || true)"
+          if [ -z "$LD64" ]; then
+            for c in /usr/lib/llvm-*/bin/ld64.lld /usr/bin/ld64.lld; do
+              [ -x "$c" ] && LD64="$c" && break
+            done
+          fi
+          if [ -z "$LD64" ]; then
+            echo "ld64.lld NOT FOUND after install"
+            dpkg -L lld 2>/dev/null | grep -i ld64 || true
+            ls /usr/lib/llvm-*/bin/ 2>/dev/null | head -40 || true
+            exit 1
+          fi
+          echo "ld64.lld=$LD64"
           clang --version | head -1
-          ld64.lld --version || true
-          which ldid
+          echo "toolchain ok"
 
       - name: sdk
         run: |
-          set -e
+          set -euo pipefail
           ok=0
+          try() {
+            echo "try $1"
+            code=$(curl -sSL --retry 2 --max-time 240 -o "$2" -w '%{http_code}' "$1" || echo 000)
+            [ "$code" = "200" ] || { echo "  http $code"; return 1; }
+            return 0
+          }
           for u in \
             "https://github.com/xybp888/iOS-SDKs/raw/master/iPhoneOS17.5.sdk.zip" \
             "https://github.com/xybp888/iOS-SDKs/raw/master/iPhoneOS17.4.sdk.zip" \
             "https://github.com/xybp888/iOS-SDKs/raw/master/iPhoneOS17.2.sdk.zip" \
             "https://github.com/xybp888/iOS-SDKs/raw/master/iPhoneOS17.0.sdk.zip"; do
-            echo "try $u"
-            code=$(curl -sSL --retry 2 -o sdk.zip -w '%{http_code}' "$u" || echo 000)
-            if [ "$code" = "200" ]; then ok=1; echo "SDK OK: $u"; break; fi
+            if try "$u" sdk.zip; then ok=1; break; fi
           done
-          test $ok -eq 1 || { echo "SDK FETCH FAILED"; exit 1; }
-          unzip -q sdk.zip
-          D=$(ls -d *.sdk | head -1)
-          echo "SDK_DIR=$D" >> "$GITHUB_ENV"
-          test -f "$D/usr/lib/libSystem.tbd" || test -f "$D/usr/lib/libSystem.dylib" || { echo "BAD SDK LAYOUT"; ls "$D"; exit 1; }
-          test -d "$D/System/Library/Frameworks/UIKit.framework" || { echo "NO UIKIT"; exit 1; }
-          echo "sdk staged: $D"
+          if [ $ok -eq 0 ]; then
+            echo "zip mirrors dead, trying theos tarball"
+            try "https://codeload.github.com/theos/sdks/tar.gz/refs/heads/master" sdk.tar.gz || true
+            if [ -s sdk.tar.gz ]; then
+              tar xzf sdk.tar.gz
+              D=$(ls -d sdks-master/*.sdk 2>/dev/null | sort -V | tail -1)
+              if [ -n "$D" ]; then mkdir -p x && cp -a "$D" x/ && ok=1; fi
+            fi
+          else
+            unzip -q sdk.zip
+            D=$(ls -d *.sdk 2>/dev/null | head -1)
+            [ -n "$D" ] && { mkdir -p x; mv "$D" x/; }
+          fi
+          test $ok -eq 1 || { echo "SDK FETCH FAILED"; ls -la; exit 1; }
+          SDK_DIR="$(cd x && ls -d *.sdk | head -1 && cd .. && pwd)/$(cd x && ls -d *.sdk | head -1)"
+          test -d "$SDK_DIR" || { echo "SDK_DIR bad: $SDK_DIR"; exit 1; }
+          echo "SDK_DIR=$SDK_DIR" >> "$GITHUB_ENV"
+          echo "sdk staged: $SDK_DIR"
+          ls "$SDK_DIR" | head
+          test -d "$SDK_DIR/System/Library/Frameworks/UIKit.framework" || { echo "NO UIKIT"; exit 1; }
+          test -f "$SDK_DIR/usr/lib/libSystem.tbd" || test -f "$SDK_DIR/usr/lib/libSystem.dylib" || { echo "NO LIBSYSTEM STUB"; exit 1; }
+          MINVER=17.0
+          case "$SDK_DIR" in
+            *iPhoneOS16*) MINVER=16.0 ;;
+            *iPhoneOS15*) MINVER=15.0 ;;
+            *iPhoneOS14*) MINVER=14.0 ;;
+          esac
+          echo "MINVER=$MINVER" >> "$GITHUB_ENV"
+          echo "deployment target: $MINVER"
+          sed -i "s#<string>17.0</string>#<string>$MINVER</string>#" out/Payload/probe.app/Info.plist || true
 
       - name: syntax
         run: |
           set +e
-          clang -fsyntax-only -target arm64-apple-ios17.0 -fobjc-arc \
+          clang -fsyntax-only -target "arm64-apple-ios$MINVER" -fobjc-arc \
             -isysroot "$SDK_DIR" -Wno-implicit-function-declaration \
             Sources/main.m > s.log 2>&1
           rc=$?
@@ -1420,9 +1467,9 @@ jobs:
           APP=out/Payload/probe.app
           mkdir -p "$APP"
           set +e
-          clang -target arm64-apple-ios17.0 -fuse-ld=lld -fobjc-arc -O1 \
+          clang -target "arm64-apple-ios$MINVER" -fuse-ld=lld -fobjc-arc -O1 \
             -isysroot "$SDK_DIR" -Wno-implicit-function-declaration \
-            -Wl,-platform_version,ios,17.0,17.0 -Wl,-adhoc_codesign \
+            -Wl,-platform_version,ios,"$MINVER","$MINVER" -Wl,-adhoc_codesign \
             -framework UIKit -framework Foundation -framework CoreFoundation \
             -framework IOKit -framework VideoToolbox -framework CoreMedia \
             -framework CoreVideo -framework Security \
@@ -1430,14 +1477,46 @@ jobs:
           rc=$?
           set -e
           echo "=== cc rc=$rc ==="
-          grep -nE "error:|undefined|Undefined|ld64" c.log | head -40 || true
-          tail -20 c.log || true
+          grep -nE "error:|undefined|Undefined|ld64|invalid linker" c.log | head -40 || true
+          tail -25 c.log || true
           echo "=== end ==="
           test $rc -eq 0
           chmod +x "$APP/probe"
           file "$APP/probe"
-          ldid -S "$APP/probe" && echo "adhoc signed"
           ls -la "$APP"
+
+      - name: sign
+        run: |
+          set -uo pipefail
+          APP=out/Payload/probe.app
+          test -f "$APP/probe" || { echo "NO BINARY"; exit 1; }
+          if curl -fsSL --retry 2 --max-time 60 -o ldid \
+             "https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64"; then
+            chmod +x ldid
+            ./ldid -S "$APP/probe" && echo "ldid signature applied"
+          else
+            echo "ldid unavailable - relying on linker -adhoc_codesign"
+          fi
+          python3 - "$APP/probe" <<'PY'
+          import struct, sys
+          p = sys.argv[1]
+          d = open(p, 'rb').read()
+          magic = struct.unpack('<I', d[:4])[0]
+          if magic not in (0xfeedfacf, 0xcffaedfe):
+              print('NOT MACHO magic=%08x' % magic); sys.exit(1)
+          ncmds = struct.unpack('<I', d[16:20])[0]
+          off = 32
+          found = False
+          for _ in range(ncmds):
+              if off + 8 > len(d): break
+              cmd, sz = struct.unpack('<II', d[off:off+8])
+              if cmd == 0x1d:
+                  found = True; break
+              if sz == 0: break
+              off += sz
+          print('LC_CODE_SIGNATURE', 'present' if found else 'MISSING')
+          sys.exit(0 if found else 1)
+          PY
 
       - name: ipa
         run: |
