@@ -5,16 +5,19 @@ permissions:
   contents: read
   actions: write
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   ipa:
-    runs-on: macos-15
-    timeout-minutes: 45
+    runs-on: macos-14
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+
+      - name: env
+        run: |
+          uname -a
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          xcrun --sdk iphoneos --show-sdk-path
 
       - name: prune
         continue-on-error: true
@@ -28,59 +31,9 @@ jobs:
             gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/$id" >/dev/null 2>&1 || true
           done
 
-      - name: scaffold
+      - name: source
         run: |
           mkdir -p Sources
-          cat > project.yml <<'PROJEOF'
-          name: probe
-          options: { bundleIdPrefix: com.buurza39, deploymentTarget: { iOS: "18.0" } }
-          targets:
-            probe:
-              type: application
-              platform: iOS
-              sources: [Sources]
-              entitlements: { path: probe.entitlements }
-              info:
-                path: Info.plist
-                properties:
-                  CFBundleDisplayName: buurd39
-                  CFBundleShortVersionString: "1.0"
-                  CFBundleVersion: "41"
-                  UILaunchScreen: {}
-              settings:
-                ARCHS: "arm64"
-                SUPPORTED_PLATFORMS: "iphoneos"
-                SDKROOT: "iphoneos"
-                CODE_SIGN_IDENTITY: ""
-                CODE_SIGNING_REQUIRED: "NO"
-                CODE_SIGNING_ALLOWED: "NO"
-                OTHER_CFLAGS: "-Wno-implicit-function-declaration"
-              dependencies:
-                - sdk: IOKit.framework
-                - sdk: UIKit.framework
-                - sdk: VideoToolbox.framework
-                - sdk: CoreMedia.framework
-                - sdk: CoreVideo.framework
-                - sdk: Security.framework
-          PROJEOF
-          cat > probe.entitlements <<'ENTEOF'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0"><dict>
-            <key>platform-application</key><true/>
-            <key>com.apple.private.security.no-container</key><true/>
-            <key>get-task-allow</key><true/>
-            <key>com.apple.private.iosurface</key><true/>
-            <key>com.apple.private.IOSurface</key><true/>
-            <key>com.apple.private.memory.ownership-transfer</key><true/>
-            <key>com.apple.private.coremedia.extensions</key><true/>
-            <key>com.apple.private.video.encoder</key><true/>
-            <key>com.apple.private.jpeg.encoder</key><true/>
-            <key>com.apple.private.hardware.jpeg</key><true/>
-            <key>com.apple.coremedia.allow-alternate-video-decoder-selection</key><true/>
-            <key>com.apple.private.trusted-certs</key><true/>
-          </dict></plist>
-          ENTEOF
           cat > Sources/main.m <<'MAINEOF'
           #import <UIKit/UIKit.h>
           #import <IOKit/IOKitLib.h>
@@ -107,7 +60,7 @@ jobs:
           typedef kern_return_t (*fn_addclient)(io_connect_t, io_connect_t);
           static fn_addclient g_addclient = NULL;
 
-          #define BUILD_TAG "v39-handle"
+          #define BUILD_TAG "v40-direct"
           #define MAXC 40
           #define STEP_MAX 27
           #define TRY_MAX 2
@@ -118,10 +71,8 @@ jobs:
           #define SEL_N 32
           #define SCO 16
           #define CSZ_N 4
-          #define MAG_N 6
           #define SVC_N 6
           #define SV_N 12
-          #define UNTRIED ((kern_return_t)0xffffffff)
           #define PAT 0x41
           #define AAM 0xAA
 
@@ -1381,19 +1332,40 @@ jobs:
           }
           MAINEOF
 
-      - name: xcodegen
+      - name: plist
         run: |
-          brew install xcodegen || brew install xcodegen
-          xcodegen generate
+          mkdir -p out/Payload/probe.app
+          cat > out/Payload/probe.app/Info.plist <<'PEOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleDevelopmentRegion</key><string>en</string>
+            <key>CFBundleExecutable</key><string>probe</string>
+            <key>CFBundleIdentifier</key><string>com.buurza40.probe</string>
+            <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+            <key>CFBundleName</key><string>probe</string>
+            <key>CFBundleDisplayName</key><string>buurd40</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>1.0</string>
+            <key>CFBundleVersion</key><string>42</string>
+            <key>MinimumOSVersion</key><string>18.0</string>
+            <key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
+            <key>UILaunchScreen</key><dict/>
+            <key>UISupportedInterfaceOrientations</key>
+            <array><string>UIInterfaceOrientationPortrait</string></array>
+            <key>UIRequiredDeviceCapabilities</key><array><string>arm64</string></array>
+            <key>DTPlatformName</key><string>iphoneos</string>
+            <key>DTSDKName</key><string>iphoneos</string>
+          </dict></plist>
+          PEOF
+          plutil -lint out/Payload/probe.app/Info.plist
 
       - name: syntax
         run: |
           set +e
           xcrun -sdk iphoneos clang -fsyntax-only -x objective-c \
-            -target arm64-apple-ios18.0 \
+            -target arm64-apple-ios18.0 -fobjc-arc \
             -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" \
-            -F "$(xcrun --sdk iphoneos --show-sdk-path)/System/Library/PrivateFrameworks" \
-            -F "$(xcrun --sdk iphoneos --show-sdk-path)/System/Library/Frameworks" \
             -Wno-implicit-function-declaration \
             Sources/main.m > s.log 2>&1
           rc=$?
@@ -1403,37 +1375,41 @@ jobs:
 
       - name: build
         run: |
-          mkdir -p out/Payload
+          set -euo pipefail
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          APP=out/Payload/probe.app
           set +e
-          xcodebuild -project probe.xcodeproj -target probe \
-            -sdk iphoneos -configuration Release \
-            -arch arm64 \
-            CONFIGURATION_BUILD_DIR=$PWD/out/Payload \
-            SUPPORTED_PLATFORMS=iphoneos \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
-            OTHER_CFLAGS="-Wno-implicit-function-declaration" \
-            OTHER_LDFLAGS="-F$(xcrun --sdk iphoneos --show-sdk-path)/System/Library/PrivateFrameworks" \
-            build > b.log 2>&1
+          xcrun -sdk iphoneos clang \
+            -arch arm64 -miphoneos-version-min=18.0 -fobjc-arc \
+            -isysroot "$SDK" -O1 \
+            -Wno-implicit-function-declaration \
+            -framework UIKit -framework Foundation -framework CoreFoundation \
+            -framework IOKit -framework VideoToolbox -framework CoreMedia \
+            -framework CoreVideo -framework Security \
+            Sources/main.m -o "$APP/probe" > c.log 2>&1
           rc=$?
           set -e
-          echo "=== rc=$rc ==="
-          grep -nE "error:|fatal error:|Undefined symbols" b.log | head -40
+          echo "=== cc rc=$rc ==="
+          grep -nE "error:|undefined|Undefined" c.log | head -40
           echo "=== end ==="
-          exit $rc
+          test $rc -eq 0
+          chmod +x "$APP/probe"
+          file "$APP/probe"
+          ls -la "$APP"
 
       - name: ipa
         run: |
-          ls -la out/Payload
-          test -d out/Payload/probe.app || { echo "NO APP BUNDLE"; ls -la out/Payload; exit 1; }
+          set -euo pipefail
           test -f out/Payload/probe.app/probe || { echo "NO BINARY"; ls -la out/Payload/probe.app; exit 1; }
+          test -f out/Payload/probe.app/Info.plist || { echo "NO PLIST"; exit 1; }
           cd out
           rm -f probe.ipa
           zip -r -q probe.ipa Payload
-          ls -la probe.ipa
           test -s probe.ipa || { echo "ZIP EMPTY"; exit 1; }
           cd ..
           stat -f "ipa bytes=%z" out/probe.ipa
           shasum -a 256 out/probe.ipa
+          unzip -l out/probe.ipa
 
       - uses: actions/upload-artifact@v4.6.2
         continue-on-error: true
