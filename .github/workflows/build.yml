@@ -10,21 +10,10 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  stage:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
+  ipa:
+    runs-on: macos-latest
+    timeout-minutes: 20
     steps:
-      - name: prune
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh api "repos/${{ github.repository }}/actions/artifacts?per_page=100" \
-            --jq '.artifacts[].id' > ids.txt || exit 0
-          head -n 60 ids.txt | while read -r id; do
-            gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/$id" >/dev/null 2>&1 || true
-          done
-
       - name: source
         run: |
           mkdir -p Sources out/Payload/probe.app
@@ -55,7 +44,7 @@ jobs:
           typedef kern_return_t (*fn_addclient)(io_connect_t, io_connect_t);
           static fn_addclient g_addclient = NULL;
 
-          #define BUILD_TAG "v47-linux"
+          #define BUILD_TAG "v48-single"
           #define MAXC 40
           #define STEP_MAX 27
           #define TRY_MAX 2
@@ -1338,296 +1327,25 @@ jobs:
             <key>CFBundleIdentifier</key><string>com.buurza47.probe</string>
             <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
             <key>CFBundleName</key><string>probe</string>
-            <key>CFBundleDisplayName</key><string>buurd47</string>
+            <key>CFBundleDisplayName</key><string>buurd48</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleShortVersionString</key><string>1.0</string>
-            <key>CFBundleVersion</key><string>49</string>
+            <key>CFBundleVersion</key><string>50</string>
             <key>MinimumOSVersion</key><string>16.0</string>
             <key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
             <key>UILaunchScreen</key><dict/>
             <key>UISupportedInterfaceOrientations</key>
             <array><string>UIInterfaceOrientationPortrait</string></array>
             <key>UIRequiredDeviceCapabilities</key><array><string>arm64</string></array>
-            <key>DTPlatformName</key><string>iphoneos</string>
-            <key>DTSDKName</key><string>iphoneos</string>
           </dict></plist>
           PEOF
-          python3 -c "import plistlib;plistlib.load(open('out/Payload/probe.app/Info.plist','rb'));print('plist ok')"
-          wc -c Sources/main.m
-
-      - uses: actions/upload-artifact@v4.6.2
-        with:
-          name: src-${{ github.run_number }}-${{ github.run_attempt }}
-          path: |
-            Sources/main.m
-            out/Payload/probe.app/Info.plist
-          retention-days: 3
-          compression-level: 0
-
-  linux:
-    needs: stage
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    continue-on-error: true
-    steps:
-      - uses: actions/download-artifact@v4.1.8
-        with:
-          name: src-${{ github.run_number }}-${{ github.run_attempt }}
-
-      - name: toolchain
-        run: |
-          set -uo pipefail
-          export DEBIAN_FRONTEND=noninteractive
-          APT="sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30"
-          $APT update -qq || $APT update || true
-          PKGS="clang lld zip unzip curl file ca-certificates python3"
-          $APT install -y -qq $PKGS || $APT install -y --fix-missing $PKGS || true
-
-          for b in clang zip unzip curl file; do
-            command -v "$b" >/dev/null || { echo "MISSING $b"; exit 1; }
-          done
-
-          LD64=""
-          for p in /usr/lib/llvm-*/bin/ld64.lld /usr/bin/ld64.lld /usr/local/bin/ld64.lld; do
-            [ -x "$p" ] && LD64="$p" && break
-          done
-          if [ -z "$LD64" ]; then
-            LD64="$(find / -maxdepth 6 -name 'ld64.lld*' -type f 2>/dev/null | head -1)"
-          fi
-          if [ -z "$LD64" ]; then
-            echo "ld64.lld absent, trying versioned lld packages"
-            for v in 20 19 18 17 16; do
-              $APT install -y -qq "lld-$v" >/dev/null 2>&1 || true
-              if [ -x "/usr/lib/llvm-$v/bin/ld64.lld" ]; then LD64="/usr/lib/llvm-$v/bin/ld64.lld"; break; fi
-            done
-          fi
-          if [ -z "$LD64" ]; then
-            echo "--- ld64.lld NOT FOUND"
-            dpkg -l | grep -i lld || true
-            ls -la /usr/lib/llvm-*/bin/ 2>/dev/null | grep -iE 'ld|lld' || true
-            find / -maxdepth 6 -name 'lld*' -type f 2>/dev/null | head -20 || true
-            exit 1
-          fi
-
-          mkdir -p "$PWD/tc"
-          ln -sf "$LD64" "$PWD/tc/ld64.lld"
-          echo "TCBIN=$PWD/tc" >> "$GITHUB_ENV"
-          echo "ld64.lld=$LD64"
-          clang --version | head -1 || true
-          echo "toolchain ok"
-
-      - name: sdk
-        run: |
-          set -uo pipefail
-          WS="$PWD"; EX="$WS/ex"; SDKROOT="$WS/sdkroot"
-          rm -rf "$EX" "$SDKROOT"; mkdir -p "$EX" "$SDKROOT"
-
-          valid() {
-            [ -d "$1/System/Library/Frameworks/UIKit.framework" ] || return 1
-            { [ -f "$1/usr/lib/libSystem.tbd" ] || [ -f "$1/usr/lib/libSystem.dylib" ]; } || return 1
-            [ -d "$1/usr/include" ] || return 1
-            return 0
-          }
-
-          pick() {
-            local d
-            while IFS= read -r d; do
-              if valid "$d"; then printf '%s\n' "$d"; return 0; fi
-            done < <(find "$1" -type d -name 'iPhoneOS*.sdk' -prune 2>/dev/null | sort -rV)
-            return 1
-          }
-
-          stage_one() {
-            local d="$1"
-            basename "$d" > "$WS/sdkname.txt"
-            rm -rf "$SDKROOT/sdk"
-            mv "$d" "$SDKROOT/sdk"
-          }
-
-          try_zip() {
-            echo "--- zip $1"
-            rm -f s.zip; rm -rf "$EX"; mkdir -p "$EX"
-            curl -fsSL --connect-timeout 15 --max-time 420 --retry 2 --retry-all-errors -o s.zip "$1" || { echo "  dl fail"; return 1; }
-            unzip -q -o s.zip -d "$EX" >/dev/null 2>&1 || { echo "  unzip fail"; return 1; }
-            local d; d="$(pick "$EX")" || { echo "  no valid sdk in zip"; return 1; }
-            stage_one "$d"
-          }
-
-          try_tar() {
-            echo "--- tar $1"
-            rm -f s.tgz; rm -rf "$EX"; mkdir -p "$EX"
-            curl -fsSL --connect-timeout 15 --max-time 900 --retry 2 --retry-all-errors -o s.tgz "$1" || { echo "  dl fail"; return 1; }
-            tar xzf s.tgz -C "$EX" 2>/dev/null || { echo "  untar fail"; return 1; }
-            local d; d="$(pick "$EX")" || { echo "  no valid sdk in tar"; return 1; }
-            stage_one "$d"
-          }
-
-          got=0
-          for u in \
-            "https://github.com/xybp888/iOS-SDKs/raw/master/iPhoneOS17.5.sdk.zip" \
-            "https://github.com/xybp888/iOS-SDKs/raw/main/iPhoneOS17.5.sdk.zip" \
-            "https://github.com/xybp888/iOS-SDKs/raw/master/iPhoneOS16.5.sdk.zip" \
-            "https://github.com/xybp888/iOS-SDKs/raw/master/iPhoneOS18.0.sdk.zip" \
-            "https://codeload.github.com/theos/sdks/tar.gz/refs/heads/master" \
-            "https://codeload.github.com/theos/sdks/tar.gz/refs/heads/main"; do
-            case "$u" in
-              *.zip) try_zip "$u" && { got=1; break; } ;;
-              *)     try_tar "$u" && { got=1; break; } ;;
-            esac
-          done
-
-          if [ "$got" -ne 1 ]; then
-            echo "NO SDK SOURCE WORKED"
-            ls -la "$EX" || true
-            exit 1
-          fi
-
-          NAME="$(cat "$WS/sdkname.txt")"
-          echo "sdk staged: $NAME"
-          SDK_DIR="$SDKROOT/sdk"
-          test -d "$SDK_DIR" || { echo "SDK_DIR MISSING"; exit 1; }
-          valid "$SDK_DIR" || { echo "STAGED SDK INVALID"; exit 1; }
-          echo "SDK_DIR=$SDK_DIR" >> "$GITHUB_ENV"
-          ls "$SDK_DIR" | head
-
-          MAJ="$(echo "$NAME" | sed -n 's/^iPhoneOS\([0-9][0-9]*\)\..*/\1/p')"
-          test -n "$MAJ" || { echo "CANNOT PARSE VERSION from $NAME"; exit 1; }
-          if [ "$MAJ" -lt 15 ]; then echo "SDK TOO OLD: $NAME"; exit 1; fi
-          MINVER="$MAJ.0"
-          if [ "$MAJ" -gt 17 ]; then MINVER="17.0"; fi
-          echo "MINVER=$MINVER" >> "$GITHUB_ENV"
-          echo "deployment target: $MINVER (sdk $MAJ)"
-
-          python3 - "$MINVER" <<'PY'
-          import plistlib, sys
-          p = 'out/Payload/probe.app/Info.plist'
-          d = plistlib.load(open(p, 'rb'))
-          d['MinimumOSVersion'] = sys.argv[1]
-          plistlib.dump(d, open(p, 'wb'))
-          print('plist minver ->', sys.argv[1])
-          PY
-
-      - name: syntax
-        run: |
-          set +e
-          clang -fsyntax-only -target "arm64-apple-ios$MINVER" -fobjc-arc \
-            -isysroot "$SDK_DIR" -Wno-implicit-function-declaration \
-            Sources/main.m > s.log 2>&1
-          rc=$?
-          set -e
-          grep -nE "error:" -A2 s.log | head -60 || true
-          tail -5 s.log || true
-          exit $rc
-
-      - name: build
-        run: |
-          set -euo pipefail
-          export PATH="$TCBIN:$PATH"
-          APP=out/Payload/probe.app
-          mkdir -p "$APP"
-          set +e
-          clang -target "arm64-apple-ios$MINVER" -fuse-ld=lld -fobjc-arc -O1 \
-            -isysroot "$SDK_DIR" -Wno-implicit-function-declaration \
-            -Wl,-platform_version,ios,"$MINVER","$MINVER" -Wl,-adhoc_codesign \
-            -framework UIKit -framework Foundation -framework CoreFoundation \
-            -framework IOKit -framework VideoToolbox -framework CoreMedia \
-            -framework CoreVideo -framework IOSurface -framework Security \
-            Sources/main.m -o "$APP/probe" > c.log 2>&1
-          rc=$?
-          set -e
-          echo "=== cc rc=$rc ld=$(command -v ld64.lld || echo none) ==="
-          grep -nE "error:|undefined|Undefined|ld64|invalid linker|ld: " c.log | head -40 || true
-          tail -25 c.log || true
-          echo "=== end ==="
-          if [ $rc -ne 0 ]; then ls -la "$SDKROOT"; ls -la "$SDKROOT/sdk/usr/lib" 2>/dev/null | head; fi
-          test $rc -eq 0
-          chmod +x "$APP/probe"
-          file "$APP/probe"
-          ls -la "$APP"
-
-      - name: sign
-        run: |
-          set -uo pipefail
-          APP=out/Payload/probe.app
-          test -f "$APP/probe" || { echo "NO BINARY"; exit 1; }
-          if curl -fsSL --retry 2 --max-time 60 -o ldid \
-             "https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64"; then
-            chmod +x ldid
-            ./ldid -S "$APP/probe" && echo "ldid signature applied"
-          else
-            echo "ldid unavailable - relying on linker -adhoc_codesign"
-          fi
-          python3 - "$APP/probe" <<'PY'
-          import struct, sys
-          p = sys.argv[1]
-          d = open(p, 'rb').read()
-          magic = struct.unpack('<I', d[:4])[0]
-          if magic not in (0xfeedfacf, 0xcffaedfe):
-              print('NOT MACHO magic=%08x' % magic); sys.exit(1)
-          ncmds = struct.unpack('<I', d[16:20])[0]
-          off = 32
-          found = False
-          for _ in range(ncmds):
-              if off + 8 > len(d): break
-              cmd, sz = struct.unpack('<II', d[off:off+8])
-              if cmd == 0x1d:
-                  found = True; break
-              if sz == 0: break
-              off += sz
-          print('LC_CODE_SIGNATURE', 'present' if found else 'MISSING')
-          sys.exit(0 if found else 1)
-          PY
-
-      - name: ipa
-        run: |
-          set -euo pipefail
-          test -f out/Payload/probe.app/probe || { echo "NO BINARY"; ls -la out/Payload/probe.app; exit 1; }
-          test -f out/Payload/probe.app/Info.plist || { echo "NO PLIST"; exit 1; }
-          cd out
-          rm -f probe.ipa
-          zip -r -q probe.ipa Payload
-          test -s probe.ipa || { echo "ZIP EMPTY"; exit 1; }
-          cd ..
-          stat -c "ipa bytes=%s" out/probe.ipa
-          sha256sum out/probe.ipa
-          unzip -l out/probe.ipa
-
-      - name: logs
-        if: failure()
-        uses: actions/upload-artifact@v4.6.2
-        with:
-          name: logs-linux-${{ github.run_number }}-${{ github.run_attempt }}
-          path: |
-            s.log
-            c.log
-            sdkname.txt
-          if-no-files-found: ignore
-          retention-days: 2
-          compression-level: 0
-
-      - uses: actions/upload-artifact@v4.6.2
-        if: success()
-        with:
-          name: probe-ipa-linux-${{ github.run_number }}-${{ github.run_attempt }}
-          path: out/probe.ipa
-          if-no-files-found: error
-          retention-days: 3
-          compression-level: 0
-
-  mac:
-    needs: stage
-    runs-on: macos-14
-    timeout-minutes: 20
-    steps:
-      - uses: actions/download-artifact@v4.1.8
-        with:
-          name: src-${{ github.run_number }}-${{ github.run_attempt }}
+          plutil -lint out/Payload/probe.app/Info.plist
+          wc -l Sources/main.m
 
       - name: build
         run: |
           set -euo pipefail
           APP=out/Payload/probe.app
-          mkdir -p "$APP"
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
           echo "sdk=$SDK"
           xcrun --sdk iphoneos clang --version | head -1
@@ -1637,7 +1355,7 @@ jobs:
             -framework UIKit -framework Foundation -framework CoreFoundation \
             -framework IOKit -framework VideoToolbox -framework CoreMedia \
             -framework CoreVideo -framework IOSurface -framework Security \
-            Sources/main.m -o "$APP/probe" 2> m.log || { tail -40 m.log; exit 1; }
+            Sources/main.m -o "$APP/probe"
           chmod +x "$APP/probe"
           file "$APP/probe"
           lipo -info "$APP/probe"
@@ -1646,8 +1364,9 @@ jobs:
         run: |
           set -euo pipefail
           APP=out/Payload/probe.app
-          codesign --force --sign - "$APP/probe"
+          codesign --force --sign - --timestamp=none "$APP/probe"
           codesign -dv "$APP/probe" 2>&1 | head -5 || true
+          otool -l "$APP/probe" | grep -A1 LC_CODE_SIGNATURE | head -3
 
       - name: ipa
         run: |
@@ -1658,20 +1377,11 @@ jobs:
           test -s out/probe.ipa || { echo "ZIP EMPTY"; exit 1; }
           stat -f "ipa bytes=%z" out/probe.ipa
           shasum -a 256 out/probe.ipa
-
-      - name: logs
-        if: failure()
-        uses: actions/upload-artifact@v4.6.2
-        with:
-          name: logs-mac-${{ github.run_number }}-${{ github.run_attempt }}
-          path: m.log
-          if-no-files-found: ignore
-          retention-days: 2
-          compression-level: 0
+          unzip -l out/probe.ipa
 
       - uses: actions/upload-artifact@v4.6.2
         with:
-          name: probe-ipa-mac-${{ github.run_number }}-${{ github.run_attempt }}
+          name: probe-ipa-${{ github.run_number }}-${{ github.run_attempt }}
           path: out/probe.ipa
           if-no-files-found: error
           retention-days: 3
