@@ -48,19 +48,40 @@ jobs:
           #import <UIKit/UIKit.h>
           #import <IOKit/IOKitLib.h>
 
+          static UITextView* g_tv;
+          static NSUInteger g_ticks = 0;
+
+          static void add_line(NSString* s) {
+              dispatch_async(dispatch_get_main_queue(), ^{
+                  g_tv.text = [g_tv.text stringByAppendingFormat:@"\n%@", s];
+                  NSLog(@"PROBE: %@", s);
+              });
+          }
+
           static void run_probe(void) {
+              add_line(@"[+] probe start");
               io_iterator_t it = 0;
-              if (IOServiceGetMatchingServices(kIOMainPortDefault,
-                      IOServiceMatching("AVEVideoEncoder"), &it) != KERN_SUCCESS) {
-                  NSLog(@"PROBE: NO SERVICE"); return;
+              kern_return_t k = IOServiceGetMatchingServices(kIOMainPortDefault,
+                      IOServiceMatching("AVEVideoEncoder"), &it);
+              if (k != KERN_SUCCESS) {
+                  add_line([NSString stringWithFormat:@"NO SERVICE kr=0x%x", k]); return;
               }
               io_service_t svc = IOIteratorNext(it);
               IOObjectRelease(it);
-              if (!svc) { NSLog(@"PROBE: NO INSTANCE"); return; }
+              if (!svc) { add_line(@"NO INSTANCE"); return; }
+
               io_connect_t c = 0;
               kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &c);
-              NSLog(@"PROBE: open = 0x%x (%s)", kr,
-                    kr == KERN_SUCCESS ? "REACHABLE" : "BLOCKED");
+              if (kr == KERN_SUCCESS)
+                  add_line([NSString stringWithFormat:@"REACHABLE kr=0x%x conn=%u", kr, c]);
+              else
+                  add_line([NSString stringWithFormat:@"BLOCKED kr=0x%x", kr]);
+
+              NSString* p = [NSSearchPathForDirectoriesInDomains(
+                  NSDocumentDirectory, NSUserDomainMask, YES).firstObject
+                  stringByAppendingPathComponent:@"probe.txt"];
+              [[g_tv.text stringByAppendingFormat:@"\n\nticks=%lu", (unsigned long)g_ticks]
+                  writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
           }
 
           @interface AppDelegate : UIResponder <UIApplicationDelegate>
@@ -70,9 +91,29 @@ jobs:
           @implementation AppDelegate
           - (BOOL)application:(UIApplication*)a didFinishLaunchingWithOptions:(NSDictionary*)o {
               self.w = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
-              self.w.rootViewController = [UIViewController new];
+              UIViewController* vc = [UIViewController new];
+              vc.view.backgroundColor = UIColor.blackColor;
+
+              g_tv = [[UITextView alloc] initWithFrame:vc.view.bounds];
+              g_tv.backgroundColor = UIColor.blackColor;
+              g_tv.textColor = UIColor.greenColor;
+              g_tv.font = [UIFont monospacedSystemFontOfSize:15 weight:UIFontWeightRegular];
+              g_tv.editable = NO;
+              g_tv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+              g_tv.text = @"boot ok";
+              [vc.view addSubview:g_tv];
+
+              self.w.rootViewController = vc;
               [self.w makeKeyAndVisible];
-              dispatch_async(dispatch_get_global_queue(0,0), ^{ run_probe(); });
+
+              [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer* t) {
+                  g_ticks++;
+                  g_tv.text = [NSString stringWithFormat:@"boot ok\nticks=%lu",
+                               (unsigned long)g_ticks];
+              }];
+
+              dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
+                             dispatch_get_global_queue(0,0), ^{ run_probe(); });
               return YES;
           }
           @end
