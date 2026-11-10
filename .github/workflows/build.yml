@@ -60,7 +60,7 @@ jobs:
 
           static UITextView* g_tv;
           static UILabel* g_hb;
-          static int g_hits = 0, g_done = 0;
+          static volatile int g_hits = 0, g_done = 0;
           static int g_fd = -1;
           static NSMutableSet* g_seen;
           static pthread_mutex_t g_lk = PTHREAD_MUTEX_INITIALIZER;
@@ -69,9 +69,6 @@ jobs:
           static io_connect_t g_conn[MAXC];
           static uint32_t g_ctype[MAXC];
           static int g_nconn = 0;
-
-          static int g_o5[512]; static int g_n5 = 0;
-          static int g_o4[1024]; static int g_n4 = 0;
 
           static void ui(NSString* s) {
               dispatch_async(dispatch_get_main_queue(), ^{
@@ -104,7 +101,7 @@ jobs:
           }
           static NSString* hex(const uint8_t* p, size_t n) {
               if (!n) return @"-";
-              if (n > 24) n = 24;
+              if (n > 512) n = 512;
               NSMutableString* s = [NSMutableString string];
               for (size_t i = 0; i < n; i++) [s appendFormat:@"%02x", p[i]];
               return s;
@@ -139,87 +136,91 @@ jobs:
               uint8_t out[4096]; size_t oSz = outsz;
               memset(out, 0xCC, sizeof(out));
               kern_return_t kr = IOConnectCallStructMethod(c, sel, in, sz, outsz ? out : NULL, &oSz);
-              g_done++;
-              persist([NSString stringWithFormat:@"%u %u %zu %@ %zu %@ | %s",
-                       t, sel, sz, kr_name(kr), oSz, hex(out, oSz), tag]);
-              if (kr != 0xe00002c2 && kr != 0xe00002c7) {
-                  g_hits++;
-                  ui([NSString stringWithFormat:@"!! %s t%u s%u -> %@ out=%zu %@",
-                      tag, t, sel, kr_name(kr), oSz, hex(out, oSz)]);
-              } else if (always) {
-                  ui([NSString stringWithFormat:@"%s t%u s%u -> %@", tag, t, sel, kr_name(kr)]);
+              __sync_fetch_and_add(&g_done, 1);
+              if (kr == KERN_SUCCESS) {
+                  persist([NSString stringWithFormat:@"OK %s t%u s%u out=%zu %@ IN %@",
+                           tag, t, sel, oSz, hex(out, oSz), hex(in, sz)]);
+                  __sync_fetch_and_add(&g_hits, 1);
+                  ui([NSString stringWithFormat:@"!!! OK %s t%u s%u out=%zu %@",
+                      tag, t, sel, oSz, hex(out, oSz)]);
+              } else if (kr != 0xe00002c2 && kr != 0xe00002c7) {
+                  persist([NSString stringWithFormat:@"%u %u %zu %@ %zu %@ | %s",
+                           t, sel, sz, kr_name(kr), oSz, hex(out, 24), tag]);
+                  __sync_fetch_and_add(&g_hits, 1);
+                  ui([NSString stringWithFormat:@"!! %s t%u s%u -> %@ %@",
+                      tag, t, sel, kr_name(kr), hex(out, 24)]);
+              } else {
+                  persist([NSString stringWithFormat:@"%u %u %zu %@ %zu - | %s",
+                           t, sel, sz, kr_name(kr), oSz, tag]);
+                  if (always) ui([NSString stringWithFormat:@"%s t%u s%u -> %@",
+                                  tag, t, sel, kr_name(kr)]);
               }
-              usleep(1000);
+              usleep(200);
               return kr;
           }
 
-          // hitmap: jeden bajt 0xFF w zerach
-          static void hmap(io_connect_t c, uint32_t t, uint32_t sel, int from, int to, int step,
-                           const char* pfx, int* store, int* nst) {
-              uint8_t* in = calloc(1, 4096);
-              for (int i = from; i < to; i += step) {
-                  in[i] = 0xFF;
-                  char tg[40]; snprintf(tg, sizeof(tg), "%s.%d", pfx, i);
-                  kern_return_t kr = callp(tg, c, t, sel, in, 4096, 4096, NO);
-                  if (kr == 0xe00002c2) { if (*nst < 1024) store[(*nst)++] = i; }
-                  in[i] = 0;
+          // [A] polowanie na command id
+          static void cmd_hunt(io_connect_t c, uint32_t t, uint32_t sel) {
+              int offs[] = { 120, 124, 126, 128 };
+              for (int o = 0; o < 4; o++) {
+                  for (uint32_t v = 0; v <= 255; v++) {
+                      uint8_t* in = calloc(1, 4096);
+                      if (offs[o] == 126) { uint16_t h = v; memcpy(in + 126, &h, 2); }
+                      else memcpy(in + offs[o], &v, 4);
+                      char tg[40]; snprintf(tg, sizeof(tg), "cmd%u.%u", offs[o], v);
+                      callp(tg, c, t, sel, in, 4096, 4096, NO);
+                      free(in);
+                  }
               }
-              free(in);
-              ui([NSString stringWithFormat:@"%s done read=%d", pfx, *nst]);
+              ui([NSString stringWithFormat:@"cmd_hunt s%u done", sel]);
           }
 
-          // hitmap odwrocony: wszystko 0xFF, jeden bajt zero
-          static void imap(io_connect_t c, uint32_t t, uint32_t sel, int from, int to, int step,
-                           const char* pfx, int* store, int* nst) {
-              uint8_t* in = malloc(4096);
-              memset(in, 0xFF, 4096);
-              for (int i = from; i < to; i += step) {
-                  in[i] = 0;
-                  char tg[40]; snprintf(tg, sizeof(tg), "%s.%d", pfx, i);
-                  kern_return_t kr = callp(tg, c, t, sel, in, 4096, 4096, NO);
-                  if (kr != 0xe00002c2) { if (*nst < 1024) store[(*nst)++] = i; }
-                  in[i] = 0xFF;
+          // [B] rownolegly hitmap 128-4095
+          static void par_hmap(io_connect_t c, uint32_t t, uint32_t sel) {
+              dispatch_group_t g = dispatch_group_create();
+              int lo = 128, hi = 4095, span = (hi - lo) / g_nconn + 1;
+              for (int n = 0; n < g_nconn; n++) {
+                  dispatch_group_async(g, dispatch_get_global_queue(0,0), ^{
+                      int a = lo + n * span, b = a + span; if (b > hi + 1) b = hi + 1;
+                      uint8_t* in = calloc(1, 4096);
+                      for (int i = a; i < b; i++) {
+                          in[i] = 0xFF;
+                          char tg[40]; snprintf(tg, sizeof(tg), "h%u.%d", sel, i);
+                          callp(tg, g_conn[n], g_ctype[n], sel, in, 4096, 4096, NO);
+                          in[i] = 0;
+                      }
+                      free(in);
+                  });
               }
-              free(in);
-              ui([NSString stringWithFormat:@"%s done hit=%d", pfx, *nst]);
+              dispatch_group_wait(g, DISPATCH_TIME_FOREVER);
+              ui([NSString stringWithFormat:@"par_hmap s%u done", sel]);
           }
 
-          static void dense(io_connect_t c, uint32_t t, uint32_t sel, int off) {
-              static const uint32_t V[] = { 0,1,2,3,4,5,6,7,8,12,16,24,32,48,64,96,128,192,
-                                            256,512,1024,2048,3072,3968,4096,4097,8192,
-                                            0x7fffffffu,0xffffffffu };
-              int n = sizeof(V)/sizeof(V[0]);
-              for (int i = 0; i < n; i++) {
-                  uint8_t* in = calloc(1, 4096);
-                  memcpy(in + off, &V[i], 4);
-                  char tg[48]; snprintf(tg, sizeof(tg), "d%u.%d.%u", sel, off, V[i]);
-                  callp(tg, c, t, sel, in, 4096, 4096, NO);
-                  free(in);
+          // [C] odwrocony 0-511 rownolegle
+          static void par_imap(io_connect_t c, uint32_t t, uint32_t sel) {
+              dispatch_group_t g = dispatch_group_create();
+              int lo = 0, hi = 511, span = (hi - lo) / g_nconn + 1;
+              for (int n = 0; n < g_nconn; n++) {
+                  dispatch_group_async(g, dispatch_get_global_queue(0,0), ^{
+                      int a = lo + n * span, b = a + span; if (b > hi + 1) b = hi + 1;
+                      uint8_t* in = malloc(4096);
+                      memset(in, 0xFF, 4096);
+                      for (int i = a; i < b; i++) {
+                          in[i] = 0;
+                          char tg[40]; snprintf(tg, sizeof(tg), "i%u.%d", sel, i);
+                          callp(tg, g_conn[n], g_ctype[n], sel, in, 4096, 4096, NO);
+                          in[i] = 0xFF;
+                      }
+                      free(in);
+                  });
               }
+              dispatch_group_wait(g, DISPATCH_TIME_FOREVER);
+              ui([NSString stringWithFormat:@"par_imap s%u done", sel]);
           }
 
-          static void valsweep(io_connect_t c, uint32_t t, uint32_t sel, int off) {
-              static const uint32_t V32[] = { 1, 0x1000, 0x10000, 0x100000, 0x7fffffffu, 0xffffffffu };
-              static const uint64_t V64[] = { 0x1000, 0xffffffffULL, 0xffffffffffffffffULL };
-              for (int i = 0; i < 6; i++) {
-                  uint8_t* in = calloc(1, 4096);
-                  memcpy(in + off, &V32[i], 4);
-                  char tg[48]; snprintf(tg, sizeof(tg), "s%u.%d.%u", sel, off, V32[i]);
-                  callp(tg, c, t, sel, in, 4096, 4096, NO);
-                  free(in);
-              }
-              for (int i = 0; i < 3; i++) {
-                  uint8_t* in = calloc(1, 4096);
-                  memcpy(in + off, &V64[i], 8);
-                  char tg[48]; snprintf(tg, sizeof(tg), "q%u.%d.%llu", sel, off, V64[i]);
-                  callp(tg, c, t, sel, in, 4096, 4096, NO);
-                  free(in);
-              }
-          }
-
-          // mieszany ABI: skalar + struct
+          // [D] ABI mieszany
           static void mixed(io_connect_t c, uint32_t t, uint32_t sel) {
-              for (uint32_t ic = 0; ic <= 4; ic++) {
+              for (uint32_t ic = 0; ic <= 6; ic++) {
                   uint64_t inS[8] = {0}, outS[16] = {0}; uint32_t oc = 16;
                   uint8_t* in = calloc(1, 4096);
                   uint8_t out[4096]; size_t oSz = sizeof(out);
@@ -230,13 +231,29 @@ jobs:
                   char tg[32]; snprintf(tg, sizeof(tg), "m%u.%u", sel, ic);
                   persist([NSString stringWithFormat:@"%u %u mixed %@ | %s", t, sel, kr_name(kr), tg]);
                   if (kr != 0xe00002c2 && kr != 0xe00002c7) {
-                      g_hits++;
-                      ui([NSString stringWithFormat:@"!! %s -> %@ sc=%u oc=%u %@",
-                          tg, kr_name(kr), ic, oc, hex(out, oSz)]);
+                      ui([NSString stringWithFormat:@"!! %s -> %@ oc=%u %@", tg, kr_name(kr), oc, hex(out, oSz)]);
                   } else {
                       ui([NSString stringWithFormat:@"%s -> %@", tg, kr_name(kr)]);
                   }
               }
+          }
+
+          // [E] fuzz ze struktura
+          static void fuzz(io_connect_t c, uint32_t t, uint32_t sel, int rounds) {
+              for (int r = 0; r < rounds; r++) {
+                  uint8_t* in = calloc(1, 4096);
+                  uint32_t n = 1 + arc4random_uniform(6);
+                  for (uint32_t k = 0; k < n; k++) {
+                      uint32_t off = arc4random_uniform(1024) & ~3u;
+                      uint32_t v = (uint32_t[]){ 1,8,16,64,256,1024,4096,8192,0x10000,
+                                                 0x100000,0x7fffffff,0xffffffff }[arc4random_uniform(12)];
+                      memcpy(in + off, &v, 4);
+                  }
+                  char tg[32]; snprintf(tg, sizeof(tg), "f%u.%d", sel, r);
+                  callp(tg, c, t, sel, in, 4096, 4096, NO);
+                  free(in);
+              }
+              ui([NSString stringWithFormat:@"fuzz s%u done", sel]);
           }
 
           static void open_all(void) {
@@ -268,47 +285,36 @@ jobs:
               VTCompressionSessionCreate(NULL, 1920, 1080, kCMVideoCodecType_H264,
                   NULL, NULL, NULL, NULL, NULL, &v);
               if (v) VTCompressionSessionPrepareToEncodeFrames(v);
-              usleep(250000);
+              usleep(200000);
 
               open_all();
               ui([NSString stringWithFormat:@"conns=%d", g_nconn]);
               if (!g_nconn) return;
 
-              io_connect_t c = g_conn[0]; uint32_t t = g_ctype[0];
+              ui(@"[A] command id hunt s5");
+              cmd_hunt(g_conn[0], g_ctype[0], 5);
+              ui(@"[A2] command id hunt s4");
+              cmd_hunt(g_conn[0], g_ctype[0], 4);
 
-              ui(@"[A] s5 hmap 128-511");
-              hmap(c, t, 5, 128, 511, 1, "hA", g_o5, &g_n5);
+              ui(@"[B] par hmap s5 128-4095");
+              par_hmap(g_conn[0], g_ctype[0], 5);
+              ui(@"[B2] par hmap s4 128-4095");
+              par_hmap(g_conn[0], g_ctype[0], 4);
 
-              ui(@"[B] s4 hmap 128-511");
-              hmap(c, t, 4, 128, 511, 1, "hB", g_o4, &g_n4);
+              ui(@"[C] par inverse s5");
+              par_imap(g_conn[0], g_ctype[0], 5);
+              ui(@"[C2] par inverse s4");
+              par_imap(g_conn[0], g_ctype[0], 4);
 
-              ui(@"[C] s4 hmap 512-4095 /4");
-              hmap(c, t, 4, 512, 4095, 4, "hC", g_o4, &g_n4);
+              ui(@"[D] mixed ABI");
+              mixed(g_conn[0], g_ctype[0], 5);
+              mixed(g_conn[0], g_ctype[0], 4);
 
-              ui(@"[D] s5 inverse 0-255");
-              imap(c, t, 5, 0, 255, 1, "iD", g_o5, &g_n5);
+              ui(@"[E] fuzz");
+              fuzz(g_conn[0], g_ctype[0], 5, 400);
+              fuzz(g_conn[0], g_ctype[0], 4, 400);
 
-              ui(@"[E] s4 inverse 0-255");
-              imap(c, t, 4, 0, 255, 1, "iE", g_o4, &g_n4);
-
-              ui(@"[F] dense 124 s4/s5");
-              dense(c, t, 5, 124);
-              dense(c, t, 4, 124);
-              dense(c, t, 5, 127);
-              dense(c, t, 4, 127);
-
-              ui(@"[G] mixed ABI");
-              mixed(c, t, 4);
-              mixed(c, t, 5);
-
-              ui(@"[H] value sweep s4 offsets");
-              for (int i = 0; i < g_n4 && i < 64; i++) valsweep(c, t, 4, g_o4[i]);
-
-              ui(@"[I] value sweep s5 offsets");
-              for (int i = 0; i < g_n5 && i < 64; i++) valsweep(c, t, 5, g_o5[i]);
-
-              ui([NSString stringWithFormat:@"FINISHED calls=%d hits=%d n4=%d n5=%d",
-                  g_done, g_hits, g_n4, g_n5]);
+              ui([NSString stringWithFormat:@"FINISHED calls=%d hits=%d", g_done, g_hits]);
               close(g_fd); g_fd = -1;
           }
 
