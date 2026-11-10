@@ -11,7 +11,7 @@ jobs:
           mkdir -p Sources
           cat > project.yml <<'PROJEOF'
           name: probe
-          options: { bundleIdPrefix: com.buurza30, deploymentTarget: { iOS: "18.0" } }
+          options: { bundleIdPrefix: com.buurza30b, deploymentTarget: { iOS: "18.0" } }
           targets:
             probe:
               type: application
@@ -21,9 +21,9 @@ jobs:
               info:
                 path: Info.plist
                 properties:
-                  CFBundleDisplayName: buurd30
+                  CFBundleDisplayName: buurd30b
                   CFBundleShortVersionString: "1.0"
-                  CFBundleVersion: "30"
+                  CFBundleVersion: "31"
                   UILaunchScreen: {}
               settings:
                 ARCHS: "arm64"
@@ -79,15 +79,18 @@ jobs:
           extern int csops(pid_t pid, unsigned int ops, void* uaddr, size_t usize);
 
           typedef uint32_t (*fn_surfid)(IOSurfaceRef);
+          typedef kern_return_t (*fn_trap0)(io_connect_t, uint32_t);
+          typedef kern_return_t (*fn_trap1)(io_connect_t, uint32_t, uintptr_t);
+          static fn_trap0 g_trap0 = NULL;
+          static fn_trap1 g_trap1 = NULL;
 
-          #define BUILD_TAG "v30-oracle4"
+          #define BUILD_TAG "v30b-trapfix"
           #define MAXC 32
           #define STEP_MAX 17
           #define TRY_MAX 2
           #define MAXCHILD 8
           #define FIXED 4096
           #define SEL_N 32
-          #define SZ_N 6
           #define SCO 6
           #define CSZ_N 8
           #define MAG_N 6
@@ -143,7 +146,6 @@ jobs:
           static kern_return_t g_5prev = 0xe00002cc;
           static int g_s4_att = 0;
 
-          static const size_t SZ[SZ_N] = { 0, 8, 16, 32, 64, 4096 };
           static const size_t CSZ[CSZ_N] = { 0, 24, 32, 48, 64, 128, 256, 4096 };
           static const uint64_t MAG[MAG_N] = { 0x4a504547ULL, 0x6a706567ULL, 0x42475241ULL, 0x00000001ULL, 0xdeadbeefULL, 0xfeedfaceULL };
 
@@ -562,16 +564,15 @@ jobs:
 
           static void trap_probe(void) {
               if (g_best < 0) return;
+              if (!g_trap0 && !g_trap1) { plog(@"TRAP unavailable"); ulog(@"TRAP unavailable"); return; }
               io_connect_t c = g_conn[g_best];
               for (uint32_t i = 0; i < TRAP_N; i++) {
-                  uintptr_t a[6] = {0};
-                  kern_return_t r0 = IOConnectTrap0(c, i);
+                  kern_return_t r0 = g_trap0 ? g_trap0(c, i) : (kern_return_t)0xe00002c7;
                   plog(@"TRAP i%u t0 -> 0x%x", i, r0);
                   if (r0) ulog(@"!! TRAP i%u -> 0x%x", i, r0);
-                  for (int k = 0; k < 6; k++) a[k] = 0;
-                  kern_return_t r1 = IOConnectTrap1(c, i, (uintptr_t)g_sid);
+                  kern_return_t r1 = g_trap1 ? g_trap1(c, i, (uintptr_t)g_sid) : (kern_return_t)0xe00002c7;
                   plog(@"TRAP i%u sid -> 0x%x", i, r1);
-                  if (r1) ulog(@"!! TRAP i%u sid -> 0x%x", i, r1);
+                  if (r1) ulog(@"!! TRAP i%u -> 0x%x", i, r1);
                   if (r0 == 0 || r1 == 0) {
                       plog(@"TRAPWIN i%u r0=0x%x r1=0x%x", i, r0, r1);
                       ulog(@"### TRAPWIN i%u", i);
@@ -731,6 +732,13 @@ jobs:
 
               mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &g_wake);
               mach_port_insert_right(mach_task_self(), g_wake, g_wake, MACH_MSG_TYPE_MAKE_SEND);
+
+              void* ik = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY);
+              g_trap0 = (fn_trap0)dlsym(RTLD_DEFAULT, "IOConnectTrap0");
+              g_trap1 = (fn_trap1)dlsym(RTLD_DEFAULT, "IOConnectTrap1");
+              if (!g_trap0 && ik) g_trap0 = (fn_trap0)dlsym(ik, "IOConnectTrap0");
+              if (!g_trap1 && ik) g_trap1 = (fn_trap1)dlsym(ik, "IOConnectTrap1");
+              plog(@"trap sym t0=%p t1=%p", (void*)g_trap0, (void*)g_trap1);
 
               plog(@"=== LAUNCH step=%d build=%s", g_step, BUILD_TAG);
               if (g_fd >= 0) fsync(g_fd);
