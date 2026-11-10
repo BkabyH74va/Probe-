@@ -11,7 +11,7 @@ jobs:
           mkdir -p Sources
           cat > project.yml <<'PROJEOF'
           name: probe
-          options: { bundleIdPrefix: com.buurza19, deploymentTarget: { iOS: "18.0" } }
+          options: { bundleIdPrefix: com.buurza21, deploymentTarget: { iOS: "18.0" } }
           targets:
             probe:
               type: application
@@ -21,9 +21,9 @@ jobs:
               info:
                 path: Info.plist
                 properties:
-                  CFBundleDisplayName: buurd19
+                  CFBundleDisplayName: buurd21
                   CFBundleShortVersionString: "1.0"
-                  CFBundleVersion: "19"
+                  CFBundleVersion: "21"
                   UILaunchScreen: {}
               settings:
                 ARCHS: "arm64"
@@ -40,6 +40,7 @@ jobs:
                 - sdk: CoreMedia.framework
                 - sdk: CoreVideo.framework
                 - sdk: Security.framework
+                - sdk: IOSurface.framework
           PROJEOF
           cat > probe.entitlements <<'ENTEOF'
           <?xml version="1.0" encoding="UTF-8"?>
@@ -53,11 +54,11 @@ jobs:
           cat > Sources/main.m <<'MAINEOF'
           #import <UIKit/UIKit.h>
           #import <IOKit/IOKitLib.h>
+          #import <IOSurface/IOSurface.h>
           #import <VideoToolbox/VideoToolbox.h>
           #import <CoreVideo/CoreVideo.h>
           #import <Security/Security.h>
           #import <mach/mach.h>
-          #import <mach/vm_region.h>
           #include <unistd.h>
           #include <fcntl.h>
           #include <signal.h>
@@ -67,23 +68,19 @@ jobs:
           #include <stdio.h>
           #include <dlfcn.h>
 
-          extern kern_return_t mach_vm_region(vm_map_t, mach_vm_address_t *,
-              mach_vm_size_t *, vm_region_flavor_t, vm_region_info_t,
-              mach_msg_type_number_t *, mach_port_t *);
           extern int csops(pid_t pid, unsigned int ops, void* uaddr, size_t usize);
 
           typedef struct __SecTask *SecTaskRef;
           typedef SecTaskRef (*fn_create)(CFAllocatorRef);
           typedef CFTypeRef (*fn_copy)(SecTaskRef, CFStringRef, CFErrorRef*);
 
-          #define BUILD_TAG "v19-shape"
+          #define BUILD_TAG "v21-heap"
           #define MAXC 96
-          #define STEP_MAX 15
+          #define STEP_MAX 17
           #define TRY_MAX 2
           #define MAXCHILD 8
           #define TYPE_MAX 7
-          #define NSIZE 12
-          #define NPAT 5
+          #define FIXED 4096
 
           static UITextView* g_tv;
           static UILabel* g_hb;
@@ -92,27 +89,28 @@ jobs:
           static volatile int g_step = 0;
           static volatile int g_stop = 0;
           static volatile int g_vt_done = 0;
+          static volatile int g_ok4 = 0;
           static int g_try = 0;
-          static int g_open_idx = -1;
           static int g_fd = -1;
           static int g_nchild = 0;
+          static int g_root_idx = -1;
           static io_service_t g_root = 0;
           static io_service_t g_child[MAXCHILD + 1];
           static NSMutableSet* g_seen;
           static pthread_mutex_t g_lk = PTHREAD_MUTEX_INITIALIZER;
           static VTCompressionSessionRef g_vt = NULL;
+          static IOSurfaceRef g_surf = NULL;
 
           static io_connect_t g_conn[MAXC];
           static uint32_t g_ctype[MAXC];
           static int g_node[MAXC];
           static int g_nconn = 0;
 
-          static const size_t SIZES[NSIZE] = {0,4,8,16,32,64,128,256,512,1024,2048,4096};
-
           static const char* STEP_NAME[STEP_MAX + 1] = {
               "boot", "census", "sig-blob", "match-uc", "vt-init", "vt-encode",
-              "dump-tree", "child-open", "root-open", "oracle", "m4-struct",
-              "m4-scalar", "m4-mixed", "map64-0-7", "map32-0-7", "post-4-5"
+              "dump-tree", "root-open", "oracle", "shape-sweep", "insize-sweep",
+              "hdr-sweep", "field-1", "field-vals", "pair-probe", "surf-probe",
+              "post-fixed", "verdict"
           };
 
           static void ui(NSString* s) {
@@ -160,9 +158,9 @@ jobs:
                   default: return [NSString stringWithFormat:@"0x%x", kr];
               }
           }
-          static NSString* hex(const uint8_t* p, size_t n) {
+          static NSString* hexn(const uint8_t* p, size_t n, size_t cap) {
               if (!n) return @"-";
-              if (n > 64) n = 64;
+              if (n > cap) n = cap;
               NSMutableString* s = [NSMutableString string];
               for (size_t i = 0; i < n; i++) [s appendFormat:@"%02x", p[i]];
               return s;
@@ -209,6 +207,7 @@ jobs:
               save_step(0);
               g_try = 0;
               save_try();
+              g_root_idx = -1;
               [@BUILD_TAG writeToFile:doc_file("build.txt")
                   atomically:YES encoding:NSUTF8StringEncoding error:nil];
           }
@@ -230,22 +229,27 @@ jobs:
           static kern_return_t callp(const char* tag, int ci, uint32_t sel,
                                      const uint8_t* in, size_t sz, size_t outsz, BOOL always) {
               if (ci < 0) ci = 0;
+              if (ci >= g_nconn) return (kern_return_t)0xe00002cc;
               uint32_t t = g_ctype[ci];
               int nd = g_node[ci];
               NSString* key = [NSString stringWithFormat:@"%d:%u:%u:%zu:%zu:%s", nd, t, sel, sz, outsz, tag];
               if (seen_key(key)) return (kern_return_t)0xdeadbeef;
               persist([NSString stringWithFormat:@"K %@", key]);
               bread(tag);
-              uint8_t out[4096]; size_t oSz = outsz;
-              memset(out, 0xCC, sizeof(out));
+              uint8_t* out = calloc(1, outsz ? outsz : 1);
+              if (!out) return (kern_return_t)0xe00002bd;
+              size_t oSz = outsz;
+              memset(out, 0xCC, outsz);
               kern_return_t kr = IOConnectCallStructMethod(g_conn[ci], sel, in, sz,
                                                            outsz ? out : NULL, &oSz);
               __sync_fetch_and_add(&g_done, 1);
               if (kr == KERN_SUCCESS) {
                   persist([NSString stringWithFormat:@"OK %s n%d t%u s%u out=%zu %@ IN %@",
-                           tag, nd, t, sel, oSz, hex(out, oSz), hex(in, sz)]);
+                           tag, nd, t, sel, oSz, hexn(out, oSz, 256), hexn(in, sz, 64)]);
                   __sync_fetch_and_add(&g_hits, 1);
-                  ui([NSString stringWithFormat:@"!!! OK %s n%d t%u out=%zu %@", tag, nd, t, oSz, hex(out, oSz)]);
+                  if (sel == 4) __sync_fetch_and_add(&g_ok4, 1);
+                  ui([NSString stringWithFormat:@"!!! OK %s n%d t%u out=%zu %@",
+                      tag, nd, t, oSz, hexn(out, oSz, 32)]);
               } else if (kr != 0xe00002c2 && kr != 0xe00002c7 && kr != 0xe00002cc) {
                   persist([NSString stringWithFormat:@"%d %u %u %zu %@ | %s", nd, t, sel, sz, kr_name(kr), tag]);
                   __sync_fetch_and_add(&g_hits, 1);
@@ -254,39 +258,16 @@ jobs:
                   persist([NSString stringWithFormat:@"%d %u %u %zu %@ | %s", nd, t, sel, sz, kr_name(kr), tag]);
                   if (always) ui([NSString stringWithFormat:@"%s n%d t%u -> %@", tag, nd, t, kr_name(kr)]);
               }
+              free(out);
               usleep(300);
               return kr;
           }
 
-          static kern_return_t callmix(const char* tag, int ci, uint32_t sel,
-                                       const uint64_t* sc, uint32_t scn,
-                                       const uint8_t* in, size_t sz, size_t outsz) {
-              if (ci < 0) ci = 0;
-              int nd = g_node[ci];
-              NSString* key = [NSString stringWithFormat:@"x%d:%u:%u:%zu:%zu:%s", nd, scn, sel, sz, outsz, tag];
-              if (seen_key(key)) return (kern_return_t)0xdeadbeef;
-              bread(tag);
-              uint8_t out[4096]; size_t oSz = outsz;
-              uint64_t os[8]; uint32_t ocn = 8;
-              memset(out, 0xCC, sizeof(out));
-              kern_return_t kr = IOConnectCallMethod(g_conn[ci], sel, sc, scn, in, sz,
-                                                     outsz ? os : NULL, outsz ? &ocn : NULL,
-                                                     outsz ? out : NULL, outsz ? &oSz : NULL);
-              __sync_fetch_and_add(&g_done, 1);
-              if (kr == KERN_SUCCESS) {
-                  persist([NSString stringWithFormat:@"OKX %s s%u n%d sc=%u sz=%zu oc=%u o=%zu %@",
-                           tag, sel, nd, scn, sz, ocn, oSz, hex(out, oSz)]);
-                  __sync_fetch_and_add(&g_hits, 1);
-                  ui([NSString stringWithFormat:@"!!! OKX %s sc=%u sz=%zu o=%zu %@", tag, scn, sz, oSz, hex(out, oSz)]);
-              } else {
-                  persist([NSString stringWithFormat:@"X %u %u %zu %@ | %s", scn, sel, sz, kr_name(kr), tag]);
-                  if (kr != 0xe00002c2 && kr != 0xe00002cc) {
-                      __sync_fetch_and_add(&g_hits, 1);
-                      ui([NSString stringWithFormat:@"!! %s sc=%u sz=%zu -> %@", tag, scn, sz, kr_name(kr)]);
-                  }
-              }
-              usleep(300);
-              return kr;
+          static kern_return_t t4(const char* tag, const uint8_t* in, size_t outsz) {
+              return callp(tag, g_root_idx, 4, in, FIXED, outsz, YES);
+          }
+          static void t5(const char* tag, const uint8_t* in) {
+              callp(tag, g_root_idx, 5, in, FIXED, FIXED, YES);
           }
 
           static int find_root(void) {
@@ -310,7 +291,7 @@ jobs:
                   ui(@"no census"); return;
               }
               NSMutableSet* seen = [NSMutableSet set];
-              io_object_t o; int n = 0, jpeg = 0;
+              io_object_t o; int n = 0, hit = 0;
               while ((o = IOIteratorNext(it)) && n < 4000) {
                   n++;
                   io_name_t cls; IOObjectGetClass(o, cls);
@@ -319,9 +300,9 @@ jobs:
                       [s rangeOfString:@"jpeg"].location != NSNotFound ||
                       [s rangeOfString:@"ISP"].location != NSNotFound ||
                       [s rangeOfString:@"Codec"].location != NSNotFound ||
-                      [s rangeOfString:@"Video"].location != NSNotFound ||
-                      [s rangeOfString:@"Cam"].location != NSNotFound) {
-                      jpeg++;
+                      [s rangeOfString:@"Cam"].location != NSNotFound ||
+                      [s rangeOfString:@"Surface"].location != NSNotFound) {
+                      hit++;
                       persist([NSString stringWithFormat:@"HIT %s", cls]);
                   }
                   if (![seen containsObject:s]) {
@@ -332,89 +313,57 @@ jobs:
               }
               IOObjectRelease(it);
               persist([NSString stringWithFormat:@"census nodes=%d cls=%lu hit=%d",
-                       n, (unsigned long)seen.count, jpeg]);
+                       n, (unsigned long)seen.count, hit]);
               ui([NSString stringWithFormat:@"census=%d cls=%lu hit=%d",
-                  n, (unsigned long)seen.count, jpeg]);
-          }
-
-          static void dump_blob(void) {
-              size_t sz = 16384;
-              char* buf = malloc(sz);
-              if (!buf) return;
-              memset(buf, 0, sz);
-              int brc = csops(getpid(), 7, buf, sz);
-              persist([NSString stringWithFormat:@"BLOB rc=%d", brc]);
-              ui([NSString stringWithFormat:@"BLOB rc=%d", brc]);
-              if (brc == 0) {
-                  size_t n = strnlen(buf, sz);
-                  if (n > 8192) n = 8192;
-                  char* s = malloc(n + 1);
-                  if (s) {
-                      for (size_t i = 0; i < n; i++) {
-                          char c = buf[i];
-                          s[i] = (c == '\n' || c == '\t' || (c >= 32 && c < 127)) ? c : '.';
-                      }
-                      s[n] = 0;
-                      persist(@"--- BLOB BEGIN ---");
-                      persist(@(s));
-                      persist(@"--- BLOB END ---");
-                      ui(@"blob written");
-                      free(s);
-                  }
-              }
-              free(buf);
-          }
-
-          static void dump_prov(void) {
-              NSString* p = [[[NSBundle mainBundle] bundlePath]
-                  stringByAppendingPathComponent:@"embedded.mobileprovision"];
-              NSDictionary* a = [[NSFileManager defaultManager] attributesOfItemAtPath:p error:nil];
-              if (!a) { persist(@"PROV none"); ui(@"PROV none"); }
-              else {
-                  persist([NSString stringWithFormat:@"PROV size=%llu", [a fileSize]]);
-                  ui([NSString stringWithFormat:@"PROV size=%llu", [a fileSize]]);
-              }
-              NSString* cr = [[[NSBundle mainBundle] bundlePath]
-                  stringByAppendingPathComponent:@"_CodeSignature/CodeResources"];
-              persist([NSString stringWithFormat:@"CODESIG=%d",
-                       [[NSFileManager defaultManager] fileExistsAtPath:cr] ? 1 : 0]);
+                  n, (unsigned long)seen.count, hit]);
           }
 
           static void dump_sig(void) {
               unsigned int fl = 0;
               int rc = csops(getpid(), 0, &fl, sizeof(fl));
               persist([NSString stringWithFormat:
-                       @"csops rc=%d f=0x%x valid=%d gta=%d hard=%d kill=%d enf=%d lv=%d rt=%d dpl=%d plat=%d dbg=%d",
-                       rc, fl, (fl & 1) ? 1 : 0, (fl & 4) ? 1 : 0, (fl & 0x100) ? 1 : 0,
+                       @"csops rc=%d f=0x%x gta=%d hard=%d kill=%d enf=%d lv=%d rt=%d dpl=%d plat=%d dbg=%d",
+                       rc, fl, (fl & 4) ? 1 : 0, (fl & 0x100) ? 1 : 0,
                        (fl & 0x200) ? 1 : 0, (fl & 0x1000) ? 1 : 0, (fl & 0x2000) ? 1 : 0,
                        (fl & 0x10000) ? 1 : 0, (fl & 0x2000000) ? 1 : 0,
                        (fl & 0x4000000) ? 1 : 0, (fl & 0x10000000) ? 1 : 0]);
-              ui([NSString stringWithFormat:@"csops rc=%d f=0x%x plat=%d",
-                  rc, fl, (fl & 0x4000000) ? 1 : 0]);
+              ui([NSString stringWithFormat:@"csops rc=%d f=0x%x", rc, fl]);
 
-              char path[1024]; memset(path, 0, sizeof(path));
-              int r1 = csops(getpid(), 4, path, sizeof(path));
-              persist([NSString stringWithFormat:@"PIDPATH rc=%d %s", r1, r1 == 0 ? path : "-"]);
-
-              uint8_t cd[20]; memset(cd, 0, sizeof(cd));
-              int r2 = csops(getpid(), 5, cd, sizeof(cd));
-              persist([NSString stringWithFormat:@"CDHASH rc=%d %@", r2, hex(cd, 20)]);
-              ui([NSString stringWithFormat:@"CDHASH rc=%d %@", r2, hex(cd, 20)]);
-
-              dump_blob();
-              dump_prov();
-
+              size_t sz = 16384;
+              char* buf = malloc(sz);
+              if (buf) {
+                  memset(buf, 0, sz);
+                  int brc = csops(getpid(), 7, buf, sz);
+                  persist([NSString stringWithFormat:@"BLOB rc=%d", brc]);
+                  ui([NSString stringWithFormat:@"BLOB rc=%d", brc]);
+                  if (brc == 0) {
+                      size_t n = strnlen(buf, sz);
+                      if (n > 8192) n = 8192;
+                      char* s = malloc(n + 1);
+                      if (s) {
+                          for (size_t i = 0; i < n; i++) {
+                              char c = buf[i];
+                              s[i] = (c == '\n' || c == '\t' || (c >= 32 && c < 127)) ? c : '.';
+                          }
+                          s[n] = 0;
+                          persist(@"--- BLOB BEGIN ---");
+                          persist(@(s));
+                          persist(@"--- BLOB END ---");
+                          free(s);
+                      }
+                  }
+                  free(buf);
+              }
               fn_create create = (fn_create)dlsym(RTLD_DEFAULT, "SecTaskCreateFromSelf");
               fn_copy copy = (fn_copy)dlsym(RTLD_DEFAULT, "SecTaskCopyValueForEntitlement");
               if (!create || !copy) { persist(@"sectask unavailable"); return; }
               SecTaskRef t = create(kCFAllocatorDefault);
-              if (!t) { persist(@"no sectask"); return; }
+              if (!t) return;
               CFTypeRef d = copy(t, NULL, NULL);
               if (d && CFGetTypeID(d) == CFDictionaryGetTypeID()) {
-                  CFIndex n = CFDictionaryGetCount((CFDictionaryRef)d);
-                  persist([NSString stringWithFormat:@"ENT count=%ld", (long)n]);
-                  ui([NSString stringWithFormat:@"ENT count=%ld", (long)n]);
-              } else { persist(@"ENT none"); ui(@"ENT none"); }
+                  persist([NSString stringWithFormat:@"ENT count=%ld",
+                           (long)CFDictionaryGetCount((CFDictionaryRef)d)]);
+              } else persist(@"ENT none");
               if (d) CFRelease(d);
               CFRelease(t);
           }
@@ -459,15 +408,6 @@ jobs:
                   int idx = g_nconn;
                   g_conn[idx] = c; g_ctype[idx] = t; g_node[idx] = node;
                   g_nconn++; got++;
-                  uint8_t* in = calloc(1, 4096);
-                  char tg[40]; snprintf(tg, sizeof(tg), "po%d.%u", node, t);
-                  kern_return_t kr = callp(tg, idx, 5, in, 4096, 4096, NO);
-                  free(in);
-                  if (kr == KERN_SUCCESS && g_open_idx < 0) {
-                      g_open_idx = idx;
-                      persist([NSString stringWithFormat:@"OPEN node=%d type=%u idx=%d", node, t, idx]);
-                      ui([NSString stringWithFormat:@"### OPEN n%d t%u idx=%d", node, t, idx]);
-                  }
               }
               return got;
           }
@@ -517,12 +457,12 @@ jobs:
           }
 
           static void oracle(int ci) {
-              if (ci < 0) ci = 0;
+              if (ci < 0 || ci >= g_nconn) { ui(@"oracle no conn"); return; }
               NSMutableString* line = [NSMutableString string];
               for (uint32_t s = 0; s <= 31; s++) {
-                  uint8_t* in = calloc(1, 4096);
+                  uint8_t* in = calloc(1, FIXED);
                   char tg[32]; snprintf(tg, sizeof(tg), "o.%u", s);
-                  kern_return_t kr = callp(tg, ci, s, in, 4096, 4096, NO);
+                  kern_return_t kr = callp(tg, ci, s, in, FIXED, FIXED, NO);
                   free(in);
                   [line appendFormat:@"%u:%@ ", s, kr_name(kr)];
               }
@@ -530,112 +470,120 @@ jobs:
               ui([NSString stringWithFormat:@"ORACLE n%d %@", g_node[ci], line]);
           }
 
-          static void fill_pat(uint8_t* in, size_t sz, int pat) {
-              switch (pat) {
-                  case 0: break;
-                  case 1: memset(in, 0xFF, sz); break;
-                  case 2: if (sz >= 8) { memcpy(in, "\x80\x07\x00\x00\x38\x04\x00\x00", 8); } break;
-                  case 3: for (size_t i = 0; i + 4 <= sz; i += 4) { uint32_t o = 1; memcpy(in + i, &o, 4); } break;
-                  case 4: if (sz >= 12) { uint32_t a = 1, b = 1920, c = 1080;
-                              memcpy(in, &a, 4); memcpy(in + 4, &b, 4); memcpy(in + 8, &c, 4); } break;
+          static void shape_sweep(void) {
+              size_t outs[15] = {0,1,4,8,16,32,64,128,256,512,1024,2048,4096,8192,16384};
+              for (int i = 0; i < 15; i++) {
+                  uint8_t* in = calloc(1, FIXED);
+                  char a[32]; snprintf(a, sizeof(a), "sh4.%zu", outs[i]);
+                  t4(a, in, outs[i]);
+                  char b[32]; snprintf(b, sizeof(b), "sh5.%zu", outs[i]);
+                  callp(b, g_root_idx, 5, in, FIXED, outs[i], YES);
+                  free(in);
               }
           }
 
-          static void m4_struct(int ci) {
-              if (ci < 0) return;
-              for (int si = 0; si < NSIZE; si++) {
-                  for (int p = 0; p < NPAT; p++) {
-                      for (int oz = 0; oz < 2; oz++) {
-                          uint8_t* in = calloc(1, 4096);
-                          fill_pat(in, SIZES[si], p);
-                          char tg[48]; snprintf(tg, sizeof(tg), "m4.%zu.%d.%d", SIZES[si], p, oz);
-                          callp(tg, ci, 4, in, SIZES[si], oz ? 4096 : 0, YES);
-                          free(in);
-                      }
-                  }
+          static void insize_sweep(void) {
+              size_t ins[15] = {0,1,4,8,16,64,256,1024,2048,4095,4096,4097,8192,16384,32768};
+              for (int i = 0; i < 15; i++) {
+                  uint8_t* in = calloc(1, 32768);
+                  char tg[32]; snprintf(tg, sizeof(tg), "is4.%zu", ins[i]);
+                  callp(tg, g_root_idx, 4, in, ins[i], FIXED, YES);
+                  free(in);
               }
           }
 
-          static void m4_scalar(int ci) {
-              if (ci < 0) return;
-              uint64_t vals[4] = {0, 1920, 1080, 1};
-              for (uint32_t n = 0; n <= 4; n++) {
-                  uint64_t in[8] = {0};
-                  for (uint32_t i = 0; i < n; i++) in[i] = vals[i % 4];
-                  char tg[32]; snprintf(tg, sizeof(tg), "sc4.%u", n);
-                  uint64_t out[8]; uint32_t oc = 8;
-                  bread(tg);
-                  kern_return_t kr = IOConnectCallScalarMethod(g_conn[ci], 4, in, n, out, &oc);
-                  __sync_fetch_and_add(&g_done, 1);
-                  persist([NSString stringWithFormat:@"scalar4 %u %@ oc=%u | %s", n, kr_name(kr), oc, tg]);
-                  if (kr == KERN_SUCCESS) {
-                      __sync_fetch_and_add(&g_hits, 1);
-                      ui([NSString stringWithFormat:@"!!! %s OK oc=%u v0=%llu", tg, oc, oc ? out[0] : 0]);
-                  } else ui([NSString stringWithFormat:@"%s -> %@", tg, kr_name(kr)]);
-                  usleep(300);
+          static void hdr_sweep(void) {
+              uint32_t v[27] = {0,1,2,3,4,5,6,7,8,9,10,12,16,20,32,64,100,255,256,512,
+                                1024,1920,1080,0x1000,0x10000,0x1000000,0xFFFFFFFF};
+              for (int i = 0; i < 27; i++) {
+                  uint8_t* in = calloc(1, FIXED);
+                  memcpy(in, &v[i], 4);
+                  char tg[40]; snprintf(tg, sizeof(tg), "hd4.%u", v[i]);
+                  t4(tg, in, FIXED);
+                  free(in);
               }
           }
 
-          static void m4_mixed(int ci) {
-              if (ci < 0) return;
-              uint64_t sets[3][2] = {{1, 0}, {1920, 1080}, {0, 0}};
-              for (int k = 0; k < 3; k++) {
-                  for (int si = 0; si < 5; si++) {
-                      uint8_t* in = calloc(1, 4096);
-                      fill_pat(in, SIZES[si], k);
-                      char tg[40]; snprintf(tg, sizeof(tg), "mx.%d.%zu", k, SIZES[si]);
-                      callmix(tg, ci, 4, sets[k], 2, in, SIZES[si], 4096);
+          static void field_probe(uint32_t val, const char* pfx) {
+              for (int off = 0; off <= 32; off += 4) {
+                  uint8_t* in = calloc(1, FIXED);
+                  memcpy(in + off, &val, 4);
+                  char tg[40]; snprintf(tg, sizeof(tg), "%s%d", pfx, off);
+                  t4(tg, in, FIXED);
+                  free(in);
+              }
+          }
+
+          static void pair_probe(void) {
+              uint32_t one = 1;
+              for (int a = 0; a <= 32; a += 4) {
+                  for (int b = a + 4; b <= 32; b += 4) {
+                      uint8_t* in = calloc(1, FIXED);
+                      memcpy(in + a, &one, 4);
+                      memcpy(in + b, &one, 4);
+                      char tg[40]; snprintf(tg, sizeof(tg), "pr4.%d.%d", a, b);
+                      t4(tg, in, FIXED);
                       free(in);
                   }
               }
           }
 
-          static void mm_range64(uint32_t lo, uint32_t hi) {
-              int ci = g_nconn ? 0 : -1;
-              if (ci < 0) return;
-              for (uint32_t mt = lo; mt <= hi; mt++) {
-                  char tg[32]; snprintf(tg, sizeof(tg), "m64.%u", mt);
-                  bread(tg);
-                  mach_vm_address_t addr = 0; mach_vm_size_t size = 0;
-                  kern_return_t kr = IOConnectMapMemory64(g_conn[ci], mt, mach_task_self(),
-                                                          &addr, &size, kIOMapAnywhere);
-                  persist([NSString stringWithFormat:@"map64 %u %@ %llu | %s", mt, kr_name(kr), size, tg]);
-                  if (kr != KERN_SUCCESS) { ui([NSString stringWithFormat:@"%s -> %@", tg, kr_name(kr)]); continue; }
-                  __sync_fetch_and_add(&g_hits, 1);
-                  ui([NSString stringWithFormat:@"!!! %s claim=%llu", tg, size]);
-                  IOConnectUnmapMemory64(g_conn[ci], mt, mach_task_self(), addr);
-              }
+          static void surf_make(void) {
+              NSDictionary* p = @{ (id)kIOSurfaceWidth: @1920, (id)kIOSurfaceHeight: @1080,
+                                   (id)kIOSurfaceBytesPerElement: @4,
+                                   (id)kIOSurfacePixelFormat: @(0x42475241) };
+              g_surf = IOSurfaceCreate((__bridge CFDictionaryRef)p);
+              persist([NSString stringWithFormat:@"surf=%d id=%u", g_surf ? 1 : 0,
+                       g_surf ? IOSurfaceGetID(g_surf) : 0]);
+              ui([NSString stringWithFormat:@"surf=%d", g_surf ? 1 : 0]);
           }
 
-          static void mm_range32(uint32_t lo, uint32_t hi) {
-              int ci = g_nconn ? 0 : -1;
-              if (ci < 0) return;
-              for (uint32_t mt = lo; mt <= hi; mt++) {
-                  char tg[32]; snprintf(tg, sizeof(tg), "m32.%u", mt);
-                  bread(tg);
-                  vm_address_t addr = 0; vm_size_t size = 0;
-                  kern_return_t kr = IOConnectMapMemory(g_conn[ci], mt, mach_task_self(),
-                                                        &addr, &size, kIOMapAnywhere);
-                  persist([NSString stringWithFormat:@"map32 %u %@ %lu | %s", mt, kr_name(kr),
-                           (unsigned long)size, tg]);
-                  if (kr != KERN_SUCCESS) { ui([NSString stringWithFormat:@"%s -> %@", tg, kr_name(kr)]); continue; }
-                  __sync_fetch_and_add(&g_hits, 1);
-                  ui([NSString stringWithFormat:@"!!! %s claim=%lu", tg, (unsigned long)size]);
-                  IOConnectUnmapMemory(g_conn[ci], mt, mach_task_self(), addr);
+          static void surf_probe(void) {
+              if (!g_surf) { ui(@"no surf"); return; }
+              IOSurfaceID sid = IOSurfaceGetID(g_surf);
+              persist([NSString stringWithFormat:@"sid=%u", sid]);
+              for (int off = 0; off <= 32; off += 4) {
+                  uint8_t* in = calloc(1, FIXED);
+                  memcpy(in + off, &sid, 4);
+                  char a[40]; snprintf(a, sizeof(a), "sf4.%d", off);
+                  kern_return_t kr = t4(a, in, FIXED);
+                  char b[40]; snprintf(b, sizeof(b), "sf5.%d", off);
+                  t5(b, in);
+                  if (kr != KERN_SUCCESS) {
+                      uint32_t w = 1920, h = 1080;
+                      memcpy(in + off + 4, &w, 4);
+                      memcpy(in + off + 8, &h, 4);
+                      char c[40]; snprintf(c, sizeof(c), "sd4.%d", off);
+                      t4(c, in, FIXED);
+                  }
+                  free(in);
               }
-          }
-
-          static void post_45(void) {
-              if (!g_nconn) return;
-              uint8_t* in = calloc(1, 4096);
-              kern_return_t a = callp("q4", 0, 4, in, 0, 0, YES);
-              kern_return_t b = callp("q5", 0, 5, in, 0, 0, YES);
-              kern_return_t c = callp("q4b", 0, 4, in, 0, 0, YES);
+              uint8_t* in = calloc(1, FIXED);
+              memcpy(in, &sid, 4);
+              uint32_t w = 1920, h = 1080, f = 0x42475241;
+              memcpy(in + 4, &w, 4);
+              memcpy(in + 8, &h, 4);
+              memcpy(in + 12, &f, 4);
+              t4("sx4.full", in, FIXED);
+              t5("sx5.full", in);
               free(in);
-              persist([NSString stringWithFormat:@"post 4=%@ 5=%@ 4b=%@",
-                       kr_name(a), kr_name(b), kr_name(c)]);
-              ui([NSString stringWithFormat:@"post 4=%@ 5=%@ 4b=%@",
-                  kr_name(a), kr_name(b), kr_name(c)]);
+          }
+
+          static void post_fixed(void) {
+              uint8_t* in = calloc(1, FIXED);
+              kern_return_t a = t4("pf4", in, FIXED);
+              t5("pf5", in);
+              kern_return_t c = t4("pf4b", in, FIXED);
+              free(in);
+              persist([NSString stringWithFormat:@"postfixed 4=%@ 4b=%@", kr_name(a), kr_name(c)]);
+              ui([NSString stringWithFormat:@"postfixed 4=%@ 4b=%@", kr_name(a), kr_name(c)]);
+          }
+
+          static void verdict(void) {
+              persist([NSString stringWithFormat:@"VERDICT ok4=%d hits=%d conns=%d root_idx=%d",
+                       g_ok4, g_hits, g_nconn, g_root_idx]);
+              ui([NSString stringWithFormat:@"VERDICT ok4=%d hits=%d idx=%d",
+                  g_ok4, g_hits, g_root_idx]);
           }
 
           static void do_step(int s) {
@@ -645,28 +593,30 @@ jobs:
                   case 2: dump_sig(); break;
                   case 3: match_uc(); break;
                   case 4: vt_start(); break;
-                  case 5: ui([NSString stringWithFormat:@"vt=%d done=%d", (int)vt_encode(), g_vt_done]); break;
+                  case 5: ui([NSString stringWithFormat:@"vt=%d", (int)vt_encode()]); break;
                   case 6: dump_tree(); break;
-                  case 7:
-                      for (int i = 1; i <= g_nchild; i++) {
-                          int got = probe_open(g_child[i], i, TYPE_MAX);
-                          persist([NSString stringWithFormat:@"child %d got=%d", i, got]);
-                          ui([NSString stringWithFormat:@"child %d got=%d", i, got]);
-                      }
-                      break;
-                  case 8: {
+                  case 7: {
+                      int base = g_nconn;
                       int got = probe_open(g_root, 0, TYPE_MAX);
-                      persist([NSString stringWithFormat:@"root got=%d", got]);
-                      ui([NSString stringWithFormat:@"root got=%d", got]);
+                      if (g_nconn > base) g_root_idx = base;
+                      persist([NSString stringWithFormat:@"root got=%d idx=%d", got, g_root_idx]);
+                      ui([NSString stringWithFormat:@"root got=%d idx=%d", got, g_root_idx]);
                       break;
                   }
-                  case 9: if (g_nconn) oracle(0); else ui(@"no conn"); break;
-                  case 10: m4_struct(0); break;
-                  case 11: m4_scalar(0); break;
-                  case 12: m4_mixed(0); break;
-                  case 13: mm_range64(0, 7); break;
-                  case 14: mm_range32(0, 7); break;
-                  case 15: post_45(); break;
+                  case 8: oracle(g_root_idx); break;
+                  case 9: shape_sweep(); break;
+                  case 10: insize_sweep(); break;
+                  case 11: hdr_sweep(); break;
+                  case 12: field_probe(1, "f1."); break;
+                  case 13:
+                      field_probe(1920, "fw.");
+                      field_probe(1080, "fh.");
+                      field_probe(0x1000, "fp.");
+                      break;
+                  case 14: pair_probe(); break;
+                  case 15: surf_make(); surf_probe(); break;
+                  case 16: post_fixed(); break;
+                  case 17: verdict(); break;
               }
           }
 
@@ -690,12 +640,12 @@ jobs:
               int svc = find_root();
               ui([NSString stringWithFormat:@"svc=%d", svc]);
               persist([NSString stringWithFormat:@"svc=%d", svc]);
-              if (!g_root) { ui(@"NO ROOT — STOP"); g_stop = 1; }
+              if (!g_root) { ui(@"NO ROOT"); g_stop = 1; }
 
               while (g_step <= STEP_MAX && !g_stop) {
                   load_try();
                   if (g_try >= TRY_MAX) {
-                      ui([NSString stringWithFormat:@"SKIP %d %s", g_step, STEP_NAME[g_step]]);
+                      ui([NSString stringWithFormat:@"SKIP %d", g_step]);
                       persist([NSString stringWithFormat:@"SKIP %d", g_step]);
                       g_step++; save_step(g_step);
                       usleep(150000);
@@ -706,8 +656,8 @@ jobs:
                   ui([NSString stringWithFormat:@"CHAIN %d %s", g_step, STEP_NAME[g_step]]);
                   do_step(g_step);
 
-                  persist([NSString stringWithFormat:@"STEP %d OK calls=%d hits=%d open=%d conns=%d",
-                           g_step, g_done, g_hits, g_open_idx, g_nconn]);
+                  persist([NSString stringWithFormat:@"STEP %d OK calls=%d hits=%d ok4=%d conns=%d",
+                           g_step, g_done, g_hits, g_ok4, g_nconn]);
                   if (g_fd >= 0) fsync(g_fd);
                   ui([NSString stringWithFormat:@"STEP %d SURVIVED", g_step]);
                   g_step++; save_step(g_step);
@@ -756,8 +706,8 @@ jobs:
               [self.w makeKeyAndVisible];
 
               [NSTimer scheduledTimerWithTimeInterval:0.25 repeats:YES block:^(NSTimer*) {
-                  g_hb.text = [NSString stringWithFormat:@"%s step %d/%d c=%d h=%d o=%d n=%d",
-                               BUILD_TAG, g_step, STEP_MAX, g_done, g_hits, g_open_idx, g_nconn];
+                  g_hb.text = [NSString stringWithFormat:@"%s step %d/%d c=%d h=%d ok4=%d n=%d",
+                               BUILD_TAG, g_step, STEP_MAX, g_done, g_hits, g_ok4, g_nconn];
                   flush_ui();
               }];
 
