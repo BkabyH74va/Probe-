@@ -11,7 +11,7 @@ jobs:
           mkdir -p Sources
           cat > project.yml <<'PROJEOF'
           name: probe
-          options: { bundleIdPrefix: com.buurza26, deploymentTarget: { iOS: "18.0" } }
+          options: { bundleIdPrefix: com.buurza27, deploymentTarget: { iOS: "18.0" } }
           targets:
             probe:
               type: application
@@ -21,9 +21,9 @@ jobs:
               info:
                 path: Info.plist
                 properties:
-                  CFBundleDisplayName: buurd26
+                  CFBundleDisplayName: buurd27
                   CFBundleShortVersionString: "1.0"
-                  CFBundleVersion: "26"
+                  CFBundleVersion: "27"
                   UILaunchScreen: {}
               settings:
                 ARCHS: "arm64"
@@ -64,6 +64,7 @@ jobs:
           #include <stdlib.h>
           #include <string.h>
           #include <stdio.h>
+          #include <stdarg.h>
           #include <dlfcn.h>
 
           extern int csops(pid_t pid, unsigned int ops, void* uaddr, size_t usize);
@@ -73,7 +74,7 @@ jobs:
           typedef CFTypeRef (*fn_copy)(SecTaskRef, CFStringRef, CFErrorRef*);
           typedef uint32_t (*fn_surfid)(IOSurfaceRef);
 
-          #define BUILD_TAG "v26-shape0"
+          #define BUILD_TAG "v27-varargs"
           #define MAXC 512
           #define STEP_MAX 14
           #define TRY_MAX 2
@@ -132,31 +133,36 @@ jobs:
               "surf-probe", "confirm", "summary", "verdict"
           };
 
-          static void ui(NSString* s) {
+          static void ulog(NSString* fmt, ...) {
+              va_list ap; va_start(ap, fmt);
+              NSString* s = [[NSString alloc] initWithFormat:fmt arguments:ap];
+              va_end(ap);
               dispatch_async(dispatch_get_main_queue(), ^{
                   [g_lines addObject:s];
                   if (g_lines.count > 200) [g_lines removeObjectsInRange:NSMakeRange(0, 40)];
               });
           }
-          static void flush_ui(void) {
-              g_tv.text = [g_lines componentsJoinedByString:@"\n"];
-              if (g_lines.count) [g_tv scrollRangeToVisible:NSMakeRange(g_tv.text.length, 0)];
-          }
-          static void persist(NSString* s) {
+          static void plog(NSString* fmt, ...) {
               if (g_fd < 0) return;
+              va_list ap; va_start(ap, fmt);
+              NSString* s = [[NSString alloc] initWithFormat:fmt arguments:ap];
+              va_end(ap);
               NSData* d = [[s stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
               pthread_mutex_lock(&g_lk);
               write(g_fd, d.bytes, d.length);
               pthread_mutex_unlock(&g_lk);
           }
+          static void flush_ui(void) {
+              g_tv.text = [g_lines componentsJoinedByString:@"\n"];
+              if (g_lines.count) [g_tv scrollRangeToVisible:NSMakeRange(g_tv.text.length, 0)];
+          }
           static void bread(const char* tag) {
-              persist([NSString stringWithFormat:@"PRE step=%d %s", g_step, tag]);
+              plog(@"PRE step=%d %s", g_step, tag);
               if (g_fd >= 0) fsync(g_fd);
           }
           static void sigh(int sig) {
               char b[96];
-              int n = snprintf(b, sizeof(b), "SIGNAL %d at step %d (%s)\n",
-                               sig, g_step, STEP_NAME[g_step < STEP_MAX+1 ? g_step : STEP_MAX]);
+              int n = snprintf(b, sizeof(b), "SIGNAL %d at step %d (%s)\n", sig, g_step, STEP_NAME[g_step < STEP_MAX+1 ? g_step : STEP_MAX]);
               if (g_fd >= 0) { write(g_fd, b, n); fsync(g_fd); }
               signal(sig, SIG_DFL);
               raise(sig);
@@ -186,8 +192,7 @@ jobs:
               return s;
           }
           static NSString* doc_file(const char* f) {
-              NSString* d = [NSSearchPathForDirectoriesInDomains(
-                  NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+              NSString* d = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
               return [d stringByAppendingPathComponent:@(f)];
           }
           static void doc_path(const char* f, char* b, size_t n) {
@@ -196,18 +201,15 @@ jobs:
               b[n - 1] = 0;
           }
           static int load_step(void) {
-              NSString* s = [NSString stringWithContentsOfFile:doc_file("step.txt")
-                  encoding:NSUTF8StringEncoding error:nil];
+              NSString* s = [NSString stringWithContentsOfFile:doc_file("step.txt") encoding:NSUTF8StringEncoding error:nil];
               return s ? s.intValue : 0;
           }
           static void save_step(int v) {
-              [[NSString stringWithFormat:@"%d", v] writeToFile:doc_file("step.txt")
-                  atomically:YES encoding:NSUTF8StringEncoding error:nil];
+              [[NSString stringWithFormat:@"%d", v] writeToFile:doc_file("step.txt") atomically:YES encoding:NSUTF8StringEncoding error:nil];
           }
           static void load_try(void) {
               g_try = 0;
-              NSString* s = [NSString stringWithContentsOfFile:doc_file("try.txt")
-                  encoding:NSUTF8StringEncoding error:nil];
+              NSString* s = [NSString stringWithContentsOfFile:doc_file("try.txt") encoding:NSUTF8StringEncoding error:nil];
               if (!s) return;
               NSArray<NSString*>* f = [s componentsSeparatedByString:@":"];
               if (f.count != 2) return;
@@ -216,24 +218,20 @@ jobs:
               if (a.intValue == g_step) g_try = b.intValue;
           }
           static void save_try(void) {
-              [[NSString stringWithFormat:@"%d:%d", g_step, g_try] writeToFile:doc_file("try.txt")
-                  atomically:YES encoding:NSUTF8StringEncoding error:nil];
+              [[NSString stringWithFormat:@"%d:%d", g_step, g_try] writeToFile:doc_file("try.txt") atomically:YES encoding:NSUTF8StringEncoding error:nil];
           }
           static void latch_build(void) {
-              NSString* bt = [NSString stringWithContentsOfFile:doc_file("build.txt")
-                  encoding:NSUTF8StringEncoding error:nil];
+              NSString* bt = [NSString stringWithContentsOfFile:doc_file("build.txt") encoding:NSUTF8StringEncoding error:nil];
               if ([bt isEqualToString:@BUILD_TAG]) return;
               unlink(doc_file("state.txt").UTF8String);
               save_step(0);
               g_try = 0;
               save_try();
               g_root_idx = -1;
-              [@BUILD_TAG writeToFile:doc_file("build.txt")
-                  atomically:YES encoding:NSUTF8StringEncoding error:nil];
+              [@BUILD_TAG writeToFile:doc_file("build.txt") atomically:YES encoding:NSUTF8StringEncoding error:nil];
           }
           static void load_state(void) {
-              NSString* s = [NSString stringWithContentsOfFile:doc_file("state.txt")
-                  encoding:NSUTF8StringEncoding error:nil];
+              NSString* s = [NSString stringWithContentsOfFile:doc_file("state.txt") encoding:NSUTF8StringEncoding error:nil];
               for (NSString* ln in [s componentsSeparatedByString:@"\n"]) {
                   if ([ln hasPrefix:@"K "]) [g_seen addObject:[ln substringFromIndex:2]];
               }
@@ -276,17 +274,10 @@ jobs:
               if (mode == 0) {
                   kr = IOConnectCallScalarMethod(c, sel, sin, sic, sout, &sc);
               } else if (mode == 1) {
-                  kr = IOConnectCallMethod(c, sel, sin, sic,
-                                           zis ? sinS : NULL, zis,
-                                           sout, &sc,
-                                           zos ? soutS : NULL, &szb);
+                  kr = IOConnectCallMethod(c, sel, sin, sic, zis ? sinS : NULL, zis, sout, &sc, zos ? soutS : NULL, &szb);
               } else {
                   uint64_t ref = 1;
-                  kr = IOConnectCallAsyncMethod(c, sel, g_wake, &ref, 1,
-                                                sin, sic,
-                                                zis ? sinS : NULL, zis,
-                                                sout, &sc,
-                                                zos ? soutS : NULL, &szb);
+                  kr = IOConnectCallAsyncMethod(c, sel, g_wake, &ref, 1, sin, sic, zis ? sinS : NULL, zis, sout, &sc, zos ? soutS : NULL, &szb);
               }
               if (soOut) memcpy(soOut, sout, sizeof(uint64_t) * SCO);
               if (soCnt) *soCnt = sc;
@@ -301,10 +292,9 @@ jobs:
               if (ci >= g_nconn) return (kern_return_t)0xe00002cc;
               uint32_t t = g_ctype[ci];
               int nd = g_node[ci];
-              NSString* key = [NSString stringWithFormat:@"%d:%u:%u:m%d:%u:%zu:%zu:%zu:%s",
-                               nd, t, sel, mode, sinCnt, sinSz, soutCnt, soutSz, tag];
+              NSString* key = [NSString stringWithFormat:@"%d:%u:%u:m%d:%u:%zu:%zu:%zu:%s", nd, t, sel, mode, sinCnt, sinSz, soutCnt, soutSz, tag];
               if (seen_key(key)) return (kern_return_t)0xdeadbeef;
-              persist([NSString stringWithFormat:@"K %@", key]);
+              plog(@"K %@", key);
               bread(tag);
 
               uint64_t so[SCO] = {0};
@@ -314,27 +304,21 @@ jobs:
               kern_return_t kr = raw(g_conn[ci], sel, mode, sinCnt, sinSz, soutSz, so, &sc, sb, &szb);
               __sync_fetch_and_add(&g_done, 1);
               if (kr == KERN_SUCCESS) {
-                  persist([NSString stringWithFormat:@"OK %s n%d t%u s%u m%d si=%u/%zu so=%zu/%zu SOUT %llu %@",
-                           tag, nd, t, sel, mode, sinCnt, sinSz, sc, szb,
-                           (unsigned long long)so[0], hexn(sb, szb, 128)]);
-                  persist([NSString stringWithFormat:@"WIN s%u m%d sic=%u zis=%zu zos=%zu so0=%llu sc=%zu szb=%zu",
-                           sel, mode, sinCnt, sinSz, soutSz, (unsigned long long)so[0], sc, szb]);
+                  plog(@"OK %s n%d t%u s%u m%d si=%u/%zu so=%zu/%zu SOUT %llu %@", tag, nd, t, sel, mode, sinCnt, sinSz, sc, szb, (unsigned long long)so[0], hexn(sb, szb, 128));
+                  plog(@"WIN s%u m%d sic=%u zis=%zu zos=%zu so0=%llu sc=%zu szb=%zu", sel, mode, sinCnt, sinSz, soutSz, (unsigned long long)so[0], sc, szb);
                   __sync_fetch_and_add(&g_hits, 1);
                   if (sel == 4) __sync_fetch_and_add(&g_ok4, 1);
                   if (sel == 0) __sync_fetch_and_add(&g_ok0, 1);
                   if (sel == 9) __sync_fetch_and_add(&g_ok9, 1);
                   note_ok(sel, (uint32_t)mode, sinCnt, sinSz, soutSz);
-                  ui([NSString stringWithFormat:@"!!! WIN s%u m%d %u/%zu/%zu so0=%llu",
-                      sel, mode, sinCnt, sinSz, soutSz, (unsigned long long)so[0]]);
+                  ulog(@"!!! WIN s%u m%d %u/%zu/%zu so0=%llu", sel, mode, sinCnt, sinSz, soutSz, (unsigned long long)so[0]);
               } else if (kr != 0xe00002c2 && kr != 0xe00002c7 && kr != 0xe00002cc && kr != 0xdeadbeef) {
-                  persist([NSString stringWithFormat:@"%d %u %u m%d si=%u/%zu so=%zu %@ | %s",
-                           nd, t, sel, mode, sinCnt, sinSz, soutSz, kr_name(kr), tag]);
+                  plog(@"%d %u %u m%d si=%u/%zu so=%zu %@ | %s", nd, t, sel, mode, sinCnt, sinSz, soutSz, kr_name(kr), tag);
                   __sync_fetch_and_add(&g_hits, 1);
-                  ui([NSString stringWithFormat:@"!! %s n%d t%u m%d -> %@", tag, nd, t, mode, kr_name(kr)]);
+                  ulog(@"!! %s n%d t%u m%d -> %@", tag, nd, t, mode, kr_name(kr));
                   if (!g_hit_s[sel]) { g_hit_s[sel] = 1; g_bsi[sel] = sinSz; g_bso[sel] = soutSz; g_bmode[sel] = mode; }
               } else {
-                  persist([NSString stringWithFormat:@"%d %u %u m%d si=%u/%zu so=%zu %@ | %s",
-                           nd, t, sel, mode, sinCnt, sinSz, soutSz, kr_name(kr), tag]);
+                  plog(@"%d %u %u m%d si=%u/%zu so=%zu %@ | %s", nd, t, sel, mode, sinCnt, sinSz, soutSz, kr_name(kr), tag);
               }
               usleep(300);
               return kr;
@@ -358,8 +342,7 @@ jobs:
 
           static int find_root(void) {
               io_iterator_t it = 0;
-              if (IOServiceGetMatchingServices(kIOMainPortDefault,
-                      IOServiceMatching("AppleJPEGDriver"), &it) != KERN_SUCCESS) return 0;
+              if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("AppleJPEGDriver"), &it) != KERN_SUCCESS) return 0;
               int svc = 0;
               io_service_t s;
               while ((s = IOIteratorNext(it))) {
@@ -372,9 +355,8 @@ jobs:
 
           static void census(void) {
               io_iterator_t it = 0;
-              if (IOServiceGetMatchingServices(kIOMainPortDefault,
-                      IOServiceMatching("IOService"), &it) != KERN_SUCCESS) {
-                  ui(@"no census"); return;
+              if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOService"), &it) != KERN_SUCCESS) {
+                  ulog(@"no census"); return;
               }
               NSMutableDictionary* cnt = [NSMutableDictionary dictionary];
               io_object_t o; int n = 0;
@@ -382,32 +364,32 @@ jobs:
                   n++;
                   io_name_t cls; IOObjectGetClass(o, cls);
                   NSString* s = @(cls);
-                  if ([s rangeOfString:@"JPEG"].location != NSNotFound ||
-                      [s rangeOfString:@"jpeg"].location != NSNotFound) {
+                  if ([s rangeOfString:@"JPEG"].location != NSNotFound || [s rangeOfString:@"jpeg"].location != NSNotFound) {
                       NSNumber* c = cnt[s];
                       cnt[s] = @(c.intValue + 1);
                   }
                   IOObjectRelease(o);
               }
               IOObjectRelease(it);
-              for (NSString* k in cnt) persist([NSString stringWithFormat:@"JCLS %@ x%d", k, [cnt[k] intValue]]);
-              persist([NSString stringWithFormat:@"census nodes=%d jcls=%lu", n, (unsigned long)cnt.count]);
-              ui([NSString stringWithFormat:@"census=%d jcls=%lu", n, (unsigned long)cnt.count]);
-              for (NSString* k in cnt) ui([NSString stringWithFormat:@"JCLS %@ x%d", k, [cnt[k] intValue]]);
+              for (NSString* k in cnt) {
+                  plog(@"JCLS %@ x%d", k, [cnt[k] intValue]);
+                  ulog(@"JCLS %@ x%d", k, [cnt[k] intValue]);
+              }
+              plog(@"census nodes=%d jcls=%lu", n, (unsigned long)cnt.count);
+              ulog(@"census=%d jcls=%lu", n, (unsigned long)cnt.count);
           }
 
           static void dump_sig(void) {
               unsigned int fl = 0;
               int rc = csops(getpid(), 0, &fl, sizeof(fl));
-              persist([NSString stringWithFormat:@"csops rc=%d f=0x%x gta=%d dpl=%d plat=%d",
-                       rc, fl, (fl & 4) ? 1 : 0, (fl & 0x2000000) ? 1 : 0, (fl & 0x4000000) ? 1 : 0]);
-              ui([NSString stringWithFormat:@"csops rc=%d f=0x%x", rc, fl]);
+              plog(@"csops rc=%d f=0x%x gta=%d dpl=%d plat=%d", rc, fl, (fl & 4) ? 1 : 0, (fl & 0x2000000) ? 1 : 0, (fl & 0x4000000) ? 1 : 0);
+              ulog(@"csops rc=%d f=0x%x", rc, fl);
           }
 
           static void dump_props(io_object_t o, int node) {
               CFMutableDictionaryRef props = NULL;
               if (IORegistryEntryCreateCFProperties(o, &props, kCFAllocatorDefault, 0) != KERN_SUCCESS || !props) {
-                  persist([NSString stringWithFormat:@"PROPS %d none", node]);
+                  plog(@"PROPS %d none", node);
                   return;
               }
               NSDictionary* d = (__bridge NSDictionary*)props;
@@ -415,31 +397,31 @@ jobs:
                   NSString* ks = [k description];
                   NSString* vs = [d[k] description];
                   if (vs.length > 160) vs = [vs substringToIndex:160];
-                  persist([NSString stringWithFormat:@"PROPS %d %@ = %@", node, ks, vs]);
+                  plog(@"PROPS %d %@ = %@", node, ks, vs);
               }
-              persist([NSString stringWithFormat:@"PROPS %d count=%lu", node, (unsigned long)d.count]);
-              ui([NSString stringWithFormat:@"PROPS %d n=%lu", node, (unsigned long)d.count]);
+              plog(@"PROPS %d count=%lu", node, (unsigned long)d.count);
+              ulog(@"PROPS %d n=%lu", node, (unsigned long)d.count);
               CFRelease(props);
           }
 
           static void prop_dump(void) {
-              if (!g_root) { ui(@"no root"); return; }
+              if (!g_root) { ulog(@"no root"); return; }
               dump_props(g_root, 0);
               for (int i = 1; i <= g_nchild; i++) dump_props(g_child[i], i);
           }
 
           static void dump_node(io_object_t o, int node) {
               io_name_t cls; IOObjectGetClass(o, cls);
-              persist([NSString stringWithFormat:@"NODE %d class=%s", node, cls]);
-              ui([NSString stringWithFormat:@"NODE %d %s", node, cls]);
+              plog(@"NODE %d class=%s", node, cls);
+              ulog(@"NODE %d %s", node, cls);
           }
 
           static void dump_tree(void) {
-              if (!g_root) { ui(@"no root"); return; }
+              if (!g_root) { ulog(@"no root"); return; }
               dump_node(g_root, 0);
               io_iterator_t ch = 0;
               if (IORegistryEntryGetChildIterator(g_root, kIOServicePlane, &ch) != KERN_SUCCESS) {
-                  ui(@"no child iter"); return;
+                  ulog(@"no child iter"); return;
               }
               io_object_t c;
               while ((c = IOIteratorNext(ch)) && g_nchild < MAXCHILD) {
@@ -448,16 +430,14 @@ jobs:
                   dump_node(c, g_nchild);
               }
               IOObjectRelease(ch);
-              persist([NSString stringWithFormat:@"children=%d", g_nchild]);
-              ui([NSString stringWithFormat:@"children=%d", g_nchild]);
+              plog(@"children=%d", g_nchild);
+              ulog(@"children=%d", g_nchild);
           }
 
-          static void vt_cb(void* ref, void* src, OSStatus st, VTEncodeInfoFlags fl,
-                            CMSampleBufferRef sb) { g_vt_done = 1; }
+          static void vt_cb(void* ref, void* src, OSStatus st, VTEncodeInfoFlags fl, CMSampleBufferRef sb) { g_vt_done = 1; }
 
           static void vt_start(void) {
-              VTCompressionSessionCreate(NULL, 1920, 1080, kCMVideoCodecType_H264,
-                  NULL, NULL, NULL, vt_cb, NULL, &g_vt);
+              VTCompressionSessionCreate(NULL, 1920, 1080, kCMVideoCodecType_H264, NULL, NULL, NULL, vt_cb, NULL, &g_vt);
               if (g_vt) VTCompressionSessionPrepareToEncodeFrames(g_vt);
           }
 
@@ -465,14 +445,12 @@ jobs:
               if (!g_vt) return -1;
               CVPixelBufferRef pb = NULL;
               NSDictionary* a = @{ (id)kCVPixelBufferIOSurfacePropertiesKey: @{} };
-              if (CVPixelBufferCreate(NULL, 1920, 1080, kCVPixelFormatType_32BGRA,
-                      (__bridge CFDictionaryRef)a, &pb) != kCVReturnSuccess) return -2;
+              if (CVPixelBufferCreate(NULL, 1920, 1080, kCVPixelFormatType_32BGRA, (__bridge CFDictionaryRef)a, &pb) != kCVReturnSuccess) return -2;
               CVPixelBufferLockBaseAddress(pb, 0);
               memset(CVPixelBufferGetBaseAddress(pb), 0x80, CVPixelBufferGetDataSize(pb));
               CVPixelBufferUnlockBaseAddress(pb, 0);
               VTEncodeInfoFlags fl = 0;
-              OSStatus st = VTCompressionSessionEncodeFrame(g_vt, pb, CMTimeMake(1, 30),
-                  CMTimeMake(1, 30), NULL, NULL, &fl);
+              OSStatus st = VTCompressionSessionEncodeFrame(g_vt, pb, CMTimeMake(1, 30), CMTimeMake(1, 30), NULL, NULL, &fl);
               CVPixelBufferRelease(pb);
               for (int i = 0; i < 300 && !g_vt_done; i++) usleep(10000);
               return (int)st;
@@ -481,18 +459,17 @@ jobs:
           static int surf_make(void) {
               if (g_surf) return 1;
               NSDictionary* p = @{ (id)kCVPixelBufferIOSurfacePropertiesKey: @{} };
-              CVReturn r = CVPixelBufferCreate(NULL, 1920, 1080, kCVPixelFormatType_32BGRA,
-                                               (__bridge CFDictionaryRef)p, &g_surf);
+              CVReturn r = CVPixelBufferCreate(NULL, 1920, 1080, kCVPixelFormatType_32BGRA, (__bridge CFDictionaryRef)p, &g_surf);
               if (r != kCVReturnSuccess || !g_surf) {
-                  persist([NSString stringWithFormat:@"surf=0 rc=%d", (int)r]);
-                  ui([NSString stringWithFormat:@"surf=0 rc=%d", (int)r]);
+                  plog(@"surf=0 rc=%d", (int)r);
+                  ulog(@"surf=0 rc=%d", (int)r);
                   return 0;
               }
               IOSurfaceRef s = CVPixelBufferGetIOSurface(g_surf);
               fn_surfid idf = (fn_surfid)dlsym(RTLD_DEFAULT, "IOSurfaceGetID");
               g_sid = (s && idf) ? idf(s) : 0;
-              persist([NSString stringWithFormat:@"surf=1 id=%u", g_sid]);
-              ui([NSString stringWithFormat:@"surf=1 id=%u", g_sid]);
+              plog(@"surf=1 id=%u", g_sid);
+              ulog(@"surf=1 id=%u", g_sid);
               return 1;
           }
 
@@ -515,7 +492,7 @@ jobs:
                           for (int zo = 0; zo < 3; zo++) {
                               io_connect_t c = 0;
                               if (IOServiceOpen(g_root, mach_task_self(), 0, &c) != KERN_SUCCESS) {
-                                  ui(@"s0 open fail"); continue;
+                                  ulog(@"s0 open fail"); continue;
                               }
                               attempts++;
                               uint64_t so[SCO] = {0};
@@ -529,38 +506,32 @@ jobs:
                               size_t zis = SZ[zi];
                               size_t zos = OUT3[zo];
                               kern_return_t kr;
-                              if (mode == 0) kr = IOConnectCallScalarMethod(c, 0, inV, scin, so, &sc);
-                              else if (mode == 1) kr = IOConnectCallMethod(c, 0, inV, scin,
-                                      zis ? inS : NULL, zis, so, &sc, zos ? sb : NULL, &szb);
-                              else {
+                              if (mode == 0) {
+                                  kr = IOConnectCallScalarMethod(c, 0, inV, scin, so, &sc);
+                              } else if (mode == 1) {
+                                  kr = IOConnectCallMethod(c, 0, inV, scin, zis ? inS : NULL, zis, so, &sc, zos ? sb : NULL, &szb);
+                              } else {
                                   uint64_t ref = 1;
-                                  kr = IOConnectCallAsyncMethod(c, 0, g_wake, &ref, 1,
-                                      inV, scin, zis ? inS : NULL, zis,
-                                      so, &sc, zos ? sb : NULL, &szb);
+                                  kr = IOConnectCallAsyncMethod(c, 0, g_wake, &ref, 1, inV, scin, zis ? inS : NULL, zis, so, &sc, zos ? sb : NULL, &szb);
                               }
                               free(inS); free(inV);
                               __sync_fetch_and_add(&g_done, 1);
-                              persist([NSString stringWithFormat:@"S0 a%d m%d sic=%u zis=%zu zos=%zu -> %@ so0=%llu sc=%zu szb=%zu %@",
-                                       attempts, mode, sic, zis, zos, kr_name(kr),
-                                       (unsigned long long)so[0], sc, szb, hexn(sb, szb, 64)]);
+                              plog(@"S0 a%d m%d sic=%u zis=%zu zos=%zu -> %@ so0=%llu sc=%zu szb=%zu %@", attempts, mode, sic, zis, zos, kr_name(kr), (unsigned long long)so[0], sc, szb, hexn(sb, szb, 64));
                               if (kr == KERN_SUCCESS) {
-                                  persist([NSString stringWithFormat:@"WIN s0 m%d sic=%u zis=%zu zos=%zu so0=%llu sc=%zu szb=%zu",
-                                           mode, sic, zis, zos, (unsigned long long)so[0], sc, szb]);
-                                  ui([NSString stringWithFormat:@"!!! WIN s0 m%d %u/%zu/%zu so0=%llu",
-                                      mode, sic, zis, zos, (unsigned long long)so[0]]);
+                                  plog(@"WIN s0 m%d sic=%u zis=%zu zos=%zu so0=%llu sc=%zu szb=%zu", mode, sic, zis, zos, (unsigned long long)so[0], sc, szb);
+                                  ulog(@"!!! WIN s0 m%d %u/%zu/%zu so0=%llu", mode, sic, zis, zos, (unsigned long long)so[0]);
                                   __sync_fetch_and_add(&g_hits, 1);
                                   __sync_fetch_and_add(&g_ok0, 1);
                                   note_ok(0, (uint32_t)mode, sic, zis, zos);
-                                  if (g_root_idx < 0) {
+                                  if (g_root_idx < 0 && g_nconn < MAXC) {
                                       g_conn[g_nconn] = c; g_ctype[g_nconn] = 0; g_node[g_nconn] = 0;
                                       g_root_idx = g_nconn; g_nconn++;
                                   }
                                   uint64_t so9[SCO] = {0}; size_t sc9 = 0;
                                   uint8_t sb9[FIXED]; size_t szb9 = FIXED;
                                   kern_return_t k9 = raw(c, 9, 0, 0, 0, FIXED, so9, &sc9, sb9, &szb9);
-                                  persist([NSString stringWithFormat:@"CH9 after-win -> %@ so0=%llu sc=%zu szb=%zu %@",
-                                           kr_name(k9), (unsigned long long)so9[0], sc9, szb9, hexn(sb9, szb9, 64)]);
-                                  ui([NSString stringWithFormat:@"CH9 -> %@ so0=%llu", kr_name(k9), (unsigned long long)so9[0]]);
+                                  plog(@"CH9 after-win -> %@ so0=%llu sc=%zu szb=%zu %@", kr_name(k9), (unsigned long long)so9[0], sc9, szb9, hexn(sb9, szb9, 64));
+                                  ulog(@"CH9 -> %@ so0=%llu", kr_name(k9), (unsigned long long)so9[0]);
                                   if (k9 == KERN_SUCCESS) { __sync_fetch_and_add(&g_ok9, 1); note_ok(9, 0, 0, 0, FIXED); }
                                   uint8_t* d4 = calloc(1, FIXED);
                                   if (d4) {
@@ -568,19 +539,17 @@ jobs:
                                       uint64_t so4[SCO] = {0}; size_t sc4 = 0;
                                       uint8_t sb4[FIXED]; size_t szb4 = FIXED;
                                       uint64_t* v4 = calloc(SCO, sizeof(uint64_t));
-                                      kern_return_t k4 = IOConnectCallMethod(c, 4, v4, 0, d4, FIXED,
-                                                                             so4, &sc4, sb4, &szb4);
-                                      persist([NSString stringWithFormat:@"CH4 after-win -> %@ so0=%llu sc=%zu szb=%zu %@",
-                                               kr_name(k4), (unsigned long long)so4[0], sc4, szb4, hexn(sb4, szb4, 128)]);
-                                      ui([NSString stringWithFormat:@"CH4 -> %@ so0=%llu", kr_name(k4), (unsigned long long)so4[0]]);
+                                      kern_return_t k4 = IOConnectCallMethod(c, 4, v4, 0, d4, FIXED, so4, &sc4, sb4, &szb4);
+                                      plog(@"CH4 after-win -> %@ so0=%llu sc=%zu szb=%zu %@", kr_name(k4), (unsigned long long)so4[0], sc4, szb4, hexn(sb4, szb4, 128));
+                                      ulog(@"CH4 -> %@ so0=%llu", kr_name(k4), (unsigned long long)so4[0]);
                                       if (k4 == KERN_SUCCESS) { __sync_fetch_and_add(&g_ok4, 1); note_ok(4, 1, 0, FIXED, FIXED); }
                                       free(v4); free(d4);
                                   }
                                   uint64_t so5[SCO] = {0}; size_t sc5 = 0;
                                   uint8_t sb5[FIXED]; size_t szb5 = FIXED;
                                   kern_return_t k5 = raw(c, 5, 1, 0, FIXED, FIXED, so5, &sc5, sb5, &szb5);
-                                  persist([NSString stringWithFormat:@"CH5 after-win -> %@", kr_name(k5)]);
-                                  ui([NSString stringWithFormat:@"CH5 -> %@", kr_name(k5)]);
+                                  plog(@"CH5 after-win -> %@", kr_name(k5));
+                                  ulog(@"CH5 -> %@", kr_name(k5));
                               } else {
                                   IOServiceClose(c);
                               }
@@ -588,17 +557,16 @@ jobs:
                       }
                   }
               }
-              persist([NSString stringWithFormat:@"shape0 attempts=%d ok0=%d", attempts, g_ok0]);
-              ui([NSString stringWithFormat:@"shape0 attempts=%d ok0=%d", attempts, g_ok0]);
+              plog(@"shape0 attempts=%d ok0=%d", attempts, g_ok0);
+              ulog(@"shape0 attempts=%d ok0=%d", attempts, g_ok0);
           }
 
           static void nine_sweep(void) {
-              int ci = g_root_idx;
               io_connect_t c = 0;
               int local = 0;
-              if (ci >= 0 && ci < g_nconn) c = g_conn[ci];
+              if (g_root_idx >= 0 && g_root_idx < g_nconn) c = g_conn[g_root_idx];
               else if (IOServiceOpen(g_root, mach_task_self(), 0, &c) == KERN_SUCCESS) local = 1;
-              else { ui(@"9 no conn"); return; }
+              else { ulog(@"9 no conn"); return; }
               for (int mode = 0; mode < 3; mode++) {
                   for (uint32_t sic = 0; sic <= 4; sic++) {
                       for (int zo = 0; zo < 3; zo++) {
@@ -609,20 +577,15 @@ jobs:
                               size_t szb = 0;
                               kern_return_t kr = raw(c, 9, mode, sic, SZ[zi], OUT3[zo], so, &sc, sb, &szb);
                               __sync_fetch_and_add(&g_done, 1);
-                              persist([NSString stringWithFormat:@"N9 m%d sic=%u zis=%zu zos=%zu -> %@ so0=%llu %@",
-                                       mode, sic, SZ[zi], OUT3[zo], kr_name(kr),
-                                       (unsigned long long)so[0], hexn(sb, szb, 96)]);
+                              plog(@"N9 m%d sic=%u zis=%zu zos=%zu -> %@ so0=%llu %@", mode, sic, SZ[zi], OUT3[zo], kr_name(kr), (unsigned long long)so[0], hexn(sb, szb, 96));
                               if (kr == KERN_SUCCESS) {
-                                  persist([NSString stringWithFormat:@"WIN s9 m%d sic=%u zis=%zu zos=%zu so0=%llu sc=%zu szb=%zu",
-                                           mode, sic, SZ[zi], OUT3[zo], (unsigned long long)so[0], sc, szb));
-                                  ui([NSString stringWithFormat:@"!!! WIN s9 m%d %u/%zu/%zu so0=%llu",
-                                      mode, sic, SZ[zi], OUT3[zo], (unsigned long long)so[0]]);
+                                  plog(@"WIN s9 m%d sic=%u zis=%zu zos=%zu so0=%llu sc=%zu szb=%zu", mode, sic, SZ[zi], OUT3[zo], (unsigned long long)so[0], sc, szb);
+                                  ulog(@"!!! WIN s9 m%d %u/%zu/%zu so0=%llu", mode, sic, SZ[zi], OUT3[zo], (unsigned long long)so[0]);
                                   __sync_fetch_and_add(&g_hits, 1);
                                   __sync_fetch_and_add(&g_ok9, 1);
                                   note_ok(9, (uint32_t)mode, sic, SZ[zi], OUT3[zo]);
                               } else if (kr != 0xe00002c2 && kr != 0xe00002cc) {
-                                  ui([NSString stringWithFormat:@"N9 m%d %u/%zu/%zu -> %@",
-                                      mode, sic, SZ[zi], OUT3[zo], kr_name(kr)]);
+                                  ulog(@"N9 m%d %u/%zu/%zu -> %@", mode, sic, SZ[zi], OUT3[zo], kr_name(kr));
                               }
                           }
                       }
@@ -641,8 +604,8 @@ jobs:
                   g_nconn++; got++;
               }
               if (g_root_idx < 0 && g_nconn > base) g_root_idx = base;
-              persist([NSString stringWithFormat:@"root got=%d idx=%d nchild=%d", got, g_root_idx, g_nchild]);
-              ui([NSString stringWithFormat:@"root got=%d idx=%d", got, g_root_idx]);
+              plog(@"root got=%d idx=%d nchild=%d", got, g_root_idx, g_nchild);
+              ulog(@"root got=%d idx=%d", got, g_root_idx);
               for (int i = 1; i <= g_nchild; i++) {
                   NSMutableString* l = [NSMutableString string];
                   for (uint32_t t = 0; t <= TYPE_MAX; t++) {
@@ -654,11 +617,11 @@ jobs:
                           g_nconn++;
                       }
                   }
-                  persist([NSString stringWithFormat:@"child %d %@", i, l]);
-                  ui([NSString stringWithFormat:@"child %d %@", i, l]);
+                  plog(@"child %d %@", i, l);
+                  ulog(@"child %d %@", i, l);
               }
-              persist([NSString stringWithFormat:@"conns=%d", g_nconn]);
-              ui([NSString stringWithFormat:@"conns=%d", g_nconn]);
+              plog(@"conns=%d", g_nconn);
+              ulog(@"conns=%d", g_nconn);
           }
 
           static void open_chain(void) {
@@ -671,8 +634,8 @@ jobs:
                   kern_return_t kr = callm(tg, g_root_idx, s, (int)m, 0, zi, 0, zo);
                   [l appendFormat:@"%u(m%u/%zu/%zu):%@ ", s, m, zi, zo, kr_name(kr)];
               }
-              persist([NSString stringWithFormat:@"OC %@", l]);
-              ui([NSString stringWithFormat:@"OC %@", l]);
+              plog(@"OC %@", l);
+              ulog(@"OC %@", l);
           }
 
           static void surf_probe(void) {
@@ -702,27 +665,24 @@ jobs:
                       kern_return_t kr = callm(tg, ci, s, (int)m, 0, zi, 0, zo);
                       [l appendFormat:@"%u:%@ ", s, kr_name(kr)];
                   }
-                  persist([NSString stringWithFormat:@"CF n%d t%u %@", g_node[ci], g_ctype[ci], l]);
-                  ui([NSString stringWithFormat:@"CF n%d t%u %@", g_node[ci], g_ctype[ci], l]);
+                  plog(@"CF n%d t%u %@", g_node[ci], g_ctype[ci], l);
+                  ulog(@"CF n%d t%u %@", g_node[ci], g_ctype[ci], l);
               }
           }
 
           static void summary(void) {
-              NSString* s = [NSString stringWithContentsOfFile:doc_file("state.txt")
-                  encoding:NSUTF8StringEncoding error:nil];
+              NSString* st = [NSString stringWithContentsOfFile:doc_file("state.txt") encoding:NSUTF8StringEncoding error:nil];
               int lines = 0, oks = 0, wins = 0;
-              for (NSString* ln in [s componentsSeparatedByString:@"\n"]) {
+              for (NSString* ln in [st componentsSeparatedByString:@"\n"]) {
                   if (!ln.length) continue;
                   lines++;
-                  if ([ln hasPrefix:@"WIN "]) { wins++; oks++; persist([NSString stringWithFormat:@"SUM %@", ln]); }
-                  else if ([ln hasPrefix:@"OK "]) { oks++; persist([NSString stringWithFormat:@"SUM %@", ln]); }
+                  if ([ln hasPrefix:@"WIN "]) { wins++; oks++; plog(@"SUM %@", ln); }
+                  else if ([ln hasPrefix:@"OK "]) { oks++; plog(@"SUM %@", ln); }
               }
-              persist([NSString stringWithFormat:@"SUMMARY lines=%d oks=%d wins=%d ok0=%d ok9=%d ok4=%d",
-                       lines, oks, wins, g_ok0, g_ok9, g_ok4]);
-              ui([NSString stringWithFormat:@"SUMMARY lines=%d oks=%d wins=%d", lines, oks, wins]);
+              plog(@"SUMMARY lines=%d oks=%d wins=%d ok0=%d ok9=%d ok4=%d", lines, oks, wins, g_ok0, g_ok9, g_ok4);
+              ulog(@"SUMMARY lines=%d oks=%d wins=%d", lines, oks, wins);
               for (uint32_t s = 0; s < SEL_N; s++) {
-                  if (g_oks[s]) ui([NSString stringWithFormat:@"OKSHAPE s%u m%u %u/%zu/%zu",
-                                    s, g_okm[s], g_oksi[s], g_okzi[s], g_okzo[s]]);
+                  if (g_oks[s]) ulog(@"OKSHAPE s%u m%u %u/%zu/%zu", s, g_okm[s], g_oksi[s], g_okzi[s], g_okzo[s]);
               }
           }
 
@@ -732,9 +692,8 @@ jobs:
                   if (g_oks[s]) [b appendFormat:@"%u(OK m%u/%u/%zu/%zu) ", s, g_okm[s], g_oksi[s], g_okzi[s], g_okzo[s]];
                   else if (g_hit_s[s]) [b appendFormat:@"%u(m%u/%zu/%zu) ", s, g_bmode[s], g_bsi[s], g_bso[s]];
               }
-              persist([NSString stringWithFormat:@"VERDICT ok0=%d ok9=%d ok4=%d hits=%d conns=%d hit=[%@]",
-                       g_ok0, g_ok9, g_ok4, g_hits, g_nconn, b]);
-              ui([NSString stringWithFormat:@"VERDICT ok0=%d ok9=%d ok4=%d hit=[%@]", g_ok0, g_ok9, g_ok4, b]);
+              plog(@"VERDICT ok0=%d ok9=%d ok4=%d hits=%d conns=%d hit=[%@]", g_ok0, g_ok9, g_ok4, g_hits, g_nconn, b);
+              ulog(@"VERDICT ok0=%d ok9=%d ok4=%d hit=[%@]", g_ok0, g_ok9, g_ok4, b);
           }
 
           static void do_step(int s) {
@@ -744,7 +703,7 @@ jobs:
                   case 2: dump_sig(); break;
                   case 3: prop_dump(); break;
                   case 4: vt_start(); break;
-                  case 5: ui([NSString stringWithFormat:@"vt=%d", (int)vt_encode()]); break;
+                  case 5: ulog(@"vt=%d", (int)vt_encode()); break;
                   case 6: dump_tree(); break;
                   case 7: shape0(); break;
                   case 8: nine_sweep(); break;
@@ -768,14 +727,13 @@ jobs:
               mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &g_wake);
               mach_port_insert_right(mach_task_self(), g_wake, g_wake, MACH_MSG_TYPE_MAKE_SEND);
 
-              persist([NSString stringWithFormat:@"=== LAUNCH step=%d build=%s", g_step, BUILD_TAG]);
+              plog(@"=== LAUNCH step=%d build=%s", g_step, BUILD_TAG);
               if (g_fd >= 0) fsync(g_fd);
-              ui([NSString stringWithFormat:@"BUILD %s", BUILD_TAG]);
-              ui([NSString stringWithFormat:@"STEP %d/%d: %s", g_step, STEP_MAX,
-                  STEP_NAME[g_step < STEP_MAX+1 ? g_step : STEP_MAX]]);
+              ulog(@"BUILD %s", BUILD_TAG);
+              ulog(@"STEP %d/%d: %s", g_step, STEP_MAX, STEP_NAME[g_step < STEP_MAX+1 ? g_step : STEP_MAX]);
 
               if (g_step > STEP_MAX) {
-                  ui(@"ALL DONE - replay");
+                  ulog(@"ALL DONE - replay");
                   summary();
                   verdict();
                   if (g_fd >= 0) fsync(g_fd);
@@ -784,32 +742,31 @@ jobs:
               }
 
               int svc = find_root();
-              ui([NSString stringWithFormat:@"svc=%d", svc]);
-              persist([NSString stringWithFormat:@"svc=%d", svc]);
-              if (!g_root) { ui(@"NO ROOT"); g_stop = 1; }
+              ulog(@"svc=%d", svc);
+              plog(@"svc=%d", svc);
+              if (!g_root) { ulog(@"NO ROOT"); g_stop = 1; }
 
               while (g_step <= STEP_MAX && !g_stop) {
                   load_try();
                   if (g_try >= TRY_MAX) {
-                      ui([NSString stringWithFormat:@"SKIP %d", g_step]);
-                      persist([NSString stringWithFormat:@"SKIP %d", g_step]);
+                      ulog(@"SKIP %d", g_step);
+                      plog(@"SKIP %d", g_step);
                       g_step++; save_step(g_step);
                       usleep(150000);
                       continue;
                   }
                   g_try++; save_try();
-                  ui([NSString stringWithFormat:@"CHAIN %d %s", g_step, STEP_NAME[g_step]]);
+                  ulog(@"CHAIN %d %s", g_step, STEP_NAME[g_step]);
                   do_step(g_step);
-                  persist([NSString stringWithFormat:@"STEP %d OK calls=%d hits=%d ok0=%d ok9=%d ok4=%d",
-                           g_step, g_done, g_hits, g_ok0, g_ok9, g_ok4]);
+                  plog(@"STEP %d OK calls=%d hits=%d ok0=%d ok9=%d ok4=%d", g_step, g_done, g_hits, g_ok0, g_ok9, g_ok4);
                   if (g_fd >= 0) fsync(g_fd);
-                  ui([NSString stringWithFormat:@"STEP %d SURVIVED", g_step]);
+                  ulog(@"STEP %d SURVIVED", g_step);
                   g_step++; save_step(g_step);
                   if (g_step <= STEP_MAX) usleep(400000);
               }
 
-              ui(@"CHAIN END");
-              persist(@"CHAIN END");
+              ulog(@"CHAIN END");
+              plog(@"CHAIN END");
               if (g_fd >= 0) fsync(g_fd);
               close(g_fd); g_fd = -1;
           }
@@ -850,13 +807,11 @@ jobs:
               [self.w makeKeyAndVisible];
 
               [NSTimer scheduledTimerWithTimeInterval:0.25 repeats:YES block:^(NSTimer*) {
-                  g_hb.text = [NSString stringWithFormat:@"%s step %d/%d c=%d h=%d ok0=%d ok9=%d ok4=%d",
-                               BUILD_TAG, g_step, STEP_MAX, g_done, g_hits, g_ok0, g_ok9, g_ok4];
+                  g_hb.text = [NSString stringWithFormat:@"%s step %d/%d c=%d h=%d ok0=%d ok9=%d ok4=%d", BUILD_TAG, g_step, STEP_MAX, g_done, g_hits, g_ok0, g_ok9, g_ok4];
                   flush_ui();
               }];
 
-              dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
-                             dispatch_get_global_queue(0,0), ^{ run(); });
+              dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_global_queue(0,0), ^{ run(); });
               return YES;
           }
           @end
