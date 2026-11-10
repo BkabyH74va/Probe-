@@ -11,7 +11,7 @@ jobs:
           mkdir -p Sources
           cat > project.yml <<'PROJEOF'
           name: probe
-          options: { bundleIdPrefix: com.buurza8, deploymentTarget: { iOS: "18.0" } }
+          options: { bundleIdPrefix: com.buurza9, deploymentTarget: { iOS: "18.0" } }
           targets:
             probe:
               type: application
@@ -19,14 +19,14 @@ jobs:
               sources: [Sources]
               entitlements: { path: probe.entitlements }
               info:
-                path: Sources/Info.plist
+                path: Info.plist
                 properties:
-                  CFBundleDisplayName: buurd8
+                  CFBundleDisplayName: buurd9
                   CFBundleShortVersionString: "1.0"
-                  CFBundleVersion: "8"
+                  CFBundleVersion: "9"
                   UILaunchScreen: {}
               settings:
-                ARCHS: "arm64e arm64"
+                ARCHS: "arm64"
                 SUPPORTED_PLATFORMS: "iphoneos"
                 SDKROOT: "iphoneos"
                 CODE_SIGN_IDENTITY: ""
@@ -60,15 +60,16 @@ jobs:
           #include <fcntl.h>
           #include <signal.h>
           #include <pthread.h>
+          #include <stdlib.h>
+          #include <string.h>
 
-          #define BUILD_TAG "v8-step"
+          #define BUILD_TAG "v9-fix"
           #define MAXC 24
           #define STEP_MAX 21
 
           static UITextView* g_tv;
           static UILabel* g_hb;
           static NSMutableArray* g_lines;
-          static NSString* g_phase = @"idle";
           static volatile int g_hits = 0, g_done = 0;
           static volatile int g_step = 0;
           static int g_fd = -1;
@@ -108,7 +109,6 @@ jobs:
               persist([NSString stringWithFormat:@"PRE step=%d %s", g_step, tag]);
               if (g_fd >= 0) fsync(g_fd);
           }
-          static void phase(NSString* p) { g_phase = p; }
           static void sigh(int sig) {
               char b[96];
               int n = snprintf(b, sizeof(b), "SIGNAL %d at step %d (%s)\n",
@@ -356,8 +356,6 @@ jobs:
                   if (!g_nconn) { ui(@"NO CONN"); return; }
               }
 
-              phase(@(STEP_NAME[g_step < STEP_MAX+1 ? g_step : STEP_MAX]));
-
               switch (g_step) {
                   case 0: break;
                   case 1: case 2: break;
@@ -424,7 +422,7 @@ jobs:
               self.w.rootViewController = vc;
               [self.w makeKeyAndVisible];
 
-              [NSTimer scheduledTimerWithTimeInterval:0.25 repeats:YES block:^(NSTimer* tm) {
+              [NSTimer scheduledTimerWithTimeInterval:0.25 repeats:YES block:^(NSTimer*) {
                   g_hb.text = [NSString stringWithFormat:@"%s step %d/%d c=%d h=%d",
                                BUILD_TAG, g_step, STEP_MAX, g_done, g_hits];
                   flush_ui();
@@ -448,15 +446,17 @@ jobs:
 
       - name: build
         run: |
+          set -o pipefail
           mkdir -p out/Payload
           xcodebuild -project probe.xcodeproj -target probe \
             -sdk iphoneos -configuration Release \
-            -arch arm64e -arch arm64 \
+            -arch arm64 \
             CONFIGURATION_BUILD_DIR=$PWD/out/Payload \
             SUPPORTED_PLATFORMS=iphoneos \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
             OTHER_CFLAGS="-Wno-implicit-function-declaration" \
-            build
+            build 2>&1 | tee b.log
+          grep -nE "error:|fatal error:" b.log || true
 
       - name: ipa
         run: |
