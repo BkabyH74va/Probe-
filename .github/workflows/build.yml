@@ -55,7 +55,7 @@ jobs:
           typedef kern_return_t (*fn_addclient)(io_connect_t, io_connect_t);
           static fn_addclient g_addclient = NULL;
 
-          #define BUILD_TAG "v46-linux"
+          #define BUILD_TAG "v47-linux"
           #define MAXC 40
           #define STEP_MAX 27
           #define TRY_MAX 2
@@ -1335,13 +1335,13 @@ jobs:
           <plist version="1.0"><dict>
             <key>CFBundleDevelopmentRegion</key><string>en</string>
             <key>CFBundleExecutable</key><string>probe</string>
-            <key>CFBundleIdentifier</key><string>com.buurza46.probe</string>
+            <key>CFBundleIdentifier</key><string>com.buurza47.probe</string>
             <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
             <key>CFBundleName</key><string>probe</string>
-            <key>CFBundleDisplayName</key><string>buurd46</string>
+            <key>CFBundleDisplayName</key><string>buurd47</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleShortVersionString</key><string>1.0</string>
-            <key>CFBundleVersion</key><string>48</string>
+            <key>CFBundleVersion</key><string>49</string>
             <key>MinimumOSVersion</key><string>16.0</string>
             <key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
             <key>UILaunchScreen</key><dict/>
@@ -1367,7 +1367,8 @@ jobs:
   linux:
     needs: stage
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
+    continue-on-error: true
     steps:
       - uses: actions/download-artifact@v4.1.8
         with:
@@ -1417,64 +1418,77 @@ jobs:
 
       - name: sdk
         run: |
-          set -euo pipefail
-          WS="$PWD"
-          EX="$WS/ex"
-          SDKROOT="$WS/sdkroot"
-          rm -rf "$EX" "$SDKROOT"
-          mkdir -p "$EX" "$SDKROOT"
+          set -uo pipefail
+          WS="$PWD"; EX="$WS/ex"; SDKROOT="$WS/sdkroot"
+          rm -rf "$EX" "$SDKROOT"; mkdir -p "$EX" "$SDKROOT"
+
+          valid() {
+            [ -d "$1/System/Library/Frameworks/UIKit.framework" ] || return 1
+            { [ -f "$1/usr/lib/libSystem.tbd" ] || [ -f "$1/usr/lib/libSystem.dylib" ]; } || return 1
+            [ -d "$1/usr/include" ] || return 1
+            return 0
+          }
 
           pick() {
-            find "$1" -type d -name '*.sdk' 2>/dev/null | sort -V | tail -1
+            local d
+            while IFS= read -r d; do
+              if valid "$d"; then printf '%s\n' "$d"; return 0; fi
+            done < <(find "$1" -type d -name 'iPhoneOS*.sdk' -prune 2>/dev/null | sort -rV)
+            return 1
+          }
+
+          stage_one() {
+            local d="$1"
+            basename "$d" > "$WS/sdkname.txt"
+            rm -rf "$SDKROOT/sdk"
+            mv "$d" "$SDKROOT/sdk"
+          }
+
+          try_zip() {
+            echo "--- zip $1"
+            rm -f s.zip; rm -rf "$EX"; mkdir -p "$EX"
+            curl -fsSL --connect-timeout 15 --max-time 420 --retry 2 --retry-all-errors -o s.zip "$1" || { echo "  dl fail"; return 1; }
+            unzip -q -o s.zip -d "$EX" >/dev/null 2>&1 || { echo "  unzip fail"; return 1; }
+            local d; d="$(pick "$EX")" || { echo "  no valid sdk in zip"; return 1; }
+            stage_one "$d"
+          }
+
+          try_tar() {
+            echo "--- tar $1"
+            rm -f s.tgz; rm -rf "$EX"; mkdir -p "$EX"
+            curl -fsSL --connect-timeout 15 --max-time 900 --retry 2 --retry-all-errors -o s.tgz "$1" || { echo "  dl fail"; return 1; }
+            tar xzf s.tgz -C "$EX" 2>/dev/null || { echo "  untar fail"; return 1; }
+            local d; d="$(pick "$EX")" || { echo "  no valid sdk in tar"; return 1; }
+            stage_one "$d"
           }
 
           got=0
-          echo "--- quick zip attempt (may be dead)"
-          if curl -fsSL --retry 1 --max-time 45 -o sdk.zip \
-             "https://github.com/xybp888/iOS-SDKs/raw/master/iPhoneOS17.5.sdk.zip"; then
-            if unzip -q -o sdk.zip -d "$EX" 2>/dev/null; then
-              D="$(pick "$EX")"
-              if [ -n "$D" ]; then mv "$D" "$SDKROOT/sdk"; got=1; echo "zip ok"; fi
-            fi
-          fi
-          rm -f sdk.zip
+          for u in \
+            "https://github.com/xybp888/iOS-SDKs/raw/master/iPhoneOS17.5.sdk.zip" \
+            "https://github.com/xybp888/iOS-SDKs/raw/main/iPhoneOS17.5.sdk.zip" \
+            "https://github.com/xybp888/iOS-SDKs/raw/master/iPhoneOS16.5.sdk.zip" \
+            "https://github.com/xybp888/iOS-SDKs/raw/master/iPhoneOS18.0.sdk.zip" \
+            "https://codeload.github.com/theos/sdks/tar.gz/refs/heads/master" \
+            "https://codeload.github.com/theos/sdks/tar.gz/refs/heads/main"; do
+            case "$u" in
+              *.zip) try_zip "$u" && { got=1; break; } ;;
+              *)     try_tar "$u" && { got=1; break; } ;;
+            esac
+          done
 
-          if [ "$got" -eq 0 ]; then
-            for u in \
-              "https://codeload.github.com/theos/sdks/tar.gz/refs/heads/master" \
-              "https://codeload.github.com/theos/sdks/tar.gz/refs/heads/main" \
-              "https://github.com/theos/sdks/archive/refs/heads/master.tar.gz"; do
-              echo "--- tarball $u"
-              rm -f sdk.tar.gz
-              if curl -fsSL --retry 2 --retry-delay 2 --max-time 240 -o sdk.tar.gz "$u"; then
-                if tar xzf sdk.tar.gz -C "$EX" 2>/dev/null; then
-                  D="$(pick "$EX")"
-                  if [ -n "$D" ]; then mv "$D" "$SDKROOT/sdk"; got=1; echo "tarball ok"; break; fi
-                  echo "no .sdk inside $u"
-                else
-                  echo "untar failed for $u"
-                fi
-              else
-                echo "download failed for $u"
-              fi
-              rm -rf "$EX"; mkdir -p "$EX"
-            done
+          if [ "$got" -ne 1 ]; then
+            echo "NO SDK SOURCE WORKED"
+            ls -la "$EX" || true
+            exit 1
           fi
 
-          test "$got" -eq 1 || { echo "NO SDK SOURCE WORKED"; find "$EX" -maxdepth 2 | head -20; exit 1; }
-
-          SDK_DIR="$SDKROOT/sdk"
-          test -d "$SDK_DIR" || { echo "SDK_DIR MISSING: $SDK_DIR"; ls -la "$SDKROOT"; exit 1; }
-          echo "SDK_DIR=$SDK_DIR" >> "$GITHUB_ENV"
-
-          NAME="$(basename "$SDK_DIR")"
+          NAME="$(cat "$WS/sdkname.txt")"
           echo "sdk staged: $NAME"
+          SDK_DIR="$SDKROOT/sdk"
+          test -d "$SDK_DIR" || { echo "SDK_DIR MISSING"; exit 1; }
+          valid "$SDK_DIR" || { echo "STAGED SDK INVALID"; exit 1; }
+          echo "SDK_DIR=$SDK_DIR" >> "$GITHUB_ENV"
           ls "$SDK_DIR" | head
-
-          test -d "$SDK_DIR/System/Library/Frameworks/UIKit.framework" || { echo "NO UIKIT in $NAME"; exit 1; }
-          if [ ! -f "$SDK_DIR/usr/lib/libSystem.tbd" ] && [ ! -f "$SDK_DIR/usr/lib/libSystem.dylib" ]; then
-            echo "NO libSystem STUB in $NAME"; exit 1
-          fi
 
           MAJ="$(echo "$NAME" | sed -n 's/^iPhoneOS\([0-9][0-9]*\)\..*/\1/p')"
           test -n "$MAJ" || { echo "CANNOT PARSE VERSION from $NAME"; exit 1; }
@@ -1582,11 +1596,11 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4.6.2
         with:
-          name: logs-${{ github.run_number }}-${{ github.run_attempt }}
+          name: logs-linux-${{ github.run_number }}-${{ github.run_attempt }}
           path: |
             s.log
             c.log
-            *.log
+            sdkname.txt
           if-no-files-found: ignore
           retention-days: 2
           compression-level: 0
@@ -1594,17 +1608,16 @@ jobs:
       - uses: actions/upload-artifact@v4.6.2
         if: success()
         with:
-          name: probe-ipa-${{ github.run_number }}-${{ github.run_attempt }}
+          name: probe-ipa-linux-${{ github.run_number }}-${{ github.run_attempt }}
           path: out/probe.ipa
           if-no-files-found: error
           retention-days: 3
           compression-level: 0
 
   mac:
-    needs: [stage, linux]
-    if: needs.linux.result == 'failure'
+    needs: stage
     runs-on: macos-14
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/download-artifact@v4.1.8
         with:
@@ -1616,21 +1629,50 @@ jobs:
           APP=out/Payload/probe.app
           mkdir -p "$APP"
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          echo "sdk=$SDK"
+          xcrun --sdk iphoneos clang --version | head -1
           xcrun -sdk iphoneos clang \
             -arch arm64 -miphoneos-version-min=16.0 -fobjc-arc \
             -isysroot "$SDK" -O1 -Wno-implicit-function-declaration \
             -framework UIKit -framework Foundation -framework CoreFoundation \
             -framework IOKit -framework VideoToolbox -framework CoreMedia \
             -framework CoreVideo -framework IOSurface -framework Security \
-            Sources/main.m -o "$APP/probe"
+            Sources/main.m -o "$APP/probe" 2> m.log || { tail -40 m.log; exit 1; }
           chmod +x "$APP/probe"
           file "$APP/probe"
-          cd out && zip -r -q probe.ipa Payload && cd ..
+          lipo -info "$APP/probe"
+
+      - name: sign
+        run: |
+          set -euo pipefail
+          APP=out/Payload/probe.app
+          codesign --force --sign - "$APP/probe"
+          codesign -dv "$APP/probe" 2>&1 | head -5 || true
+
+      - name: ipa
+        run: |
+          set -euo pipefail
+          test -f out/Payload/probe.app/probe || { echo "NO BINARY"; exit 1; }
+          test -f out/Payload/probe.app/Info.plist || { echo "NO PLIST"; exit 1; }
+          cd out && rm -f probe.ipa && zip -r -q probe.ipa Payload && cd ..
+          test -s out/probe.ipa || { echo "ZIP EMPTY"; exit 1; }
+          stat -f "ipa bytes=%z" out/probe.ipa
           shasum -a 256 out/probe.ipa
+
+      - name: logs
+        if: failure()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: logs-mac-${{ github.run_number }}-${{ github.run_attempt }}
+          path: m.log
+          if-no-files-found: ignore
+          retention-days: 2
+          compression-level: 0
 
       - uses: actions/upload-artifact@v4.6.2
         with:
           name: probe-ipa-mac-${{ github.run_number }}-${{ github.run_attempt }}
           path: out/probe.ipa
+          if-no-files-found: error
           retention-days: 3
           compression-level: 0
