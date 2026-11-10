@@ -1,53 +1,29 @@
-name: static
-on:
-  workflow_dispatch:
-    inputs:
-      device: { default: 'iPhone17,1' }
-      build:  { default: '24A335' }
-jobs:
-  dump:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: tools
-        continue-on-error: true
-        run: |
-          brew install blacktop/tap/ipsw
-          git clone --depth 1 https://github.com/karmaz92/CrimsonUroboros.git cu
-          python3 -m pip install --break-system-packages -r cu/requirements.txt || true
-      - name: firmware
-        continue-on-error: true
-        run: |
-          mkdir -p dl kc kext
-          ipsw download ipsw --device "${{ inputs.device }}" --build "${{ inputs.build }}" --output dl --confirm
-      - name: kernelcache
-        continue-on-error: true
-        run: ipsw extract --kernel dl/*.ipsw -o kc
-      - name: extract kext
-        continue-on-error: true
-        run: |
-          for k in kc/kernelcache*; do
-            ipsw kernel extract "$k" --pattern AppleJPEGDriver -o kext || true
-          done
-      - name: symbols
-        continue-on-error: true
-        run: |
-          BIN=$(find kext -type f -perm +111 | head -1)
-          [ -z "$BIN" ] && exit 0
-          chmod +x "$BIN" 2>/dev/null || true
-          python3 cu/CrimsonUroboros.py -p "$BIN" --symbols > syms.txt 2>&1 || true
-          grep -iE "externalMethod|setProperties|clientMemoryForType|registerNotificationPort" syms.txt || true
-      - name: strings
-        continue-on-error: true
-        run: |
-          BIN=$(find kext -type f | head -1)
-          [ -z "$BIN" ] && exit 0
-          strings -a "$BIN" | grep -iE "jpeg|session|surface|buffer|encode|decode|quality|width|height" | sort -u | head -200
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: static
-          path: |
-            syms.txt
-            kext/
-          if-no-files-found: warn
+name: probe
+options: { bundleIdPrefix: com.buurza8, deploymentTarget: { iOS: "18.0" } }
+targets:
+  probe:
+    type: application
+    platform: iOS
+    sources: [Sources]
+    entitlements: { path: probe.entitlements }
+    info:
+      path: Sources/Info.plist
+      properties:
+        CFBundleDisplayName: buurd8
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "8"
+    settings:
+      ARCHS: "arm64e arm64"
+      SUPPORTED_PLATFORMS: "iphoneos"
+      SDKROOT: "iphoneos"
+      CODE_SIGN_IDENTITY: ""
+      CODE_SIGNING_REQUIRED: "NO"
+      CODE_SIGNING_ALLOWED: "NO"
+      OTHER_CFLAGS: "-Wno-implicit-function-declaration"
+    dependencies:
+      - sdk: IOKit.framework
+      - sdk: UIKit.framework
+      - sdk: VideoToolbox.framework
+      - sdk: CoreMedia.framework
+      - sdk: CoreVideo.framework
+      - sdk: Security.framework
