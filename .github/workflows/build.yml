@@ -48,20 +48,15 @@ jobs:
             <key>platform-application</key><true/>
             <key>com.apple.private.security.no-container</key><true/>
             <key>com.apple.security.iokit-user-client-class</key>
-            <array>
-              <string>AVEVideoEncoderUserClient</string>
-              <string>AppleAVE2UserClient</string>
-            </array>
+            <array><string>AVEVideoEncoderUserClient</string></array>
           </dict></plist>
           EOF
           cat > Sources/main.m <<'EOF'
           #import <UIKit/UIKit.h>
           #import <IOKit/IOKitLib.h>
-          #import <VideoToolbox/VideoToolbox.h>
-          #import <CoreVideo/CoreVideo.h>
           #import <Security/Security.h>
+          #import <VideoToolbox/VideoToolbox.h>
           #include <unistd.h>
-          #include <dlfcn.h>
           #include <errno.h>
           #include <sys/sysctl.h>
 
@@ -73,15 +68,13 @@ jobs:
           #define CS_OPS_STATUS            0
           #define CS_OPS_ENTITLEMENTS_BLOB 7
 
-          typedef kern_return_t (*fn_auth)(io_service_t, IOOptionBits);
-
           static UITextView* g_tv;
           static UILabel* g_hb;
           static NSUInteger g_ticks = 0;
-          static dispatch_semaphore_t g_sem;
-          static VTCompressionSessionRef g_vt = NULL;
-          static int g_opens = 0;
+          static int g_ave = 0, g_jpeg = 0;
           static NSMutableString* g_sum;
+          static VTCompressionSessionRef g_vt = NULL;
+          static dispatch_semaphore_t g_sem;
 
           static void add_line(NSString* s) {
               dispatch_async(dispatch_get_main_queue(), ^{
@@ -111,167 +104,146 @@ jobs:
               return @(b);
           }
 
-          static void check_csflags(void) {
+          static NSString* kr_name(kern_return_t kr) {
+              switch (kr) {
+                  case KERN_SUCCESS: return @"OK";
+                  case 0xe00002c2:   return @"BadArg";
+                  case 0xe00002c7:   return @"Unsup";
+                  case 0xe00002be:   return @"NoRes";
+                  case 0xe00002bd:   return @"NoMem";
+                  case 0xe00002c5:   return @"Excl";
+                  case 0xe00002c1:   return @"NotPriv";
+                  case 0xe00002e2:   return @"NotPerm";
+                  default:           return [NSString stringWithFormat:@"0x%x", kr];
+              }
+          }
+
+          static void check_sig(void) {
               uint32_t f = 0;
-              if (csops(getpid(), CS_OPS_STATUS, &f, sizeof(f)) != 0) {
-                  sum([NSString stringWithFormat:@"csops errno=%d", errno]); return;
-              }
-              sum([NSString stringWithFormat:@"csflags=0x%08x platform=%d installer=%d gettaskallow=%d",
-                   f, !!(f & 0x04000000), !!(f & 0x00080000), !!(f & 0x00000004)]);
-          }
-
-          static void dump_ent_blob(void) {
-              uint8_t buf[8192]; size_t len = sizeof(buf);
-              if (csops(getpid(), CS_OPS_ENTITLEMENTS_BLOB, buf, len) != 0) {
-                  sum([NSString stringWithFormat:@"ent blob errno=%d (WYCIETE)", errno]); return;
-              }
-              NSMutableString* s = [NSMutableString string];
-              for (size_t i = 0; i < len && s.length < 1200; i++) {
-                  uint8_t c = buf[i];
-                  if (c == '\n') [s appendString:@" | "];
-                  else if (c >= 32 && c < 127) [s appendFormat:@"%c", c];
-              }
-              sum([NSString stringWithFormat:@"ent blob: %@", s.length ? s : @"(pusty)"]);
-          }
-
-          static void check_ent_keys(void) {
+              if (csops(getpid(), CS_OPS_STATUS, &f, sizeof(f)) == 0)
+                  sum([NSString stringWithFormat:@"csflags=0x%08x platform=%d gettaskallow=%d",
+                       f, !!(f & 0x04000000), !!(f & 0x00000004)]);
               SecTaskRef t = SecTaskCreateFromSelf(kCFAllocatorDefault);
-              if (!t) { sum(@"SecTask nil"); return; }
-              const char* keys[] = { "platform-application",
-                  "com.apple.private.security.no-container",
-                  "com.apple.security.iokit-user-client-class", "get-task-allow" };
-              for (int i = 0; i < 4; i++) {
-                  CFTypeRef v = SecTaskCopyValueForEntitlement(t, (__bridge CFStringRef)@(keys[i]), NULL);
-                  sum([NSString stringWithFormat:@"ent %s = %@", keys[i], v ? @"YES" : @"nil"]);
-                  if (v) CFRelease(v);
+              if (t) {
+                  const char* k[] = { "platform-application",
+                      "com.apple.private.security.no-container", "get-task-allow" };
+                  for (int i = 0; i < 3; i++) {
+                      CFTypeRef v = SecTaskCopyValueForEntitlement(t, (__bridge CFStringRef)@(k[i]), NULL);
+                      sum([NSString stringWithFormat:@"ent %s = %@", k[i], v ? @"YES" : @"nil"]);
+                      if (v) CFRelease(v);
+                  }
+                  CFRelease(t);
               }
-              CFRelease(t);
           }
 
           static void vt_out(void* r, void* s, OSStatus st, VTEncodeInfoFlags f, CMSampleBufferRef sb) {
               dispatch_semaphore_signal(g_sem);
           }
 
-          static void vt_full(void) {
+          static void vt_warm(void) {
               g_sem = dispatch_semaphore_create(0);
-              OSStatus st = VTCompressionSessionCreate(NULL, 1920, 1080,
-                      kCMVideoCodecType_H264, NULL, NULL, NULL, vt_out, NULL, &g_vt);
-              sum([NSString stringWithFormat:@"vt create=%d", (int)st]);
-              if (!g_vt) return;
+              if (VTCompressionSessionCreate(NULL, 1920, 1080, kCMVideoCodecType_H264,
+                      NULL, NULL, NULL, vt_out, NULL, &g_vt) != noErr || !g_vt) {
+                  sum(@"vt create FAIL"); return;
+              }
+              sum(@"vt create ok");
               VTCompressionSessionPrepareToEncodeFrames(g_vt);
               CVPixelBufferRef pb = NULL;
               CVPixelBufferCreate(NULL, 1920, 1080, kCVPixelFormatType_32BGRA, NULL, &pb);
               if (!pb) return;
               VTCompressionSessionEncodeFrame(g_vt, pb, CMTimeMake(1, 30), CMTimeMake(1, 30), NULL, NULL, NULL);
-              long w = dispatch_semaphore_wait(g_sem, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC));
-              sum([NSString stringWithFormat:@"vt encode waited=%ld", w]);
+              dispatch_semaphore_wait(g_sem, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC));
               CVPixelBufferRelease(pb);
           }
 
-          static void dump_props(io_service_t svc) {
-              CFMutableDictionaryRef p = NULL;
-              if (IORegistryEntryCreateCFProperties(svc, &p, kCFAllocatorDefault, 0) != KERN_SUCCESS || !p) return;
-              const char* keys[] = { "IOUserClientClass", "IOKitUserClientAccess", "IOClass" };
-              for (int i = 0; i < 3; i++) {
-                  CFTypeRef v = CFDictionaryGetValue(p, (__bridge CFStringRef)@(keys[i]));
-                  if (!v) continue;
-                  NSString* d = [(__bridge id)v description];
-                  if (d.length > 250) d = [[d substringToIndex:250] stringByAppendingString:@"…"];
-                  add_line([NSString stringWithFormat:@"  %s = %@", keys[i], d]);
-              }
-              CFRelease(p);
-          }
-
-          static void sweep(io_service_t svc, fn_auth auth) {
-              io_name_t cls; IOObjectGetClass(svc, cls);
-              for (int t = 0; t <= 24; t++) {
-                  io_connect_t c = 0;
-                  kern_return_t kr = IOServiceOpen(svc, mach_task_self(), (uint32_t)t, &c);
-                  if (kr == KERN_SUCCESS) {
-                      g_opens++;
-                      add_line([NSString stringWithFormat:@"!! %s type=%d OPEN conn=%u", cls, t, c]);
-                      for (uint64_t sel = 0; sel < 3; sel++) {
-                          uint64_t out[8] = {0}; uint32_t oc = 8;
-                          kern_return_t sr = IOConnectCallScalarMethod(c, (uint32_t)sel, NULL, 0, out, &oc);
-                          add_line([NSString stringWithFormat:@"   sel %llu -> 0x%x", sel, sr]);
-                      }
-                      continue;
+          static void map_sel(io_connect_t c, const char* tag) {
+              NSMutableString* row = [NSMutableString string];
+              int live = 0;
+              for (uint32_t sel = 0; sel < 48; sel++) {
+                  uint64_t out[16] = {0}; uint32_t oc = 16;
+                  kern_return_t kr = IOConnectCallScalarMethod(c, sel, NULL, 0, out, &oc);
+                  if (kr == KERN_SUCCESS || kr == 0xe00002c2 ||
+                      kr == 0xe00002be || kr == 0xe00002bd) {
+                      live++;
+                      [row appendFormat:@" %u=%@", sel, kr_name(kr)];
                   }
-                  if (t <= 4) add_line([NSString stringWithFormat:@"%s type=%d -> 0x%x", cls, t, kr]);
+                  usleep(3000);
+              }
+              add_line([NSString stringWithFormat:@"  %s live=%d ->%@", tag, live, row.length ? row : @" -"]);
+          }
+
+          static void deepen(io_connect_t c, const char* tag) {
+              for (uint32_t sel = 0; sel < 48; sel++) {
+                  uint64_t o1[16] = {0}; uint32_t oc1 = 16;
+                  if (IOConnectCallScalarMethod(c, sel, NULL, 0, o1, &oc1) != 0xe00002c2) continue;
+                  for (int ic = 1; ic <= 4; ic++) {
+                      uint64_t in[8] = {0}; uint64_t out[16] = {0}; uint32_t oc = 16;
+                      kern_return_t kr = IOConnectCallScalarMethod(c, sel, in, (uint32_t)ic, out, &oc);
+                      add_line([NSString stringWithFormat:@"    %s sel %u in=%d -> %@ out0=0x%llx",
+                                tag, sel, ic, kr_name(kr), out[0]]);
+                      if (kr != 0xe00002c2) break;
+                  }
               }
           }
 
-          static void inspect(io_service_t svc, fn_auth auth) {
-              io_name_t cls; IOObjectGetClass(svc, cls);
-              add_line([NSString stringWithFormat:@"NODE %s", cls]);
-              io_service_t par = 0;
-              if (IORegistryEntryGetParentEntry(svc, kIOServicePlane, &par) == KERN_SUCCESS) {
-                  io_name_t pc; IOObjectGetClass(par, pc);
-                  add_line([NSString stringWithFormat:@"  parent %s", pc]);
-                  IOObjectRelease(par);
+          static void do_ave(void) {
+              io_iterator_t it = 0;
+              if (IOServiceGetMatchingServices(kIOMainPortDefault,
+                      IOServiceMatching("AppleAVE2Driver"), &it) != KERN_SUCCESS) return;
+              io_service_t s;
+              while ((s = IOIteratorNext(it))) {
+                  for (int t = 0; t <= 6; t++) {
+                      io_connect_t c = 0;
+                      kern_return_t kr = IOServiceOpen(s, mach_task_self(), (uint32_t)t, &c);
+                      if (kr == KERN_SUCCESS) g_ave++;
+                      add_line([NSString stringWithFormat:@"AVE t=%d -> %@", t, kr_name(kr)]);
+                  }
+                  IOObjectRelease(s);
               }
-              dump_props(svc);
-              if (auth) add_line([NSString stringWithFormat:@"  authorize=0x%x", auth(svc, 0)]);
-              sweep(svc, auth);
+              IOObjectRelease(it);
           }
 
-          // dopasowanie TYLKO do enkoderow
-          static BOOL is_encoder_class(NSString* c) {
-              if ([c containsString:@"HIDTransport"]) return NO;
-              if ([c containsString:@"AVE"]) return YES;
-              if ([c containsString:@"VideoEncoder"]) return YES;
-              if ([c containsString:@"VideoCodec"]) return YES;
-              if ([c containsString:@"VideoToolbox"]) return YES;
-              if ([c containsString:@"H264"]) return YES;
-              if ([c containsString:@"HEVC"]) return YES;
-              if ([c containsString:@"JPEG"]) return YES;
-              return NO;
+          static void do_jpeg(void) {
+              io_iterator_t it = 0;
+              if (IOServiceGetMatchingServices(kIOMainPortDefault,
+                      IOServiceMatching("AppleJPEGDriver"), &it) != KERN_SUCCESS) {
+                  add_line(@"JPEG: no match"); return;
+              }
+              io_service_t s; int nodes = 0;
+              while ((s = IOIteratorNext(it)) && nodes < 3) {
+                  nodes++;
+                  add_line([NSString stringWithFormat:@"JPEG node %d", nodes]);
+                  for (int t = 20; t <= 26; t++) {
+                      io_connect_t c = 0;
+                      kern_return_t kr = IOServiceOpen(s, mach_task_self(), (uint32_t)t, &c);
+                      if (kr != KERN_SUCCESS) { add_line([NSString stringWithFormat:@"  t=%d -> %@", t, kr_name(kr)]); continue; }
+                      g_jpeg++;
+                      char tag[24]; snprintf(tag, sizeof(tag), "n%d.t%d", nodes, t);
+                      add_line([NSString stringWithFormat:@"  t=%d OPEN conn=%u", t, c]);
+                      map_sel(c, tag);
+                      deepen(c, tag);
+                  }
+                  IOObjectRelease(s);
+              }
+              IOObjectRelease(it);
           }
 
           static void run_probe(void) {
               g_sum = [NSMutableString string];
               add_line(@"[+] probe start");
-
-              check_csflags();
-              check_ent_keys();
-              dump_ent_blob();
-
-              fn_auth auth = (fn_auth)dlsym(RTLD_DEFAULT, "IOServiceAuthorize");
-
-              add_line(@"[*] VT warmup");
-              vt_full();
-              usleep(600000);
-
-              add_line(@"[*] explicit AVE pass");
-              const char* names[] = { "AppleAVE2Driver", "AppleAVE2", "AVEVideoEncoder",
-                                      "AppleH264Encoder", "AppleHEVCEncoder", "AppleVideoEncoder" };
-              for (int i = 0; i < 6; i++) {
-                  io_iterator_t it = 0;
-                  if (IOServiceGetMatchingServices(kIOMainPortDefault,
-                          IOServiceMatching(names[i]), &it) != KERN_SUCCESS) continue;
-                  io_service_t s;
-                  while ((s = IOIteratorNext(it))) { inspect(s, auth); IOObjectRelease(s); }
-                  IOObjectRelease(it);
-              }
-
-              add_line(@"[*] filtered scan");
-              io_iterator_t it = 0;
-              if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOService"), &it) == KERN_SUCCESS) {
-                  io_service_t s; int n = 0, hits = 0;
-                  while ((s = IOIteratorNext(it)) && n < 12000) {
-                      io_name_t c; IOObjectGetClass(s, c);
-                      if (is_encoder_class(@(c)) && hits < 120) { hits++; inspect(s, auth); }
-                      IOObjectRelease(s); n++;
-                  }
-                  IOObjectRelease(it);
-                  add_line([NSString stringWithFormat:@"scanned=%d encoders=%d opens=%d", n, hits, g_opens]);
-              }
-
+              check_sig();
+              add_line(@"[*] vt");
+              vt_warm();
+              usleep(400000);
+              add_line(@"[*] AVE");
+              do_ave();
+              add_line(@"[*] JPEG");
+              do_jpeg();
               add_line(@"=========== SUMMARY ===========");
               add_line([NSString stringWithFormat:@"os=%@ model=%@", sysctl_str("kern.osproductversion"), sysctl_str("hw.model")]);
               add_line(g_sum);
-              add_line([NSString stringWithFormat:@"opens=%d", g_opens]);
-              add_line(g_opens ? @"[+] VERDICT: OPENABLE" : @"[-] VERDICT: no open");
+              add_line([NSString stringWithFormat:@"ave_opens=%d jpeg_opens=%d", g_ave, g_jpeg]);
+              add_line(g_jpeg ? @"[+] JPEG CLIENT LIVE" : @"[-] JPEG dead");
               add_line(@"[*] done");
               dump_file();
           }
