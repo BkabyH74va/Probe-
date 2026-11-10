@@ -775,5 +775,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: probe
-          artifact: out/probe.ipa
+          path: out/probe.ipa
           if-no-files-found: error
