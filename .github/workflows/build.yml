@@ -11,7 +11,7 @@ jobs:
           mkdir -p Sources
           cat > project.yml <<'PROJEOF'
           name: probe
-          options: { bundleIdPrefix: com.buurza34, deploymentTarget: { iOS: "18.0" } }
+          options: { bundleIdPrefix: com.buurza35, deploymentTarget: { iOS: "18.0" } }
           targets:
             probe:
               type: application
@@ -21,9 +21,9 @@ jobs:
               info:
                 path: Info.plist
                 properties:
-                  CFBundleDisplayName: buurd34
+                  CFBundleDisplayName: buurd35
                   CFBundleShortVersionString: "1.0"
-                  CFBundleVersion: "36"
+                  CFBundleVersion: "37"
                   UILaunchScreen: {}
               settings:
                 ARCHS: "arm64"
@@ -85,18 +85,20 @@ jobs:
           typedef kern_return_t (*fn_addclient)(io_connect_t, io_connect_t);
           static fn_addclient g_addclient = NULL;
 
-          #define BUILD_TAG "v34-nodename"
+          #define BUILD_TAG "v35-scalarpad"
           #define MAXC 40
-          #define STEP_MAX 26
+          #define STEP_MAX 25
           #define TRY_MAX 2
           #define MAXCHILD 8
           #define FIXED 4096
+          #define BLOB 262144
           #define BIGOUT 16
           #define SEL_N 32
           #define SCO 16
           #define CSZ_N 4
           #define MAG_N 6
           #define SVC_N 6
+          #define SV_N 12
           #define UNTRIED ((kern_return_t)0xffffffff)
           #define PAT 0x41
           #define AAM 0xAA
@@ -111,11 +113,13 @@ jobs:
           static volatile int g_ok4 = 0;
           static volatile int g_ok9 = 0;
           static volatile int g_9flip = 0;
-          static volatile int g_m1hit = 0;
+          static volatile int g_spad = 0;
+          static volatile int g_s9new = 0;
           static volatile int g_probes = 0;
           static volatile int g_cliffs = 0;
           static volatile int g_oobw = 0;
           static volatile int g_nocopy = 0;
+          static volatile int g_jfeed = 0;
           static int g_try = 0;
           static int g_fd = -1;
           static int g_nchild = 0;
@@ -162,12 +166,15 @@ jobs:
           static const size_t ZS[21] = { 0, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 1024, 2048, 4096, 8192, 16384, 65536, 262144, 1048576 };
           #define NSZ 21
 
+          static uint64_t SV[SV_N] = { 0, 1, 2, 18, 24, 64, 1920, 1080, 4096, 0x1000ULL, 0x10000ULL, 0x4141414141414141ULL };
+          static const uint32_t SICV[] = { 1, 2, 3, 4, 6, 16 };
+
           static const char* STEP_NAME[STEP_MAX + 1] = {
               "boot", "census", "sig-blob", "dev-info", "tree-up", "svc-open",
               "dump-tree", "prop-dump", "vt-init", "vt-encode", "root-open",
-              "addclient", "child-open", "child-sweep", "ping-sweep", "s9-payload",
-              "sweep-m1", "out-struct", "seq-test", "cliff-map", "oob-write",
-              "scalar-16", "null-mix", "combo-m1", "confirm", "summary", "verdict"
+              "child-open", "scpad-best", "scpad-child", "s9-scalars", "s9-struct",
+              "jpeg-build", "jpeg-feed", "cliff-pad", "oob-pad", "seq-test",
+              "combo-m1", "confirm", "summary", "verdict", "null-mix"
           };
 
           static void ulog(NSString* fmt, ...) {
@@ -431,6 +438,17 @@ jobs:
               ulog(@"DEV %s = %s", key, b);
           }
 
+          static void sysctl_u32(const char* key) {
+              uint32_t v = 0; size_t n = sizeof(v);
+              if (sysctlbyname(key, &v, &n, NULL, 0) != 0) {
+                  plog(@"DEV %s = <err>", key);
+                  ulog(@"DEV %s = <err>", key);
+                  return;
+              }
+              plog(@"DEV %s = 0x%x (%u)", key, v, v);
+              ulog(@"DEV %s = 0x%x", key, v);
+          }
+
           static void dev_info(void) {
               struct utsname u;
               memset(&u, 0, sizeof(u));
@@ -444,7 +462,9 @@ jobs:
               }
               sysctl_str("hw.machine");
               sysctl_str("hw.model");
-              sysctl_str("hw.cpufamily");
+              sysctl_u32("hw.cpufamily");
+              sysctl_u32("hw.cpusubfamily");
+              sysctl_u32("hw.ncpu");
               sysctl_str("kern.osversion");
               sysctl_str("kern.osproductversion");
               int64_t phys = 0; size_t pn = sizeof(phys);
@@ -605,6 +625,7 @@ jobs:
               IOSurfaceRef s = CVPixelBufferGetIOSurface(g_surf);
               fn_surfid idf = (fn_surfid)dlsym(RTLD_DEFAULT, "IOSurfaceGetID");
               g_sid = (s && idf) ? idf(s) : 0;
+              if (g_sid) SV[3] = g_sid;
               plog(@"surf=1 id=%u", g_sid);
               ulog(@"surf=1 id=%u", g_sid);
               return 1;
@@ -629,19 +650,11 @@ jobs:
               ulog(@"rootopen conns=%d best=%d %@", g_nconn, g_best, l);
           }
 
-          static void addclient(void) {
-              if (g_nconn < 2) { ulog(@"addclient needs 2 conns"); return; }
-              if (!g_addclient) { plog(@"ADDCLIENT unavailable"); ulog(@"ADDCLIENT unavailable"); return; }
-              kern_return_t kr = g_addclient(g_conn[0], g_conn[1]);
-              plog(@"ADDCLIENT c0+c1 -> %@", kr_name(kr));
-              ulog(@"ADDCLIENT -> %@", kr_name(kr));
-          }
-
           static void child_open(void) {
               NSMutableString* l = [NSMutableString string];
-              for (int i = 1; i <= g_nchild; i++) {
+              for (int i = 1; i <= g_nchild && g_nconn < MAXC; i++) {
                   if (!g_child[i]) { [l appendFormat:@"c%d:none ", i]; continue; }
-                  for (uint32_t t = 0; t <= 2 && g_nconn < MAXC; t++) {
+                  for (uint32_t t = 0; t <= 3 && g_nconn < MAXC; t++) {
                       io_connect_t c = 0;
                       kern_return_t kr = IOServiceOpen(g_child[i], mach_task_self(), t, &c);
                       if (kr == KERN_SUCCESS) {
@@ -650,6 +663,7 @@ jobs:
                           plog(@"CHILDOPEN c%d t%u -> OK s0=%@", i, t, kr_name(k0));
                           [l appendFormat:@"c%d.t%u:OK/s0=%@ ", i, t, kr_name(k0)];
                           g_conn[g_nconn] = c; g_ctype[g_nconn] = t; g_node[g_nconn] = i;
+                          if (g_best < 0) g_best = g_nconn;
                           g_nconn++;
                       } else {
                           plog(@"CHILDOPEN c%d t%u -> %@", i, t, kr_name(kr));
@@ -661,234 +675,218 @@ jobs:
               ulog(@"childopen conns=%d %@", g_nconn, l);
           }
 
-          static void child_sweep(void) {
-              NSMutableString* l = [NSMutableString string];
-              int swept = 0;
-              for (int ci = 0; ci < g_nconn; ci++) {
+          static kern_return_t sc1(int ci, uint32_t sel, uint32_t sic, int mode, size_t zis, const char* tag) {
+              uint64_t sin[SCO] = {0};
+              for (uint32_t k = 0; k < SCO; k++) sin[k] = SV[k % SV_N];
+              uint8_t* in = NULL;
+              if (mode == 1) {
+                  in = calloc(1, zis ? zis : 1);
+                  if (!in) return (kern_return_t)0xe00002bd;
+                  memset(in, PAT, zis);
+                  desc_into(in, zis);
+              }
+              uint64_t so[SCO] = {0}; size_t sc = 0;
+              uint8_t sb[BIGOUT]; size_t szb = BIGOUT;
+              memset(sb, AAM, sizeof(sb));
+              kern_return_t kr = rawx(g_conn[ci], sel, mode, sin, sic, in, zis, so, &sc, sb, &szb);
+              __sync_fetch_and_add(&g_spad, 1);
+              __sync_fetch_and_add(&g_done, 1);
+              int un = 0;
+              for (size_t i = 0; i < sizeof(sb); i++) if (sb[i] == AAM) un++;
+              plog(@"SP %s n%d s%u m%d sc_=%u zi=%zu -> %@ sc=%zu szb=%zu un=%d so0=%llu %@",
+                   tag, g_node[ci], sel, mode, sic, zis, kr_name(kr), sc, szb, un,
+                   (unsigned long long)so[0], hexn(sb, sizeof(sb), BIGOUT));
+              if (kr == KERN_SUCCESS) {
+                  ulog(@"!!! SP %s s%u m%d sc_=%u zi=%zu OK so0=%llu", tag, sel, mode, sic, zis, (unsigned long long)so[0]);
+                  __sync_fetch_and_add(&g_hits, 1);
+                  note_ok(sel, (uint32_t)mode, sic, zis, BIGOUT);
+              } else if (kr != 0xe00002c2) {
+                  ulog(@"!! SP %s s%u m%d sc_=%u zi=%zu -> %@", tag, sel, mode, sic, zis, kr_name(kr));
+                  mark_live(sel);
+              }
+              if (szb > BIGOUT) {
+                  __sync_fetch_and_add(&g_oobw, 1);
+                  plog(@"OOBW s%u offered=%d driver=%zu", sel, BIGOUT, szb);
+              }
+              free(in);
+              usleep(180);
+              return kr;
+          }
+
+          static void scpad_conn(int ci, const char* tag) {
+              for (uint32_t s = 0; s < SEL_N; s++) {
+                  for (int i = 0; i < (int)(sizeof(SICV)/sizeof(SICV[0])); i++) {
+                      sc1(ci, s, SICV[i], 0, 0, tag);
+                  }
+              }
+          }
+
+          static void scpad_best(void) {
+              if (g_best < 0) { ulog(@"scpad no conn"); return; }
+              scpad_conn(g_best, "b");
+              ulog(@"scpad-best done spad=%d live=%d", g_spad, g_nlive);
+          }
+
+          static void scpad_child(void) {
+              int seen = 0;
+              for (int ci = 0; ci < g_nconn && seen < 8; ci++) {
                   if (g_node[ci] <= 0) continue;
                   int child = g_node[ci];
                   BOOL first = YES;
                   for (int pj = 0; pj < ci; pj++) if (g_node[pj] == child) { first = NO; break; }
                   if (!first) continue;
-                  swept++;
-                  for (uint32_t s = 0; s < SEL_N; s++) {
-                      uint64_t so[SCO] = {0}; size_t sc = 0; uint8_t sb[128]; size_t szb = 0;
-                      kern_return_t kr = rawv(g_conn[ci], s, 0, NULL, 0, NULL, 0, so, &sc, sb, &szb);
-                      if (s == 9) g_s9res[ci] = kr;
-                      __sync_fetch_and_add(&g_done, 1);
-                      plog(@"CS c%d s%u -> %@ sc=%zu szb=%zu so0=%llu %@", child, s, kr_name(kr), sc, szb, (unsigned long long)so[0], hexn(sb, szb, 32));
-                      if (kr == KERN_SUCCESS) {
-                          [l appendFormat:@"c%d.s%u:OK ", child, s];
-                          ulog(@"!!! CS c%d s%u OK so0=%llu", child, s, (unsigned long long)so[0]);
-                          __sync_fetch_and_add(&g_hits, 1);
-                          note_ok(s, 0, 0, 0, 0);
-                      } else if (kr != 0xe00002c2) {
-                          [l appendFormat:@"c%d.s%u:%@ ", child, s, kr_name(kr)];
-                          ulog(@"!! CS c%d s%u -> %@", child, s, kr_name(kr));
-                          mark_live(s);
-                      }
-                      usleep(200);
-                  }
+                  seen++;
+                  scpad_conn(ci, "c");
               }
-              plog(@"CSWEEP n=%d %@", swept, l);
-              ulog(@"CSWEEP n=%d %@", swept, l);
+              ulog(@"scpad-child done n=%d spad=%d live=%d", seen, g_spad, g_nlive);
           }
 
-          static void ping_sweep(void) {
-              if (g_best < 0 && g_root_idx >= 0) g_best = g_root_idx;
-              if (g_best < 0) { ulog(@"no conn"); return; }
-              NSMutableString* l = [NSMutableString string];
-              for (uint32_t s = 0; s < SEL_N; s++) {
-                  uint64_t so[SCO] = {0}; size_t sc = 0; uint8_t sb[64]; size_t szb = 0;
-                  kern_return_t kr = rawv(g_conn[g_best], s, 0, NULL, 0, NULL, 0, so, &sc, sb, &szb);
-                  if (s == 9) g_s9res[g_best] = kr;
-                  plog(@"PING s%u -> %@ sc=%zu szb=%zu so0=%llu %@", s, kr_name(kr), sc, szb, (unsigned long long)so[0], hexn(sb, szb, 32));
-                  if (kr == KERN_SUCCESS) {
-                      [l appendFormat:@"%u:OK ", s];
-                      note_ok(s, 0, 0, 0, 0);
-                      ulog(@"PING s%u OK", s);
-                  } else if (kr != 0xe00002c2) {
-                      [l appendFormat:@"%u:%@ ", s, kr_name(kr)];
-                      ulog(@"PING s%u -> %@", s, kr_name(kr));
-                      mark_live(s);
+          static void s9_scalars(void) {
+              if (g_best < 0) { ulog(@"s9s no conn"); return; }
+              for (uint32_t sic = 1; sic <= 16; sic++) {
+                  uint64_t so[SCO] = {0}; size_t sc = 0; uint8_t sb[BIGOUT]; size_t szb = BIGOUT;
+                  memset(sb, AAM, sizeof(sb));
+                  uint64_t sin[SCO] = {0};
+                  for (uint32_t k = 0; k < SCO; k++) sin[k] = SV[k % SV_N];
+                  kern_return_t kr = rawv(g_conn[g_best], 9, 0, sin, sic, NULL, 0, so, &sc, sb, &szb);
+                  __sync_fetch_and_add(&g_done, 1);
+                  plog(@"S9N n%u -> %@ sc=%zu szb=%zu so0=%llu %@", sic, kr_name(kr), sc, szb, (unsigned long long)so[0], hexn(sb, sizeof(sb), BIGOUT));
+                  if (kr != g_9prev) {
+                      plog(@"FLIP9N n%u -> %@ (was %@)", sic, kr_name(kr), kr_name(g_9prev));
+                      ulog(@"### FLIP9N n%u -> %@", sic, kr_name(kr));
+                      g_9prev = kr;
+                      __sync_fetch_and_add(&g_s9new, 1);
+                      if (kr == KERN_SUCCESS) { __sync_fetch_and_add(&g_ok9, 1); note_ok(9, 0, sic, 0, 0); }
                   }
+                  if (kr != 0xe00002c2 && kr != 0xe00002bc) ulog(@"!! S9N n%u -> %@", sic, kr_name(kr));
                   usleep(200);
               }
-              plog(@"PING m0 %@", l);
-              ulog(@"PING m0 %@", l);
+              ulog(@"s9-scalars done new=%d", g_s9new);
           }
 
-          static void s9_payload(void) {
-              int n = 0;
-              for (int ci = 0; ci < g_nconn; ci++) {
-                  if (g_s9res[ci] == UNTRIED) continue;
-                  if (g_s9res[ci] == 0xe00002c2) continue;
-                  n++;
-                  for (uint32_t sic = 0; sic <= 4; sic++) {
-                      for (int z = 0; z < 10; z++) {
-                          size_t zis = ZS[z];
-                          if (sic == 0 && zis == 0) continue;
-                          uint8_t* in = calloc(1, FIXED);
-                          uint64_t sin[SCO] = {0};
-                          if (!in) continue;
-                          desc_into(in, zis);
-                          for (uint32_t k = 0; k < sic && k < SCO; k++) sin[k] = MAG[k % MAG_N];
-                          uint64_t so[SCO] = {0}; size_t sc = 0;
-                          uint8_t sb[FIXED]; size_t szb = 0;
-                          int mode = zis ? 1 : 0;
-                          kern_return_t kr = rawv(g_conn[ci], 9, mode, sin, sic, in, zis, so, &sc, sb, &szb);
-                          __sync_fetch_and_add(&g_done, 1);
-                          plog(@"P9 n%d m%d sc_=%u zi=%zu -> %@ sc=%zu szb=%zu so0=%llu %@",
-                               g_node[ci], mode, sic, zis, kr_name(kr), sc, szb, (unsigned long long)so[0], hexn(sb, szb, 64));
-                          if (kr == KERN_SUCCESS) {
-                              ulog(@"!!! P9 n%d sc_=%u zi=%zu OK so0=%llu", g_node[ci], sic, zis, (unsigned long long)so[0]);
-                              __sync_fetch_and_add(&g_hits, 1);
-                              note_ok(9, (uint32_t)mode, sic, zis, 0);
-                          } else if (kr != 0xe00002c2) {
-                              ulog(@"!! P9 n%d sc_=%u zi=%zu -> %@", g_node[ci], sic, zis, kr_name(kr));
-                              mark_live(9);
-                          }
-                          free(in);
-                          usleep(250);
-                      }
+          static void s9_struct(void) {
+              if (g_best < 0) { ulog(@"s9t no conn"); return; }
+              static const uint32_t SIC[] = { 1, 2, 3 };
+              for (int i = 0; i < 3; i++) {
+                  for (int z = 0; z < NSZ; z++) {
+                      sc1(g_best, 9, SIC[i], 1, ZS[z], "t9");
                   }
               }
-              ulog(@"p9 done conns=%d", n);
+              ulog(@"s9-struct done");
           }
 
-          static void sweep_mode(int mode, const char* tag) {
-              if (g_best < 0) { ulog(@"sweep no conn"); return; }
-              NSMutableString* l = [NSMutableString string];
+          static size_t jpeg_build(uint8_t* b, size_t cap, int trunc) {
+              size_t n = 0;
+              #define EM(x) do { if (n < cap) b[n++] = (uint8_t)(x); } while (0)
+              EM(0xFF); EM(0xD8);
+              EM(0xFF); EM(0xE0); EM(0x00); EM(0x10);
+              EM('J'); EM('F'); EM('I'); EM('F'); EM(0x00);
+              EM(0x01); EM(0x01); EM(0x00); EM(0x00); EM(0x01); EM(0x00); EM(0x01); EM(0x00); EM(0x00);
+              EM(0xFF); EM(0xDB); EM(0x00); EM(0x43); EM(0x00);
+              for (int i = 0; i < 64; i++) EM(1);
+              EM(0xFF); EM(0xC0); EM(0x00); EM(0x11); EM(0x08);
+              EM(0x00); EM(0x10); EM(0x00); EM(0x10);
+              EM(0x01); EM(0x01); EM(0x11); EM(0x00);
+              EM(0xFF); EM(0xC4); EM(0x00); EM(0x14); EM(0x00);
+              EM(0x01);
+              for (int i = 0; i < 15; i++) EM(0x00);
+              EM(0x00);
+              EM(0xFF); EM(0xDA); EM(0x00); EM(0x08); EM(0x01); EM(0x01); EM(0x00); EM(0x00); EM(0x3F); EM(0x00);
+              for (int i = 0; i < 256; i++) EM((uint8_t)(i & 0x7f));
+              #undef EM
+              if (trunc > 0 && n > (size_t)trunc) n -= trunc;
+              if (trunc == 0) { if (n + 1 < cap) { b[n++] = 0xFF; b[n++] = 0xD9; } }
+              return n;
+          }
+
+          static uint8_t* g_blob = NULL;
+          static size_t g_blobfull = 0;
+
+          static void jpeg_build_step(void) {
+              g_blob = calloc(1, BLOB);
+              if (!g_blob) { ulog(@"blob nomem"); return; }
+              g_blobfull = jpeg_build(g_blob, BLOB, 0);
+              plog(@"BLOB full=%zu body=%zu", g_blobfull, g_blobfull - 2);
+              ulog(@"BLOB full=%zu", g_blobfull);
+          }
+
+          static void jpeg_feed(void) {
+              if (!g_blob || g_blobfull < 4) { ulog(@"no blob"); return; }
+              size_t body = g_blobfull - 2;
+              size_t SZ[9];
+              SZ[0] = body;
+              SZ[1] = body - 1;
+              SZ[2] = body - 2;
+              SZ[3] = body - 8;
+              SZ[4] = body - 16;
+              SZ[5] = body - 64;
+              SZ[6] = g_blobfull;
+              SZ[7] = 4096;
+              SZ[8] = 65536;
               for (uint32_t s = 0; s < SEL_N; s++) {
-                  uint64_t so[SCO] = {0}; size_t sc = 0; uint8_t sb[256]; size_t szb = 0;
-                  kern_return_t h = hb();
-                  kern_return_t kr = rawv(g_conn[g_best], s, mode, NULL, 0, NULL, 0, so, &sc, sb, &szb);
-                  __sync_fetch_and_add(&g_done, 1);
-                  plog(@"SW%s s%u hb=%@ -> %@ sc=%zu szb=%zu so0=%llu %@", tag, s, kr_name(h), kr_name(kr), sc, szb, (unsigned long long)so[0], hexn(sb, szb, 64));
-                  if (kr == KERN_SUCCESS) {
-                      [l appendFormat:@"%u:OK ", s];
-                      ulog(@"!!! SW%s s%u OK so0=%llu", tag, s, (unsigned long long)so[0]);
-                      __sync_fetch_and_add(&g_hits, 1);
-                      __sync_fetch_and_add(&g_m1hit, 1);
-                      note_ok(s, (uint32_t)mode, 0, 0, 0);
-                  } else if (kr != 0xe00002c2) {
-                      [l appendFormat:@"%u:%@ ", s, kr_name(kr)];
-                      ulog(@"!! SW%s s%u -> %@", tag, s, kr_name(kr));
-                      __sync_fetch_and_add(&g_m1hit, 1);
-                      mark_live(s);
-                      if (!g_hit_s[s]) { g_hit_s[s] = 1; g_bmode[s] = (uint32_t)mode; }
-                  }
-                  usleep(250);
-              }
-              plog(@"SW%s %@", tag, l);
-              ulog(@"SW%s done m1hit=%d", tag, g_m1hit);
-          }
-
-          static void out_struct(void) {
-              if (g_best < 0) return;
-              static const uint32_t SEL3[3] = { 4, 5, 9 };
-              static const size_t ZO[2] = { 128, 4096 };
-              for (int d = 0; d < 3; d++) {
-                  for (int o = 0; o < 2; o++) {
-                      for (int zi = 0; zi < 2; zi++) {
-                          size_t zis = zi ? 4096 : 0;
-                          uint8_t* in = calloc(1, FIXED);
+                  if (!g_live[s]) continue;
+                  for (int i = 0; i < 9; i++) {
+                      for (uint32_t sic = 0; sic <= 3; sic++) {
+                          size_t zis = SZ[i];
+                          if (zis > BLOB) zis = BLOB;
+                          uint8_t* in = calloc(1, zis);
                           uint64_t sin[SCO] = {0};
                           if (!in) continue;
-                          desc_into(in, zis);
+                          memcpy(in, g_blob, zis < g_blobfull ? zis : g_blobfull);
+                          if (zis > g_blobfull) memset(in + g_blobfull, 0x41, zis - g_blobfull);
+                          for (uint32_t k = 0; k < sic && k < SCO; k++) sin[k] = (k == 0) ? (uint64_t)zis : SV[k % SV_N];
                           uint64_t so[SCO] = {0}; size_t sc = 0;
-                          uint8_t sb[FIXED]; size_t szb = 0;
-                          kern_return_t h = hb();
-                          kern_return_t kr = rawv(g_conn[g_best], SEL3[d], 1, sin, 0, in, zis, so, &sc, sb, &szb);
+                          uint8_t sb[BIGOUT]; size_t szb = BIGOUT;
+                          memset(sb, AAM, sizeof(sb));
+                          kern_return_t kr = rawx(g_conn[g_best], s, 1, sin, sic, in, zis, so, &sc, sb, &szb);
+                          __sync_fetch_and_add(&g_jfeed, 1);
                           __sync_fetch_and_add(&g_done, 1);
-                          plog(@"OS s%u m1 zi=%zu zo=%zu hb=%@ -> %@ sc=%zu szb=%zu so0=%llu %@",
-                               SEL3[d], zis, ZO[o], kr_name(h), kr_name(kr), sc, szb,
-                               (unsigned long long)so[0], hexn(sb, szb, 96));
+                          int un = 0;
+                          for (size_t q = 0; q < sizeof(sb); q++) if (sb[q] == AAM) un++;
+                          plog(@"JF s%u i%d zi=%zu sc_=%u -> %@ sc=%zu szb=%zu un=%d so0=%llu %@",
+                               s, i, zis, sic, kr_name(kr), sc, szb, un, (unsigned long long)so[0], hexn(sb, sizeof(sb), BIGOUT));
                           if (kr == KERN_SUCCESS) {
-                              ulog(@"!!! OS s%u m1 zi=%zu zo=%zu OK", SEL3[d], zis, ZO[o]);
+                              ulog(@"!!! JF s%u i%d zi=%zu sc_=%u OK", s, i, zis, sic);
                               __sync_fetch_and_add(&g_hits, 1);
-                              note_ok(SEL3[d], 1, 0, zis, ZO[o]);
-                              if (SEL3[d] == 4 && !g_w4) {
-                                  g_w4 = 1; g_w4_sic = 0; g_w4_zis = zis; g_w4_zos = ZO[o];
-                                  memcpy(g_w4_pay, in, zis > FIXED ? FIXED : zis);
-                              }
+                              note_ok(s, 1, sic, zis, BIGOUT);
                           } else if (kr != 0xe00002c2 && kr != 0xe00002bc) {
-                              ulog(@"!! OS s%u m1 zi=%zu zo=%zu -> %@", SEL3[d], zis, ZO[o], kr_name(kr));
-                              mark_live(SEL3[d]);
+                              ulog(@"!! JF s%u i%d zi=%zu -> %@", s, i, zis, kr_name(kr));
+                          }
+                          if (szb > BIGOUT) {
+                              __sync_fetch_and_add(&g_oobw, 1);
+                              plog(@"OOBW jf s%u zi=%zu driver=%zu", s, zis, szb);
                           }
                           free(in);
-                          usleep(300);
+                          usleep(150);
                       }
                   }
               }
-          }
-
-          static void seq_test(void) {
-              if (g_best < 0) { ulog(@"seq no conn"); return; }
-              static const uint32_t T[3] = { 4, 5, 9 };
-              uint64_t so[SCO] = {0}; size_t sc = 0; uint8_t sb[64]; size_t szb = 0;
-              kern_return_t k0 = rawv(g_conn[g_best], 0, 0, NULL, 0, NULL, 0, so, &sc, sb, &szb);
-              plog(@"SEQ s0 -> %@", kr_name(k0));
-              ulog(@"SEQ s0 -> %@", kr_name(k0));
-              for (int i = 0; i < 3; i++) {
-                  for (int m = 0; m <= 1; m++) {
-                      uint64_t o[SCO] = {0}; size_t c = 0; uint8_t b[128]; size_t z = 0;
-                      kern_return_t kr = rawv(g_conn[g_best], T[i], m, NULL, 0, NULL, 0, o, &c, b, &z);
-                      plog(@"SEQ s%u m%d -> %@", T[i], m, kr_name(kr));
-                      ulog(@"SEQ s%u m%d -> %@", T[i], m, kr_name(kr));
-                  }
-              }
-              uint64_t o2[SCO] = {0}; size_t c2 = 0; uint8_t b2[64]; size_t z2 = 0;
-              kern_return_t k2 = rawv(g_conn[g_best], 2, 0, NULL, 0, NULL, 0, o2, &c2, b2, &z2);
-              plog(@"SEQ s2 -> %@", kr_name(k2));
-              ulog(@"SEQ s2 -> %@", kr_name(k2));
-              for (int i = 0; i < 3; i++) {
-                  uint64_t o[SCO] = {0}; size_t c = 0; uint8_t b[128]; size_t z = 0;
-                  kern_return_t kr = rawv(g_conn[g_best], T[i], 0, NULL, 0, NULL, 0, o, &c, b, &z);
-                  plog(@"SEQ2 s%u -> %@", T[i], kr_name(kr));
-                  ulog(@"SEQ2 s%u -> %@", T[i], kr_name(kr));
-              }
-          }
-
-          static kern_return_t zprobe(int ci, uint32_t sel, size_t zis, int passPtr, size_t* out_szb, int* uncopied) {
-              uint8_t* in = calloc(1, zis ? zis : 1);
-              uint64_t sin[SCO] = {0};
-              if (!in) return (kern_return_t)0xe00002bd;
-              memset(in, PAT, zis);
-              desc_into(in, zis);
-              for (uint32_t k = 0; k < SCO; k++) sin[k] = MAG[k % MAG_N];
-              uint64_t so[SCO] = {0}; size_t sc = 0;
-              uint8_t sb[BIGOUT]; size_t szb = BIGOUT;
-              memset(sb, AAM, sizeof(sb));
-              int mode = zis ? 1 : 0;
-              kern_return_t kr = rawx(g_conn[ci], sel, mode, sin, 0, in, zis, passPtr, so, &sc, sb, &szb);
-              __sync_fetch_and_add(&g_probes, 1);
-              int un = 0;
-              for (size_t i = 0; i < sizeof(sb); i++) if (sb[i] == AAM) un++;
-              if (out_szb) *out_szb = szb;
-              if (uncopied) *uncopied = un;
-              plog(@"CL n%d s%u zi=%zu pp=%d -> %@ sc=%zu szb=%zu un=%d so0=%llu %@",
-                   g_node[ci], sel, zis, passPtr, kr_name(kr), sc, szb, un,
-                   (unsigned long long)so[0], hexn(sb, sizeof(sb), BIGOUT));
-              if (kr == KERN_SUCCESS) {
-                  __sync_fetch_and_add(&g_hits, 1);
-                  note_ok(sel, (uint32_t)mode, 0, zis, BIGOUT);
-                  ulog(@"!!! CL n%d s%u zi=%zu OK so0=%llu", g_node[ci], sel, zis, (unsigned long long)so[0]);
-              }
-              free(in);
-              usleep(200);
-              return kr;
+              ulog(@"jpeg-feed done n=%d oobw=%d", g_jfeed, g_oobw);
           }
 
           static void cliff_one(int ci, uint32_t sel) {
-              if (g_probes > 520) return;
+              if (g_probes > 480) return;
+              uint32_t sic = 1;
               size_t lastbad = 0;
               BOOL havebad = NO;
               size_t firstok = 0;
               for (int z = 0; z < NSZ; z++) {
                   size_t zis = ZS[z];
-                  size_t szb = 0; int un = 0;
-                  kern_return_t kr = zprobe(ci, sel, zis, 1, &szb, &un);
+                  uint64_t so[SCO] = {0}; size_t sc = 0; uint8_t sb[BIGOUT]; size_t szb = BIGOUT;
+                  memset(sb, AAM, sizeof(sb));
+                  uint64_t sin[SCO] = {0};
+                  for (uint32_t k = 0; k < SCO; k++) sin[k] = SV[k % SV_N];
+                  uint8_t* in = calloc(1, zis ? zis : 1);
+                  if (!in) continue;
+                  memset(in, PAT, zis);
+                  desc_into(in, zis);
+                  int mode = zis ? 1 : 0;
+                  kern_return_t kr = rawx(g_conn[ci], sel, mode, sin, sic, in, zis, so, &sc, sb, &szb);
+                  __sync_fetch_and_add(&g_probes, 1);
+                  int un = 0;
+                  for (size_t q = 0; q < sizeof(sb); q++) if (sb[q] == AAM) un++;
+                  plog(@"CLP s%u zi=%zu -> %@ sc=%zu szb=%zu un=%d so0=%llu %@", sel, zis, kr_name(kr), sc, szb, un, (unsigned long long)so[0], hexn(sb, sizeof(sb), BIGOUT));
+                  free(in);
                   if (kr == 0xe00002c2) { lastbad = zis; havebad = YES; continue; }
                   if (havebad && firstok == 0 && zis > 0) {
                       firstok = zis;
@@ -908,25 +906,37 @@ jobs:
                       plog(@"OOBW s%u zi=%zu offered=%d driver_szb=%zu", sel, zis, BIGOUT, szb);
                       ulog(@"### OOBW s%u @ %zu szb=%zu", sel, zis, szb);
                   }
+                  usleep(150);
               }
               if (!havebad || firstok == 0) return;
               size_t lo = lastbad, hi = firstok;
-              while (hi - lo > 1 && g_probes <= 560) {
+              while (hi - lo > 1 && g_probes <= 520) {
                   size_t mid = lo + (hi - lo) / 2;
-                  size_t szb = 0; int un = 0;
-                  kern_return_t kr = zprobe(ci, sel, mid, 1, &szb, &un);
+                  uint8_t* in = calloc(1, mid);
+                  if (!in) break;
+                  memset(in, PAT, mid);
+                  desc_into(in, mid);
+                  uint64_t sin[SCO] = {0};
+                  for (uint32_t k = 0; k < SCO; k++) sin[k] = SV[k % SV_N];
+                  uint64_t so[SCO] = {0}; size_t sc = 0; uint8_t sb[BIGOUT]; size_t szb = BIGOUT;
+                  memset(sb, AAM, sizeof(sb));
+                  kern_return_t kr = rawx(g_conn[ci], sel, 1, sin, 1, in, mid, so, &sc, sb, &szb);
+                  __sync_fetch_and_add(&g_probes, 1);
+                  plog(@"CLB s%u zi=%zu -> %@", sel, mid, kr_name(kr));
+                  free(in);
                   if (kr == 0xe00002c2) lo = mid; else hi = mid;
+                  usleep(150);
               }
               g_cliff[sel] = hi;
               plog(@"CLIFFX s%u exact=%zu (bad<=%zu)", sel, hi, lo);
               ulog(@"### CLIFFX s%u exact=%zu bad<=%zu", sel, hi, lo);
           }
 
-          static void cliff_map(void) {
+          static void cliff_pad(void) {
               if (g_best < 0) { ulog(@"cliff no conn"); return; }
               if (!g_nlive) { ulog(@"cliff no live sel"); return; }
               int done = 0;
-              for (uint32_t s = 0; s < SEL_N && done < 8; s++) {
+              for (uint32_t s = 0; s < SEL_N && done < 10; s++) {
                   if (!g_live[s]) continue;
                   done++;
                   ulog(@"cliff s%u start", s);
@@ -936,68 +946,45 @@ jobs:
               ulog(@"CLIFFMAP live=%d probed=%d cliffs=%d oobw=%d nocopy=%d", g_nlive, g_probes, g_cliffs, g_oobw, g_nocopy);
           }
 
-          static void oob_write(void) {
+          static void oob_pad(void) {
               if (g_best < 0) { ulog(@"oob no conn"); return; }
               for (uint32_t s = 0; s < SEL_N; s++) {
                   if (!g_live[s]) continue;
                   size_t base = g_cliff[s] ? g_cliff[s] : 4096;
-                  static const size_t OFF[4] = { 0, 1, 8, 64 };
-                  for (int o = 0; o < 4; o++) {
-                      size_t zis = base + OFF[o];
-                      size_t szb = 0; int un = 0;
-                      kern_return_t kr = zprobe(g_best, s, zis, 1, &szb, &un);
-                      if (kr != 0xe00002c2 && kr != KERN_SUCCESS) {
-                          ulog(@"!! OOB s%u zi=%zu -> %@ szb=%zu", s, zis, kr_name(kr), szb);
+                  static const size_t OFF[5] = { 0, 1, 8, 64, 256 };
+                  for (int o = 0; o < 5; o++) {
+                      for (uint32_t sic = 0; sic <= 2; sic++) {
+                          sc1(g_best, s, sic, 1, base + OFF[o], "oob");
                       }
                   }
               }
               ulog(@"oob done");
           }
 
-          static void scalar_16(void) {
-              if (g_best < 0) { ulog(@"sc16 no conn"); return; }
-              for (uint32_t s = 0; s < SEL_N; s++) {
-                  if (!g_live[s]) continue;
-                  uint64_t sin[SCO];
-                  for (uint32_t k = 0; k < SCO; k++) sin[k] = MAG[k % MAG_N];
-                  for (uint32_t sic = 6; sic <= 16; sic += 5) {
-                      uint64_t so[SCO] = {0}; size_t sc = 0; uint8_t sb[BIGOUT]; size_t szb = BIGOUT;
-                      memset(sb, AAM, sizeof(sb));
-                      kern_return_t kr = rawv(g_conn[g_best], s, 0, sin, sic, NULL, 0, so, &sc, sb, &szb);
-                      plog(@"SC16 s%u n%u -> %@ sc=%zu szb=%zu so0=%llu %@", s, sic, kr_name(kr), sc, szb, (unsigned long long)so[0], hexn(sb, sizeof(sb), BIGOUT));
-                      if (kr == KERN_SUCCESS) {
-                          ulog(@"!!! SC16 s%u n%u OK so0=%llu", s, sic, (unsigned long long)so[0]);
-                          note_ok(s, 0, sic, 0, 0);
-                      } else if (kr != 0xe00002c2) {
-                          ulog(@"!! SC16 s%u n%u -> %@", s, sic, kr_name(kr));
-                      }
-                      usleep(200);
-                  }
+          static void seq_test(void) {
+              if (g_best < 0) { ulog(@"seq no conn"); return; }
+              uint64_t so[SCO] = {0}; size_t sc = 0; uint8_t sb[64]; size_t szb = 0;
+              kern_return_t k0 = rawv(g_conn[g_best], 0, 0, NULL, 0, NULL, 0, so, &sc, sb, &szb);
+              plog(@"SEQ s0 -> %@", kr_name(k0));
+              ulog(@"SEQ s0 -> %@", kr_name(k0));
+              for (int rep = 0; rep < 6; rep++) {
+                  uint64_t o[SCO] = {0}; size_t c = 0; uint8_t b[128]; size_t z = 0;
+                  kern_return_t kr = rawv(g_conn[g_best], 0, 0, NULL, 0, NULL, 0, o, &c, b, &z);
+                  plog(@"SEQ2 s0 r%d -> %@", rep, kr_name(kr));
+                  ulog(@"SEQ2 s0 r%d -> %@", rep, kr_name(kr));
+                  usleep(300);
               }
-              ulog(@"sc16 done");
-          }
-
-          static void null_mix(void) {
-              if (g_best < 0) { ulog(@"nm no conn"); return; }
-              for (uint32_t s = 0; s < SEL_N; s++) {
-                  if (!g_live[s]) continue;
-                  size_t szb = 0; int un = 0;
-                  kern_return_t a = zprobe(g_best, s, 4096, 0, &szb, &un);
-                  plog(@"NM s%u null+4096 -> %@ szb=%zu", s, kr_name(a), szb);
-                  if (a == KERN_SUCCESS) ulog(@"!!! NM s%u null+4096 OK", s);
-                  else if (a != 0xe00002c2) ulog(@"!! NM s%u null+4096 -> %@", s, kr_name(a));
-                  uint8_t* in = calloc(1, 64);
-                  uint64_t sin[SCO] = {0};
-                  uint64_t so[SCO] = {0}; size_t sc = 0; uint8_t sb[BIGOUT]; size_t z2 = BIGOUT;
-                  memset(sb, AAM, sizeof(sb));
-                  kern_return_t b = rawx(g_conn[g_best], s, 1, sin, 0, in, 0, 1, so, &sc, sb, &z2);
-                  plog(@"NM s%u ptr+0 -> %@ szb=%zu", s, kr_name(b), z2);
-                  if (b == KERN_SUCCESS) ulog(@"!!! NM s%u ptr+0 OK", s);
-                  else if (b != 0xe00002c2) ulog(@"!! NM s%u ptr+0 -> %@", s, kr_name(b));
-                  free(in);
-                  usleep(200);
+              uint64_t o2[SCO] = {0}; size_t c2 = 0; uint8_t b2[64]; size_t z2 = 0;
+              kern_return_t k2 = rawv(g_conn[g_best], 2, 0, NULL, 0, NULL, 0, o2, &c2, b2, &z2);
+              plog(@"SEQ s2 -> %@", kr_name(k2));
+              ulog(@"SEQ s2 -> %@", kr_name(k2));
+              for (int rep = 0; rep < 4; rep++) {
+                  uint64_t o[SCO] = {0}; size_t c = 0; uint8_t b[128]; size_t z = 0;
+                  kern_return_t kr = rawv(g_conn[g_best], 0, 0, NULL, 0, NULL, 0, o, &c, b, &z);
+                  plog(@"SEQ3 s0 r%d -> %@", rep, kr_name(kr));
+                  ulog(@"SEQ3 s0 r%d -> %@", rep, kr_name(kr));
+                  usleep(300);
               }
-              ulog(@"nm done");
           }
 
           static void combo_m1(void) {
@@ -1036,6 +1023,23 @@ jobs:
               free(in);
           }
 
+          static void null_mix(void) {
+              if (g_best < 0) { ulog(@"nm no conn"); return; }
+              for (uint32_t s = 0; s < SEL_N; s++) {
+                  if (!g_live[s]) continue;
+                  ulog(@"nm s%u start", s);
+                  uint64_t sin[SCO] = {0};
+                  uint64_t so[SCO] = {0}; size_t sc = 0;
+                  uint8_t sb[BIGOUT]; size_t z2 = BIGOUT;
+                  memset(sb, AAM, sizeof(sb));
+                  kern_return_t b = rawx(g_conn[g_best], s, 1, sin, 1, NULL, 4096, so, &sc, sb, &z2);
+                  plog(@"NM s%u null+4096 -> %@ szb=%zu", s, kr_name(b), z2);
+                  ulog(@"NM s%u null+4096 -> %@", s, kr_name(b));
+                  usleep(200);
+              }
+              ulog(@"nm done");
+          }
+
           static void summary(void) {
               NSString* st = [NSString stringWithContentsOfFile:doc_file("state.txt") encoding:NSUTF8StringEncoding error:nil];
               if (!st) { ulog(@"no state"); return; }
@@ -1046,24 +1050,23 @@ jobs:
                   if (!ln.length) continue;
                   lines++;
                   if ([ln hasPrefix:@"WIN4 "]) { wins++; [keep addObject:ln]; continue; }
-                  if ([ln hasPrefix:@"FLIP9 "] || [ln hasPrefix:@"FLIP5 "]) { flips++; [keep addObject:ln]; continue; }
+                  if ([ln hasPrefix:@"FLIP9"]) { flips++; [keep addObject:ln]; continue; }
                   if ([ln hasPrefix:@"CLIFF"]) { cliffs++; [keep addObject:ln]; continue; }
                   if ([ln hasPrefix:@"OOBW "]) { oobw++; [keep addObject:ln]; continue; }
                   if ([ln hasPrefix:@"NOCOPY "]) { nocopy++; [keep addObject:ln]; continue; }
                   if ([ln hasPrefix:@"SIGNAL "]) { sigs++; [keep addObject:ln]; continue; }
-                  if ([ln hasPrefix:@"rootopen"] || [ln hasPrefix:@"ADDCLIENT"] || [ln hasPrefix:@"SVC "] ||
+                  if ([ln hasPrefix:@"rootopen"] || [ln hasPrefix:@"CHILDOPEN"] || [ln hasPrefix:@"SVC "] ||
                       [ln hasPrefix:@"PARENT"] || [ln hasPrefix:@"SIB "] || [ln hasPrefix:@"JCLS "] ||
-                      [ln hasPrefix:@"PROPS"] || [ln hasPrefix:@"NODE "] || [ln hasPrefix:@"CHILDOPEN"] ||
-                      [ln hasPrefix:@"CSWEEP"] || [ln hasPrefix:@"SEQ"] || [ln hasPrefix:@"DEV "] ||
-                      [ln hasPrefix:@"csops"] || [ln hasPrefix:@"surf="] || [ln hasPrefix:@"svc="] ||
-                      [ln hasPrefix:@"CLIFFMAP"]) {
+                      [ln hasPrefix:@"PROPS"] || [ln hasPrefix:@"NODE "] || [ln hasPrefix:@"BLOB"] ||
+                      [ln hasPrefix:@"SEQ"] || [ln hasPrefix:@"DEV "] || [ln hasPrefix:@"csops"] ||
+                      [ln hasPrefix:@"surf="] || [ln hasPrefix:@"svc="] || [ln hasPrefix:@"CLIFFMAP"]) {
                       if ([ln rangeOfString:@"OK"].location != NSNotFound) opens++;
                       [keep addObject:ln];
                       continue;
                   }
-                  BOOL isCall = [ln hasPrefix:@"S4 "] || [ln hasPrefix:@"PING "] || [ln hasPrefix:@"SW1 "] ||
-                                [ln hasPrefix:@"SW2 "] || [ln hasPrefix:@"OS "] || [ln hasPrefix:@"CS "] ||
-                                [ln hasPrefix:@"P9 "] || [ln hasPrefix:@"SC16 "] || [ln hasPrefix:@"NM "];
+                  BOOL isCall = [ln hasPrefix:@"SP "] || [ln hasPrefix:@"S9N "] || [ln hasPrefix:@"JF "] ||
+                                [ln hasPrefix:@"CLP "] || [ln hasPrefix:@"CLB "] || [ln hasPrefix:@"S4 "] ||
+                                [ln hasPrefix:@"NM "] || [ln hasPrefix:@"P9 "];
                   if (!isCall) continue;
                   calls++;
                   NSRange ar = [ln rangeOfString:@" -> "];
@@ -1084,7 +1087,7 @@ jobs:
               plog(@"HIST %@", h);
               ulog(@"REPLAY calls=%d bad=%d nonbad=%lu wins=%d flips=%d cliffs=%d oobw=%d nocopy=%d", calls, bad, (unsigned long)(calls - bad), wins, flips, cliffs, oobw, nocopy);
               ulog(@"HIST %@", h);
-              NSUInteger cap = keep.count > 220 ? 220 : keep.count;
+              NSUInteger cap = keep.count > 240 ? 240 : keep.count;
               for (NSUInteger i = 0; i < cap; i++) { plog(@"KEEP %@", keep[i]); ulog(@"%@", keep[i]); }
               if (keep.count > cap) ulog(@"... +%lu more", (unsigned long)(keep.count - cap));
           }
@@ -1100,15 +1103,10 @@ jobs:
                   NSString* rest = [ln substringFromIndex:ar.location + 4];
                   NSString* cls = [[rest componentsSeparatedByString:@" "] firstObject];
                   if (!cls.length) continue;
-                  NSRange hr = [pre rangeOfString:@" hb="];
-                  if (hr.location != NSNotFound) pre = [pre substringToIndex:hr.location];
                   NSArray* t = [pre componentsSeparatedByString:@" "];
                   if (!t.count) continue;
                   NSString* key = [t lastObject];
                   if (!key.length) continue;
-                  if ([pre hasPrefix:@"CS "] || [pre hasPrefix:@"P9 "] || [pre hasPrefix:@"CL "]) {
-                      if (t.count >= 3) key = [NSString stringWithFormat:@"%@ %@", t[t.count-2], key];
-                  }
                   NSString* k2 = [NSString stringWithFormat:@"%@:%@", key, cls];
                   NSNumber* c = sel[k2];
                   sel[k2] = @(c.intValue + 1);
@@ -1133,22 +1131,21 @@ jobs:
                   case 8: vt_start(); break;
                   case 9: ulog(@"vt=%d", (int)vt_encode()); break;
                   case 10: root_open(); break;
-                  case 11: addclient(); break;
-                  case 12: child_open(); break;
-                  case 13: child_sweep(); break;
-                  case 14: ping_sweep(); break;
-                  case 15: s9_payload(); break;
-                  case 16: sweep_mode(1, "1"); break;
-                  case 17: out_struct(); break;
-                  case 18: seq_test(); break;
-                  case 19: cliff_map(); break;
-                  case 20: oob_write(); break;
-                  case 21: scalar_16(); break;
-                  case 22: null_mix(); break;
-                  case 23: combo_m1(); break;
-                  case 24: confirm_all(); break;
-                  case 25: summary(); break;
-                  case 26: verdict(); break;
+                  case 11: child_open(); break;
+                  case 12: scpad_best(); break;
+                  case 13: scpad_child(); break;
+                  case 14: s9_scalars(); break;
+                  case 15: s9_struct(); break;
+                  case 16: jpeg_build_step(); break;
+                  case 17: jpeg_feed(); break;
+                  case 18: cliff_pad(); break;
+                  case 19: oob_pad(); break;
+                  case 20: seq_test(); break;
+                  case 21: combo_m1(); break;
+                  case 22: confirm_all(); break;
+                  case 23: summary(); break;
+                  case 24: verdict(); break;
+                  case 25: null_mix(); break;
               }
           }
 
@@ -1200,7 +1197,7 @@ jobs:
                   g_try++; save_try();
                   ulog(@"CHAIN %d %s", g_step, STEP_NAME[g_step]);
                   do_step(g_step);
-                  plog(@"STEP %d OK calls=%d hits=%d ok4=%d flip9=%d cliffs=%d oobw=%d", g_step, g_done, g_hits, g_ok4, g_9flip, g_cliffs, g_oobw);
+                  plog(@"STEP %d OK calls=%d hits=%d ok4=%d flip9=%d spad=%d cliffs=%d oobw=%d jf=%d", g_step, g_done, g_hits, g_ok4, g_9flip, g_spad, g_cliffs, g_oobw, g_jfeed);
                   if (g_fd >= 0) fsync(g_fd);
                   ulog(@"STEP %d SURVIVED", g_step);
                   g_step++; save_step(g_step);
@@ -1249,7 +1246,7 @@ jobs:
               [self.w makeKeyAndVisible];
 
               [NSTimer scheduledTimerWithTimeInterval:0.25 repeats:YES block:^(NSTimer*) {
-                  g_hb.text = [NSString stringWithFormat:@"%s step %d/%d c=%d ok4=%d cl=%d oob=%d", BUILD_TAG, g_step, STEP_MAX, g_done, g_ok4, g_cliffs, g_oobw];
+                  g_hb.text = [NSString stringWithFormat:@"%s step %d/%d sp=%d ok4=%d cl=%d oob=%d", BUILD_TAG, g_step, STEP_MAX, g_spad, g_ok4, g_cliffs, g_oobw];
                   flush_ui();
               }];
 
@@ -1319,7 +1316,7 @@ jobs:
         with:
           name: probe-ipa-${{ github.run_number }}
           path: out/probe.ipa
-          if-no-files-found: error
+          if-no-files-found: never
           retention-days: 7
           overwrite: true
           compression-level: 0
