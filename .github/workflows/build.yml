@@ -80,17 +80,20 @@ jobs:
           brew install xcodegen
           xcodegen generate
 
-      - name: archive
+      - name: build
         run: |
-          xcodebuild -project probe.xcodeproj -scheme probe \
-            -sdk iphoneos -destination 'generic/platform=iOS' -configuration Release \
-            -archivePath $PWD/build/probe.xcarchive archive \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+          mkdir -p out/Payload
+          xcodebuild -project probe.xcodeproj -target probe \
+            -sdk iphoneos -configuration Release \
+            -arch arm64e -arch arm64 \
+            CONFIGURATION_BUILD_DIR=$PWD/out/Payload \
+            SUPPORTED_PLATFORMS=iphoneos \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            build
 
       - name: ipa
         run: |
-          mkdir -p out/Payload
-          cp -r build/probe.xcarchive/Products/Applications/*.app out/Payload/
+          ls -la out/Payload
           cd out && zip -r probe.ipa Payload
 
       - uses: actions/upload-artifact@v4
