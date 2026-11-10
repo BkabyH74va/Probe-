@@ -61,9 +61,7 @@ jobs:
 
           typedef struct __SecTask *SecTaskRef;
           extern SecTaskRef SecTaskCreateFromSelf(CFAllocatorRef);
-          extern CFTypeRef SecTaskCopyValueForEntitlement(SecTaskRef, CFStringRef, CFErrorRef *);
           extern int csops(pid_t, unsigned int, void *, size_t);
-
           #define CS_OPS_STATUS 0
 
           static UITextView* g_tv;
@@ -71,148 +69,179 @@ jobs:
           static NSUInteger g_ticks = 0;
           static int g_hits = 0;
           static NSMutableString* g_sum;
-          static io_connect_t g_conn[4];
-          static uint32_t g_ctype[4];
+
+          #define MAXC 16
+          static io_connect_t g_conn[MAXC];
+          static uint32_t g_ctype[MAXC];
           static int g_nconn = 0;
 
-          static const size_t kSizes[] = {
-              8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096
-          };
-          static const int kNSizes = sizeof(kSizes) / sizeof(kSizes[0]);
+          #define MAXL 64
+          static int g_lc[MAXL], g_ls[MAXL];
+          static size_t g_lz[MAXL];
+          static int g_nlive = 0;
+
+          static const size_t kSizes[] = { 8,16,24,32,48,64,96,128,192,256,384,512,768,1024,1536,2048,3072,4096 };
+          static const int kNSizes = sizeof(kSizes)/sizeof(kSizes[0]);
 
           static void add_line(NSString* s) {
               dispatch_async(dispatch_get_main_queue(), ^{
                   g_tv.text = [g_tv.text stringByAppendingFormat:@"\n%@", s];
                   [g_tv scrollRangeToVisible:NSMakeRange(g_tv.text.length, 0)];
-                  NSLog(@"PROBE: %@", s);
               });
           }
-
           static void sum(NSString* s) {
-              dispatch_async(dispatch_get_main_queue(), ^{
-                  [g_sum appendFormat:@"\n%@", s];
-              });
+              dispatch_async(dispatch_get_main_queue(), ^{ [g_sum appendFormat:@"\n%@", s]; });
           }
-
           static void dump_file(void) {
               NSString* p = [NSSearchPathForDirectoriesInDomains(
                   NSDocumentDirectory, NSUserDomainMask, YES).firstObject
                   stringByAppendingPathComponent:@"probe.txt"];
               [g_tv.text writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
           }
-
           static NSString* kr_name(kern_return_t kr) {
               switch (kr) {
                   case KERN_SUCCESS: return @"OK";
-                  case 0xe00002c2:   return @"BadArg";
-                  case 0xe00002c7:   return @"Unsup";
-                  case 0xe00002be:   return @"NoRes";
+                  case 0xe00002bc:   return @"Error";
                   case 0xe00002bd:   return @"NoMem";
+                  case 0xe00002be:   return @"NoRes";
                   case 0xe00002c1:   return @"NotPriv";
+                  case 0xe00002c2:   return @"BadArg";
+                  case 0xe00002c5:   return @"Excl";
+                  case 0xe00002c7:   return @"Unsup";
+                  case 0xe00002cc:   return @"NotOpen";
+                  case 0xe00002cd:   return @"NotReadable";
+                  case 0xe00002ce:   return @"NotWritable";
+                  case 0xe00002d4:   return @"Busy";
                   case 0xe00002e2:   return @"NotPerm";
                   default:           return [NSString stringWithFormat:@"0x%x", kr];
               }
           }
-
           static NSString* hex(const uint8_t* p, size_t n) {
               if (!n) return @"-";
-              if (n > 48) n = 48;
+              if (n > 40) n = 40;
               NSMutableString* s = [NSMutableString string];
               for (size_t i = 0; i < n; i++) [s appendFormat:@"%02x", p[i]];
               return s;
           }
-
           static void check_sig(void) {
               uint32_t f = 0;
               if (csops(getpid(), CS_OPS_STATUS, &f, sizeof(f)) == 0)
-                  sum([NSString stringWithFormat:@"csflags=0x%08x platform=%d",
-                       f, !!(f & 0x04000000)]);
+                  sum([NSString stringWithFormat:@"csflags=0x%08x", f]);
           }
-
           static void vt_out(void* r, void* s, OSStatus st, VTEncodeInfoFlags f, CMSampleBufferRef sb) {}
           static void vt_warm(void) {
               VTCompressionSessionRef v = NULL;
               OSStatus st = VTCompressionSessionCreate(NULL, 1920, 1080, kCMVideoCodecType_H264,
                       NULL, NULL, NULL, vt_out, NULL, &v);
-              sum([NSString stringWithFormat:@"vt create=%d", (int)st]);
-              if (v) { VTCompressionSessionPrepareToEncodeFrames(v); }
+              sum([NSString stringWithFormat:@"vt=%d", (int)st]);
+              if (v) VTCompressionSessionPrepareToEncodeFrames(v);
           }
 
-          static void probe_sel(io_connect_t c, uint32_t type, uint32_t sel) {
-              for (int i = 0; i < kNSizes; i++) {
-                  size_t sz = kSizes[i];
-                  uint8_t* in = calloc(1, sz);
-                  uint8_t out[4096];
-                  size_t outSz = sizeof(out);
-                  memset(out, 0xCC, sizeof(out));
-                  kern_return_t kr = IOConnectCallStructMethod(c, sel, in, sz, out, &outSz);
-                  free(in);
-
-                  if (kr == 0xe00002c7) {
-                      add_line([NSString stringWithFormat:@"t%u s%u sz=%zu -> Unsup (slot dead)", type, sel, sz]);
-                      return;
-                  }
-                  if (kr == 0xe00002c2) continue;
-
-                  g_hits++;
-                  add_line([NSString stringWithFormat:@"!! t%u s%u sz=%zu -> %@ out=%zu %@",
-                            type, sel, sz, kr_name(kr), outSz, hex(out, outSz)]);
-                  for (int r = 0; r < 2; r++) {
-                      uint8_t* in2 = calloc(1, sz);
-                      uint8_t out2[4096]; size_t outSz2 = sizeof(out2);
-                      kern_return_t k2 = IOConnectCallStructMethod(c, sel, in2, sz, out2, &outSz2);
-                      free(in2);
-                      add_line([NSString stringWithFormat:@"   confirm %d -> %@ out=%zu %@",
-                                r, kr_name(k2), outSz2, hex(out2, outSz2)]);
-                      usleep(4000);
-                  }
-                  return;
-              }
-              add_line([NSString stringWithFormat:@"t%u s%u -> all sizes BadArg", type, sel]);
-          }
-
-          static void run_probe(void) {
-              g_sum = [NSMutableString string];
-              add_line(@"[+] struct-method sweep");
-              check_sig();
-
-              vt_warm();
-              usleep(300000);
-
+          static void open_all(void) {
               io_iterator_t it = 0;
               if (IOServiceGetMatchingServices(kIOMainPortDefault,
-                      IOServiceMatching("AppleJPEGDriver"), &it) != KERN_SUCCESS) {
-                  add_line(@"no JPEG driver"); return;
-              }
-              io_service_t s;
-              while ((s = IOIteratorNext(it)) && g_nconn < 4) {
-                  for (int t = 20; t <= 26 && g_nconn < 4; t++) {
+                      IOServiceMatching("AppleJPEGDriver"), &it) != KERN_SUCCESS) return;
+              io_service_t s; int nodes = 0;
+              while ((s = IOIteratorNext(it)) && nodes < 2) {
+                  nodes++;
+                  for (int t = 20; t <= 26 && g_nconn < MAXC; t++) {
                       io_connect_t c = 0;
                       if (IOServiceOpen(s, mach_task_self(), (uint32_t)t, &c) == KERN_SUCCESS) {
                           g_conn[g_nconn] = c;
                           g_ctype[g_nconn] = (uint32_t)t;
                           g_nconn++;
-                          add_line([NSString stringWithFormat:@"open type=%d", t]);
+                          add_line([NSString stringWithFormat:@"open node%d type=%d", nodes, t]);
                       }
                   }
                   IOObjectRelease(s);
               }
               IOObjectRelease(it);
+          }
 
-              if (!g_nconn) { add_line(@"no connections"); dump_file(); return; }
-
+          // faza A: znajdz zywe pary (conn,sel,size)
+          static void discover(void) {
               for (int n = 0; n < g_nconn; n++) {
-                  add_line([NSString stringWithFormat:@"=== sweep conn type=%u ===", g_ctype[n]]);
                   for (uint32_t sel = 0; sel < 48; sel++) {
-                      probe_sel(g_conn[n], g_ctype[n], sel);
-                      usleep(2000);
+                      for (int i = 0; i < kNSizes; i++) {
+                          size_t sz = kSizes[i];
+                          uint8_t* in = calloc(1, sz);
+                          uint8_t out[4096]; size_t oSz = sizeof(out);
+                          memset(out, 0xCC, sizeof(out));
+                          kern_return_t kr = IOConnectCallStructMethod(g_conn[n], sel, in, sz, out, &oSz);
+                          free(in);
+                          if (kr == 0xe00002c7) break;
+                          if (kr == 0xe00002c2) continue;
+                          add_line([NSString stringWithFormat:@"LIVE t%u s%u sz=%zu -> %@ out=%zu %@",
+                                    g_ctype[n], sel, sz, kr_name(kr), oSz, hex(out, oSz)]);
+                          g_hits++;
+                          if (g_nlive < MAXL) {
+                              g_lc[g_nlive] = n; g_ls[g_nlive] = (int)sel;
+                              g_lz[g_nlive] = sz; g_nlive++;
+                          }
+                          break;
+                      }
+                      usleep(1500);
                   }
               }
+          }
+
+          // faza B: wszystkie conny otwarte -> retest
+          static void retest(void) {
+              add_line(@"[*] retest with all clients held");
+              for (int k = 0; k < g_nlive; k++) {
+                  int n = g_lc[k]; uint32_t sel = (uint32_t)g_ls[k]; size_t sz = g_lz[k];
+                  for (int r = 0; r < 2; r++) {
+                      uint8_t* in = calloc(1, sz);
+                      uint8_t out[4096]; size_t oSz = sizeof(out);
+                      memset(out, 0xCC, sizeof(out));
+                      kern_return_t kr = IOConnectCallStructMethod(g_conn[n], sel, in, sz, out, &oSz);
+                      free(in);
+                      add_line([NSString stringWithFormat:@"  R t%u s%u sz=%zu #%d -> %@ out=%zu %@",
+                                g_ctype[n], sel, sz, r, kr_name(kr), oSz, hex(out, oSz)]);
+                      usleep(3000);
+                  }
+              }
+          }
+
+          // faza C: kazdy conn po kolei jako "opener" -> s5 na typie 23
+          static void cross(void) {
+              int data = -1;
+              for (int n = 0; n < g_nconn; n++) if (g_ctype[n] == 23) { data = n; break; }
+              if (data < 0) { add_line(@"no t23 conn"); return; }
+              add_line(@"[*] cross: call s5 on each other client first");
+              for (int n = 0; n < g_nconn; n++) {
+                  if (n == data) continue;
+                  for (uint32_t sel = 0; sel < 12; sel++) {
+                      uint8_t in[64] = {0}; uint8_t out[256]; size_t oSz = sizeof(out);
+                      kern_return_t kr = IOConnectCallStructMethod(g_conn[n], sel, in, 64, out, &oSz);
+                      if (kr == 0xe00002c2 || kr == 0xe00002c7) continue;
+                      add_line([NSString stringWithFormat:@"  pre t%u s%u -> %@", g_ctype[n], sel, kr_name(kr)]);
+                      uint8_t* in2 = calloc(1, 4096); uint8_t out2[4096]; size_t o2 = sizeof(out2);
+                      kern_return_t k2 = IOConnectCallStructMethod(g_conn[data], 5, in2, 4096, out2, &o2);
+                      free(in2);
+                      add_line([NSString stringWithFormat:@"    after -> s5 %@ out=%zu %@", kr_name(k2), o2, hex(out2, o2)]);
+                  }
+              }
+          }
+
+          static void run_probe(void) {
+              g_sum = [NSMutableString string];
+              add_line(@"[+] client-pair probe");
+              check_sig();
+              vt_warm();
+              usleep(300000);
+
+              open_all();
+              add_line([NSString stringWithFormat:@"conns=%d", g_nconn]);
+              if (!g_nconn) { dump_file(); return; }
+
+              discover();
+              retest();
+              cross();
 
               add_line(@"=========== SUMMARY ===========");
-              add_line([NSString stringWithFormat:@"conns=%d hits=%d", g_nconn, g_hits]);
+              add_line([NSString stringWithFormat:@"conns=%d live=%d", g_nconn, g_nlive]);
               add_line(g_sum);
-              add_line(g_hits ? @"[+] STRUCT TABLE REACHED" : @"[-] all struct sizes rejected");
               add_line(@"[*] done");
               dump_file();
           }
