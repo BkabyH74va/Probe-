@@ -7,7 +7,7 @@ permissions:
 
 jobs:
   ipa:
-    runs-on: macos-14
+    runs-on: macos-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -60,7 +60,7 @@ jobs:
           typedef kern_return_t (*fn_addclient)(io_connect_t, io_connect_t);
           static fn_addclient g_addclient = NULL;
 
-          #define BUILD_TAG "v40-direct"
+          #define BUILD_TAG "v41-latest"
           #define MAXC 40
           #define STEP_MAX 27
           #define TRY_MAX 2
@@ -1341,14 +1341,14 @@ jobs:
           <plist version="1.0"><dict>
             <key>CFBundleDevelopmentRegion</key><string>en</string>
             <key>CFBundleExecutable</key><string>probe</string>
-            <key>CFBundleIdentifier</key><string>com.buurza40.probe</string>
+            <key>CFBundleIdentifier</key><string>com.buurza41.probe</string>
             <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
             <key>CFBundleName</key><string>probe</string>
-            <key>CFBundleDisplayName</key><string>buurd40</string>
+            <key>CFBundleDisplayName</key><string>buurd41</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleShortVersionString</key><string>1.0</string>
-            <key>CFBundleVersion</key><string>42</string>
-            <key>MinimumOSVersion</key><string>18.0</string>
+            <key>CFBundleVersion</key><string>43</string>
+            <key>MinimumOSVersion</key><string>17.0</string>
             <key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
             <key>UILaunchScreen</key><dict/>
             <key>UISupportedInterfaceOrientations</key>
@@ -1364,7 +1364,7 @@ jobs:
         run: |
           set +e
           xcrun -sdk iphoneos clang -fsyntax-only -x objective-c \
-            -target arm64-apple-ios18.0 -fobjc-arc \
+            -target arm64-apple-ios17.0 -fobjc-arc \
             -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" \
             -Wno-implicit-function-declaration \
             Sources/main.m > s.log 2>&1
@@ -1380,7 +1380,7 @@ jobs:
           APP=out/Payload/probe.app
           set +e
           xcrun -sdk iphoneos clang \
-            -arch arm64 -miphoneos-version-min=18.0 -fobjc-arc \
+            -arch arm64 -miphoneos-version-min=17.0 -fobjc-arc \
             -isysroot "$SDK" -O1 \
             -Wno-implicit-function-declaration \
             -framework UIKit -framework Foundation -framework CoreFoundation \
