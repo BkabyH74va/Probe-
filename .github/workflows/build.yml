@@ -11,7 +11,7 @@ jobs:
           mkdir -p Sources
           cat > project.yml <<'PROJEOF'
           name: probe
-          options: { bundleIdPrefix: com.buurza31, deploymentTarget: { iOS: "18.0" } }
+          options: { bundleIdPrefix: com.buurza31b, deploymentTarget: { iOS: "18.0" } }
           targets:
             probe:
               type: application
@@ -21,7 +21,7 @@ jobs:
               info:
                 path: Info.plist
                 properties:
-                  CFBundleDisplayName: buurd31
+                  CFBundleDisplayName: buurd31b
                   CFBundleShortVersionString: "1.0"
                   CFBundleVersion: "32"
                   UILaunchScreen: {}
@@ -79,8 +79,10 @@ jobs:
           extern int csops(pid_t pid, unsigned int ops, void* uaddr, size_t usize);
 
           typedef uint32_t (*fn_surfid)(IOSurfaceRef);
+          typedef kern_return_t (*fn_addclient)(io_connect_t, io_connect_t);
+          static fn_addclient g_addclient = NULL;
 
-          #define BUILD_TAG "v31-modesvc"
+          #define BUILD_TAG "v31b-addclientfix"
           #define MAXC 32
           #define STEP_MAX 18
           #define TRY_MAX 2
@@ -589,7 +591,8 @@ jobs:
 
           static void addclient(void) {
               if (g_nconn < 2) { ulog(@"addclient needs 2 conns"); return; }
-              kern_return_t kr = IOConnectAddClient(g_conn[0], g_conn[1]);
+              if (!g_addclient) { plog(@"ADDCLIENT unavailable"); ulog(@"ADDCLIENT unavailable"); return; }
+              kern_return_t kr = g_addclient(g_conn[0], g_conn[1]);
               plog(@"ADDCLIENT c0+c1 -> %@", kr_name(kr));
               ulog(@"ADDCLIENT -> %@", kr_name(kr));
               if (kr == KERN_SUCCESS) {
@@ -789,6 +792,11 @@ jobs:
 
               mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &g_wake);
               mach_port_insert_right(mach_task_self(), g_wake, g_wake, MACH_MSG_TYPE_MAKE_SEND);
+
+              void* ik = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY);
+              g_addclient = (fn_addclient)dlsym(RTLD_DEFAULT, "IOConnectAddClient");
+              if (!g_addclient && ik) g_addclient = (fn_addclient)dlsym(ik, "IOConnectAddClient");
+              plog(@"addclient sym=%p", (void*)g_addclient);
 
               plog(@"=== LAUNCH step=%d build=%s wake=0x%x", g_step, BUILD_TAG, g_wake);
               if (g_fd >= 0) fsync(g_fd);
