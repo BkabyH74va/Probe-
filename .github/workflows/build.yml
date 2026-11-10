@@ -16,7 +16,7 @@ jobs:
           mkdir -p Sources
           cat > project.yml <<'PROJEOF'
           name: probe
-          options: { bundleIdPrefix: com.buurza36, deploymentTarget: { iOS: "18.0" } }
+          options: { bundleIdPrefix: com.buurza37, deploymentTarget: { iOS: "18.0" } }
           targets:
             probe:
               type: application
@@ -26,9 +26,9 @@ jobs:
               info:
                 path: Info.plist
                 properties:
-                  CFBundleDisplayName: buurd36
+                  CFBundleDisplayName: buurd37
                   CFBundleShortVersionString: "1.0"
-                  CFBundleVersion: "38"
+                  CFBundleVersion: "39"
                   UILaunchScreen: {}
               settings:
                 ARCHS: "arm64"
@@ -90,7 +90,7 @@ jobs:
           typedef kern_return_t (*fn_addclient)(io_connect_t, io_connect_t);
           static fn_addclient g_addclient = NULL;
 
-          #define BUILD_TAG "v36-mac15"
+          #define BUILD_TAG "v37-rawx12"
           #define MAXC 40
           #define STEP_MAX 25
           #define TRY_MAX 2
@@ -693,7 +693,7 @@ jobs:
               uint64_t so[SCO] = {0}; size_t sc = 0;
               uint8_t sb[BIGOUT]; size_t szb = BIGOUT;
               memset(sb, AAM, sizeof(sb));
-              kern_return_t kr = rawx(g_conn[ci], sel, mode, sin, sic, in, zis, so, &sc, sb, &szb);
+              kern_return_t kr = rawx(g_conn[ci], sel, mode, sin, sic, in, zis, in ? 1 : 0, so, &sc, sb, &szb);
               __sync_fetch_and_add(&g_spad, 1);
               __sync_fetch_and_add(&g_done, 1);
               int un = 0;
@@ -843,7 +843,7 @@ jobs:
                           uint64_t so[SCO] = {0}; size_t sc = 0;
                           uint8_t sb[BIGOUT]; size_t szb = BIGOUT;
                           memset(sb, AAM, sizeof(sb));
-                          kern_return_t kr = rawx(g_conn[g_best], s, 1, sin, sic, in, zis, so, &sc, sb, &szb);
+                          kern_return_t kr = rawx(g_conn[g_best], s, 1, sin, sic, in, zis, 1, so, &sc, sb, &szb);
                           __sync_fetch_and_add(&g_jfeed, 1);
                           __sync_fetch_and_add(&g_done, 1);
                           int un = 0;
@@ -886,7 +886,7 @@ jobs:
                   memset(in, PAT, zis);
                   desc_into(in, zis);
                   int mode = zis ? 1 : 0;
-                  kern_return_t kr = rawx(g_conn[ci], sel, mode, sin, sic, in, zis, so, &sc, sb, &szb);
+                  kern_return_t kr = rawx(g_conn[ci], sel, mode, sin, sic, in, zis, 1, so, &sc, sb, &szb);
                   __sync_fetch_and_add(&g_probes, 1);
                   int un = 0;
                   for (size_t q = 0; q < sizeof(sb); q++) if (sb[q] == AAM) un++;
@@ -925,7 +925,7 @@ jobs:
                   for (uint32_t k = 0; k < SCO; k++) sin[k] = SV[k % SV_N];
                   uint64_t so[SCO] = {0}; size_t sc = 0; uint8_t sb[BIGOUT]; size_t szb = BIGOUT;
                   memset(sb, AAM, sizeof(sb));
-                  kern_return_t kr = rawx(g_conn[ci], sel, 1, sin, 1, in, mid, so, &sc, sb, &szb);
+                  kern_return_t kr = rawx(g_conn[ci], sel, 1, sin, 1, in, mid, 1, so, &sc, sb, &szb);
                   __sync_fetch_and_add(&g_probes, 1);
                   plog(@"CLB s%u zi=%zu -> %@", sel, mid, kr_name(kr));
                   free(in);
@@ -1037,7 +1037,7 @@ jobs:
                   uint64_t so[SCO] = {0}; size_t sc = 0;
                   uint8_t sb[BIGOUT]; size_t z2 = BIGOUT;
                   memset(sb, AAM, sizeof(sb));
-                  kern_return_t b = rawx(g_conn[g_best], s, 1, sin, 1, NULL, 4096, so, &sc, sb, &z2);
+                  kern_return_t b = rawx(g_conn[g_best], s, 1, sin, 1, NULL, 4096, 1, so, &sc, sb, &z2);
                   plog(@"NM s%u null+4096 -> %@ szb=%zu", s, kr_name(b), z2);
                   ulog(@"NM s%u null+4096 -> %@", s, kr_name(b));
                   usleep(200);
