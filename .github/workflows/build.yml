@@ -21,7 +21,6 @@ jobs:
         run: |
           gh api "repos/${{ github.repository }}/actions/artifacts?per_page=100" \
             --jq '.artifacts[].id' > ids.txt || exit 0
-          wc -l < ids.txt
           head -n 60 ids.txt | while read -r id; do
             gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/$id" >/dev/null 2>&1 || true
           done
@@ -55,7 +54,7 @@ jobs:
           typedef kern_return_t (*fn_addclient)(io_connect_t, io_connect_t);
           static fn_addclient g_addclient = NULL;
 
-          #define BUILD_TAG "v43-stage"
+          #define BUILD_TAG "v44-linux"
           #define MAXC 40
           #define STEP_MAX 27
           #define TRY_MAX 2
@@ -1335,13 +1334,13 @@ jobs:
           <plist version="1.0"><dict>
             <key>CFBundleDevelopmentRegion</key><string>en</string>
             <key>CFBundleExecutable</key><string>probe</string>
-            <key>CFBundleIdentifier</key><string>com.buurza43.probe</string>
+            <key>CFBundleIdentifier</key><string>com.buurza44.probe</string>
             <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
             <key>CFBundleName</key><string>probe</string>
-            <key>CFBundleDisplayName</key><string>buurd43</string>
+            <key>CFBundleDisplayName</key><string>buurd44</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleShortVersionString</key><string>1.0</string>
-            <key>CFBundleVersion</key><string>45</string>
+            <key>CFBundleVersion</key><string>46</string>
             <key>MinimumOSVersion</key><string>17.0</string>
             <key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
             <key>UILaunchScreen</key><dict/>
@@ -1354,7 +1353,6 @@ jobs:
           PEOF
           python3 -c "import plistlib;plistlib.load(open('out/Payload/probe.app/Info.plist','rb'));print('plist ok')"
           wc -c Sources/main.m
-          md5sum Sources/main.m
 
       - uses: actions/upload-artifact@v4.6.2
         with:
@@ -1365,41 +1363,50 @@ jobs:
           retention-days: 3
           compression-level: 0
 
-  ipa:
+  linux:
     needs: stage
-    runs-on: macos-latest
-    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/download-artifact@v4.1.8
         with:
           name: src-${{ github.run_number }}-${{ github.run_attempt }}
 
-      - name: env
-        run: |
-          uname -a
-          xcodebuild -version
-          xcrun --sdk iphoneos --show-sdk-version
-          xcrun --sdk iphoneos --show-sdk-path
-
-      - name: layout
+      - name: toolchain
         run: |
           set -e
-          mkdir -p out/Payload/probe.app
-          test -f Sources/main.m || { echo "NO SOURCE"; ls -R; exit 1; }
-          test -f out/Payload/probe.app/Info.plist || { echo "NO PLIST"; ls -R; exit 1; }
-          mv out/Payload/probe.app/Info.plist /tmp/Info.plist
-          mkdir -p out/Payload/probe.app
-          mv /tmp/Info.plist out/Payload/probe.app/Info.plist
-          plutil -lint out/Payload/probe.app/Info.plist
-          ls -la Sources out/Payload/probe.app
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang lld ldid zip unzip curl file
+          clang --version | head -1
+          ld64.lld --version || true
+          which ldid
+
+      - name: sdk
+        run: |
+          set -e
+          ok=0
+          for u in \
+            "https://github.com/xybp888/iOS-SDKs/raw/master/iPhoneOS17.5.sdk.zip" \
+            "https://github.com/xybp888/iOS-SDKs/raw/master/iPhoneOS17.4.sdk.zip" \
+            "https://github.com/xybp888/iOS-SDKs/raw/master/iPhoneOS17.2.sdk.zip" \
+            "https://github.com/xybp888/iOS-SDKs/raw/master/iPhoneOS17.0.sdk.zip"; do
+            echo "try $u"
+            code=$(curl -sSL --retry 2 -o sdk.zip -w '%{http_code}' "$u" || echo 000)
+            if [ "$code" = "200" ]; then ok=1; echo "SDK OK: $u"; break; fi
+          done
+          test $ok -eq 1 || { echo "SDK FETCH FAILED"; exit 1; }
+          unzip -q sdk.zip
+          D=$(ls -d *.sdk | head -1)
+          echo "SDK_DIR=$D" >> "$GITHUB_ENV"
+          test -f "$D/usr/lib/libSystem.tbd" || test -f "$D/usr/lib/libSystem.dylib" || { echo "BAD SDK LAYOUT"; ls "$D"; exit 1; }
+          test -d "$D/System/Library/Frameworks/UIKit.framework" || { echo "NO UIKIT"; exit 1; }
+          echo "sdk staged: $D"
 
       - name: syntax
         run: |
           set +e
-          xcrun -sdk iphoneos clang -fsyntax-only -x objective-c \
-            -target arm64-apple-ios17.0 -fobjc-arc \
-            -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" \
-            -Wno-implicit-function-declaration \
+          clang -fsyntax-only -target arm64-apple-ios17.0 -fobjc-arc \
+            -isysroot "$SDK_DIR" -Wno-implicit-function-declaration \
             Sources/main.m > s.log 2>&1
           rc=$?
           set -e
@@ -1410,13 +1417,12 @@ jobs:
       - name: build
         run: |
           set -euo pipefail
-          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
           APP=out/Payload/probe.app
+          mkdir -p "$APP"
           set +e
-          xcrun -sdk iphoneos clang \
-            -arch arm64 -miphoneos-version-min=17.0 -fobjc-arc \
-            -isysroot "$SDK" -O1 \
-            -Wno-implicit-function-declaration \
+          clang -target arm64-apple-ios17.0 -fuse-ld=lld -fobjc-arc -O1 \
+            -isysroot "$SDK_DIR" -Wno-implicit-function-declaration \
+            -Wl,-platform_version,ios,17.0,17.0 -Wl,-adhoc_codesign \
             -framework UIKit -framework Foundation -framework CoreFoundation \
             -framework IOKit -framework VideoToolbox -framework CoreMedia \
             -framework CoreVideo -framework Security \
@@ -1424,12 +1430,13 @@ jobs:
           rc=$?
           set -e
           echo "=== cc rc=$rc ==="
-          grep -nE "error:|undefined|Undefined" c.log | head -40 || true
-          tail -15 c.log || true
+          grep -nE "error:|undefined|Undefined|ld64" c.log | head -40 || true
+          tail -20 c.log || true
           echo "=== end ==="
           test $rc -eq 0
           chmod +x "$APP/probe"
           file "$APP/probe"
+          ldid -S "$APP/probe" && echo "adhoc signed"
           ls -la "$APP"
 
       - name: ipa
@@ -1442,15 +1449,49 @@ jobs:
           zip -r -q probe.ipa Payload
           test -s probe.ipa || { echo "ZIP EMPTY"; exit 1; }
           cd ..
-          stat -f "ipa bytes=%z" out/probe.ipa
-          shasum -a 256 out/probe.ipa
+          stat -c "ipa bytes=%s" out/probe.ipa
+          sha256sum out/probe.ipa
           unzip -l out/probe.ipa
 
       - uses: actions/upload-artifact@v4.6.2
-        continue-on-error: true
         with:
           name: probe-ipa-${{ github.run_number }}-${{ github.run_attempt }}
           path: out/probe.ipa
           if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+
+  mac:
+    needs: [stage, linux]
+    if: needs.linux.result == 'failure'
+    runs-on: macos-13
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4.1.8
+        with:
+          name: src-${{ github.run_number }}-${{ github.run_attempt }}
+
+      - name: build
+        run: |
+          set -euo pipefail
+          APP=out/Payload/probe.app
+          mkdir -p "$APP"
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          xcrun -sdk iphoneos clang \
+            -arch arm64 -miphoneos-version-min=17.0 -fobjc-arc \
+            -isysroot "$SDK" -O1 -Wno-implicit-function-declaration \
+            -framework UIKit -framework Foundation -framework CoreFoundation \
+            -framework IOKit -framework VideoToolbox -framework CoreMedia \
+            -framework CoreVideo -framework Security \
+            Sources/main.m -o "$APP/probe"
+          chmod +x "$APP/probe"
+          file "$APP/probe"
+          cd out && zip -r -q probe.ipa Payload && cd ..
+          shasum -a 256 out/probe.ipa
+
+      - uses: actions/upload-artifact@v4.6.2
+        with:
+          name: probe-ipa-mac-${{ github.run_number }}-${{ github.run_attempt }}
+          path: out/probe.ipa
           retention-days: 3
           compression-level: 0
