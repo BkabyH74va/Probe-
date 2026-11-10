@@ -11,7 +11,7 @@ jobs:
           mkdir -p Sources
           cat > project.yml <<'PROJEOF'
           name: probe
-          options: { bundleIdPrefix: com.buurza31b, deploymentTarget: { iOS: "18.0" } }
+          options: { bundleIdPrefix: com.buurza31c, deploymentTarget: { iOS: "18.0" } }
           targets:
             probe:
               type: application
@@ -21,9 +21,9 @@ jobs:
               info:
                 path: Info.plist
                 properties:
-                  CFBundleDisplayName: buurd31b
+                  CFBundleDisplayName: buurd31c
                   CFBundleShortVersionString: "1.0"
-                  CFBundleVersion: "32"
+                  CFBundleVersion: "33"
                   UILaunchScreen: {}
               settings:
                 ARCHS: "arm64"
@@ -82,7 +82,7 @@ jobs:
           typedef kern_return_t (*fn_addclient)(io_connect_t, io_connect_t);
           static fn_addclient g_addclient = NULL;
 
-          #define BUILD_TAG "v31b-addclientfix"
+          #define BUILD_TAG "v31c-replay"
           #define MAXC 32
           #define STEP_MAX 18
           #define TRY_MAX 2
@@ -731,31 +731,72 @@ jobs:
 
           static void summary(void) {
               NSString* st = [NSString stringWithContentsOfFile:doc_file("state.txt") encoding:NSUTF8StringEncoding error:nil];
-              int lines = 0, wins = 0, sw = 0;
+              if (!st) { ulog(@"no state"); return; }
+              NSMutableDictionary* hist = [NSMutableDictionary dictionary];
+              NSMutableArray* keep = [NSMutableArray array];
+              int lines = 0, calls = 0, bad = 0, wins = 0, flips = 0, sigs = 0, opens = 0;
               for (NSString* ln in [st componentsSeparatedByString:@"\n"]) {
                   if (!ln.length) continue;
                   lines++;
-                  if ([ln hasPrefix:@"WIN4 "]) { wins++; plog(@"SUM %@", ln); }
-                  if ([ln hasPrefix:@"SW"] && [ln rangeOfString:@"OK"].location != NSNotFound) { sw++; plog(@"SUM %@", ln); }
+                  if ([ln hasPrefix:@"WIN4 "]) { wins++; [keep addObject:ln]; continue; }
+                  if ([ln hasPrefix:@"FLIP5 "]) { flips++; [keep addObject:ln]; continue; }
+                  if ([ln hasPrefix:@"SIGNAL "]) { sigs++; [keep addObject:ln]; continue; }
+                  if ([ln hasPrefix:@"rootopen"] || [ln hasPrefix:@"ADDCLIENT"] || [ln hasPrefix:@"SVC "] ||
+                      [ln hasPrefix:@"PARENT"] || [ln hasPrefix:@"SIB "] || [ln hasPrefix:@"JCLS "] ||
+                      [ln hasPrefix:@"surf="] || [ln hasPrefix:@"svc="] || [ln hasPrefix:@"TRAP"]) {
+                      if ([ln rangeOfString:@"OK"].location != NSNotFound) opens++;
+                      [keep addObject:ln];
+                      continue;
+                  }
+                  BOOL isCall = [ln hasPrefix:@"S4 "] || [ln hasPrefix:@"PING "] ||
+                                [ln hasPrefix:@"SW1 "] || [ln hasPrefix:@"SW2 "] || [ln hasPrefix:@"OS "];
+                  if (!isCall) continue;
+                  calls++;
+                  NSRange ar = [ln rangeOfString:@" -> "];
+                  if (ar.location == NSNotFound) continue;
+                  NSString* rest = [ln substringFromIndex:ar.location + 4];
+                  NSString* cls = [[rest componentsSeparatedByString:@" "] firstObject];
+                  if (!cls.length) continue;
+                  NSNumber* c = hist[cls];
+                  hist[cls] = @(c.intValue + 1);
+                  if ([cls isEqualToString:@"BadArg"]) bad++;
+                  else [keep addObject:ln];
               }
-              plog(@"SUMMARY lines=%d wins4=%d swok=%d ok0=%d ok4=%d ok5=%d flip5=%d m1=%d m2=%d att=%d", lines, wins, sw, g_ok0, g_ok4, g_ok5, g_5flip, g_m1hit, g_m2hit, g_s4_att);
-              ulog(@"SUMMARY lines=%d wins4=%d swok=%d ok4=%d flip5=%d m1=%d m2=%d", lines, wins, sw, g_ok4, g_5flip, g_m1hit, g_m2hit);
+              plog(@"REPLAY lines=%d calls=%d bad=%d nonbad=%lu wins=%d flips=%d sigs=%d opens=%d",
+                   lines, calls, bad, (unsigned long)(calls - bad), wins, flips, sigs, opens);
+              NSMutableString* h = [NSMutableString string];
+              for (NSString* k in [[hist allKeys] sortedArrayUsingSelector:@selector(compare:)])
+                  [h appendFormat:@"%@=%d ", k, [hist[k] intValue]];
+              plog(@"HIST %@", h);
+              ulog(@"REPLAY calls=%d bad=%d nonbad=%lu wins=%d flips=%d opens=%d", calls, bad, (unsigned long)(calls - bad), wins, flips, opens);
+              ulog(@"HIST %@", h);
+              NSUInteger cap = keep.count > 150 ? 150 : keep.count;
+              for (NSUInteger i = 0; i < cap; i++) { plog(@"KEEP %@", keep[i]); ulog(@"%@", keep[i]); }
+              if (keep.count > cap) ulog(@"... +%lu more", (unsigned long)(keep.count - cap));
           }
 
           static void verdict(void) {
+              NSString* st = [NSString stringWithContentsOfFile:doc_file("state.txt") encoding:NSUTF8StringEncoding error:nil];
+              if (!st) { ulog(@"VERDICT no state"); return; }
+              NSMutableDictionary* sel = [NSMutableDictionary dictionary];
+              for (NSString* ln in [st componentsSeparatedByString:@"\n"]) {
+                  NSRange ar = [ln rangeOfString:@" -> "];
+                  if (ar.location == NSNotFound) continue;
+                  NSString* pre = [ln substringToIndex:ar.location];
+                  NSString* rest = [ln substringFromIndex:ar.location + 4];
+                  NSString* cls = [[rest componentsSeparatedByString:@" "] firstObject];
+                  NSArray* t = [pre componentsSeparatedByString:@" "];
+                  NSString* last = [t lastObject];
+                  if (!last.length || !cls.length) continue;
+                  NSString* key = [NSString stringWithFormat:@"%@:%@", last, cls];
+                  NSNumber* c = sel[key];
+                  sel[key] = @(c.intValue + 1);
+              }
               NSMutableString* b = [NSMutableString string];
-              for (uint32_t s = 0; s < SEL_N; s++) {
-                  if (g_oks[s]) [b appendFormat:@"%u(OK m%u/%u/%zu/%zu) ", s, g_okm[s], g_oksi[s], g_okzi[s], g_okzo[s]];
-                  else if (g_hit_s[s]) [b appendFormat:@"%u(m%u) ", s, g_bmode[s]];
-              }
-              plog(@"VERDICT ok0=%d ok4=%d ok5=%d flip5=%d m1=%d m2=%d conns=%d hit=[%@]", g_ok0, g_ok4, g_ok5, g_5flip, g_m1hit, g_m2hit, g_nconn, b);
-              ulog(@"VERDICT ok0=%d ok4=%d ok5=%d m1=%d m2=%d hit=[%@]", g_ok0, g_ok4, g_ok5, g_m1hit, g_m2hit, b);
-              if (g_w4) {
-                  plog(@"VWIN s4 sic=%u zis=%zu zos=%zu sc=[%llu %llu] pay=%s",
-                       g_w4_sic, g_w4_zis, g_w4_zos,
-                       (unsigned long long)g_w4_sc[0], (unsigned long long)g_w4_sc[1],
-                       hexn(g_w4_pay, g_w4_zis > 64 ? 64 : g_w4_zis, 64).UTF8String);
-              }
+              for (NSString* k in [[sel allKeys] sortedArrayUsingSelector:@selector(compare:)])
+                  [b appendFormat:@"%@x%d ", k, [sel[k] intValue]];
+              plog(@"VERDICT2 %@", b);
+              ulog(@"VERDICT2 %@", b);
           }
 
           static void do_step(int s) {
@@ -941,4 +982,4 @@ jobs:
         with:
           name: probe
           path: out/probe.ipa
-          if-no-files-found: error
+          if-no-files-found: never
