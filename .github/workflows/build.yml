@@ -1,367 +1,347 @@
-name: dylib
+name: build
 on: [push, workflow_dispatch]
 jobs:
-  dylib:
+  ipa:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: source
+      - name: scaffold
         run: |
-          mkdir -p out
-          cat > buurd.m <<'EOF'
+          mkdir -p Sources
+          cat > project.yml <<'EOF'
+          name: probe
+          options: { bundleIdPrefix: com.buurza, deploymentTarget: { iOS: "18.0" } }
+          targets:
+            probe:
+              type: application
+              platform: iOS
+              sources: [Sources]
+              entitlements: { path: probe.entitlements }
+              info:
+                path: Sources/Info.plist
+                properties:
+                  CFBundleDisplayName: buurd
+                  CFBundleShortVersionString: "1.0"
+                  CFBundleVersion: "1"
+                  UILaunchScreen: {}
+              settings:
+                ARCHS: "arm64e arm64"
+                SUPPORTED_PLATFORMS: "iphoneos"
+                SDKROOT: "iphoneos"
+                CODE_SIGN_IDENTITY: ""
+                CODE_SIGNING_REQUIRED: "NO"
+                CODE_SIGNING_ALLOWED: "NO"
+                OTHER_CFLAGS: "-Wno-implicit-function-declaration"
+              dependencies:
+                - sdk: IOKit.framework
+                - sdk: UIKit.framework
+                - sdk: VideoToolbox.framework
+                - sdk: CoreMedia.framework
+                - sdk: CoreVideo.framework
+                - sdk: Security.framework
+          EOF
+          cat > probe.entitlements <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>platform-application</key><true/>
+            <key>com.apple.private.security.no-container</key><true/>
+            <key>get-task-allow</key><true/>
+          </dict></plist>
+          EOF
+          cat > Sources/main.m <<'EOF'
           #import <UIKit/UIKit.h>
-          #import <mach/mach.h>
-          #import <mach-o/dyld.h>
-          #import <mach-o/loader.h>
-          #import <dlfcn.h>
-          #include <string.h>
-          #include <stdlib.h>
-          #include <math.h>
+          #import <IOKit/IOKitLib.h>
+          #import <VideoToolbox/VideoToolbox.h>
+          #include <unistd.h>
+          #include <fcntl.h>
+          #include <pthread.h>
 
-          #define STRIDE      0x78
-          #define CHUNK_BITS  9
-          #define MAX_ENT     4096
-          #define MAX_DRAW    24
-          #define SCAN_CAP    2500000
-          #define SEG_CAP     (16u * 1024u * 1024u)
+          extern int csops(pid_t, unsigned int, void *, size_t);
+          #define CS_OPS_STATUS 0
 
-          typedef struct {
-              char     module[128];
-              uint64_t off_list;
-              uint64_t off_count;
-              uint64_t off_matrix;
-              uint64_t off_ent_pos;
-          } BUConf;
+          static UITextView* g_tv;
+          static UILabel* g_hb;
+          static int g_hits = 0, g_done = 0;
+          static int g_fd = -1;
+          static NSMutableSet* g_seen;
+          static pthread_mutex_t g_lk = PTHREAD_MUTEX_INITIALIZER;
 
-          static BUConf g_conf;
+          #define MAXC 24
+          static io_connect_t g_conn[MAXC];
+          static uint32_t g_ctype[MAXC];
+          static int g_nconn = 0;
 
-          static uintptr_t g_base   = 0;
-          static uintptr_t g_list   = 0;
-          static uintptr_t g_matrix = 0;
-          static uint32_t  g_count  = 0;
-          static volatile int g_scanning = 0;
-          static volatile int g_stop     = 0;
-          static NSString* g_status = @"boot";
-          static NSMutableArray<NSString*>* g_mods;
+          static int g_off5[128]; static int g_n5 = 0;
+          static int g_off4[128]; static int g_n4 = 0;
 
-          static inline BOOL rd(uintptr_t a, void* b, size_t n) {
-              if (a < 0x100000000ULL) return NO;
-              vm_size_t got = 0;
-              return vm_read_overwrite(mach_task_self(), (vm_address_t)a,
-                       (vm_size_t)n, (vm_address_t)b, &got) == KERN_SUCCESS && got == n;
+          static void ui(NSString* s) {
+              dispatch_async(dispatch_get_main_queue(), ^{
+                  g_tv.text = [g_tv.text stringByAppendingFormat:@"\n%@", s];
+                  [g_tv scrollRangeToVisible:NSMakeRange(g_tv.text.length, 0)];
+              });
           }
-          static inline uint64_t rd64(uintptr_t a) { uint64_t v = 0; rd(a, &v, 8); return v; }
-          static inline uint32_t rd32(uintptr_t a) { uint32_t v = 0; rd(a, &v, 4); return v; }
-          static inline float    rdf (uintptr_t a) { float    v = 0; rd(a, &v, 4); return v; }
-
-          static BOOL w2s(const float* m, float x, float y, float z, CGPoint* o, CGSize s) {
-              float w = m[3]*x + m[7]*y + m[11]*z + m[15];
-              if (w <= 0.001f) return NO;
-              float cx = m[0]*x + m[4]*y + m[8]*z  + m[12];
-              float cy = m[1]*x + m[5]*y + m[9]*z  + m[13];
-              o->x = (s.width  * 0.5f) * (1.0f + cx / w);
-              o->y = (s.height * 0.5f) * (1.0f - cy / w);
-              return YES;
+          static void persist(NSString* s) {
+              if (g_fd < 0) return;
+              NSData* d = [[s stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
+              pthread_mutex_lock(&g_lk);
+              write(g_fd, d.bytes, d.length);
+              pthread_mutex_unlock(&g_lk);
+          }
+          static NSString* kr_name(kern_return_t kr) {
+              switch (kr) {
+                  case KERN_SUCCESS: return @"OK";
+                  case 0xe00002bc: return @"Error";
+                  case 0xe00002bd: return @"NoMem";
+                  case 0xe00002be: return @"NoRes";
+                  case 0xe00002c1: return @"NotPriv";
+                  case 0xe00002c2: return @"BadArg";
+                  case 0xe00002c5: return @"Excl";
+                  case 0xe00002c7: return @"Unsup";
+                  case 0xe00002cc: return @"NotOpen";
+                  case 0xe00002d4: return @"Busy";
+                  case 0xe00002e2: return @"NotPerm";
+                  default: return [NSString stringWithFormat:@"0x%x", kr];
+              }
+          }
+          static NSString* hex(const uint8_t* p, size_t n) {
+              if (!n) return @"-";
+              if (n > 32) n = 32;
+              NSMutableString* s = [NSMutableString string];
+              for (size_t i = 0; i < n; i++) [s appendFormat:@"%02x", p[i]];
+              return s;
+          }
+          static void state_path(char* b, size_t n) {
+              NSString* p = [NSSearchPathForDirectoriesInDomains(
+                  NSDocumentDirectory, NSUserDomainMask, YES).firstObject
+                  stringByAppendingPathComponent:@"state.txt"];
+              strncpy(b, p.UTF8String, n - 1);
+          }
+          static void load_state(void) {
+              char b[512]; state_path(b, sizeof(b));
+              NSString* s = [NSString stringWithContentsOfFile:@(b) encoding:NSUTF8StringEncoding error:nil];
+              for (NSString* ln in [s componentsSeparatedByString:@"\n"]) {
+                  if (ln.length < 5) continue;
+                  NSArray* f = [ln componentsSeparatedByString:@" "];
+                  if (f.count >= 3) [g_seen addObject:[NSString stringWithFormat:@"%@:%@:%@", f[0], f[1], f[2]]];
+              }
+          }
+          static BOOL seen_key(NSString* k) {
+              pthread_mutex_lock(&g_lk);
+              BOOL r = [g_seen containsObject:k];
+              [g_seen addObject:k];
+              pthread_mutex_unlock(&g_lk);
+              return r;
           }
 
-          // ---------- konfiguracja ----------
-          static void load_conf(void) {
-              NSString* p = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/buurd.plist"];
-              NSDictionary* d = [NSDictionary dictionaryWithContentsOfFile:p];
-              if (!d) return;
-              NSString* m = d[@"module"];
-              if (m) strncpy(g_conf.module, m.UTF8String, sizeof(g_conf.module) - 1);
-              g_conf.off_list   = [d[@"off_list"]   unsignedLongLongValue];
-              g_conf.off_count  = [d[@"off_count"]  unsignedLongLongValue];
-              g_conf.off_matrix = [d[@"off_matrix"] unsignedLongLongValue];
-              g_conf.off_ent_pos= [d[@"off_ent_pos"]unsignedLongLongValue];
-              g_status = @"conf loaded";
+          static kern_return_t callp(const char* tag, io_connect_t c, uint32_t t, uint32_t sel,
+                                     const uint8_t* in, size_t sz, size_t outsz, BOOL always) {
+              NSString* key = [NSString stringWithFormat:@"%u:%u:%zu:%zu:%s", t, sel, sz, outsz, tag];
+              if (seen_key(key)) return (kern_return_t)0xdeadbeef;
+              uint8_t out[4096]; size_t oSz = outsz;
+              memset(out, 0xCC, sizeof(out));
+              kern_return_t kr = IOConnectCallStructMethod(c, sel, in, sz, outsz ? out : NULL, &oSz);
+              g_done++;
+              persist([NSString stringWithFormat:@"%u %u %zu %@ %zu %@ | %s",
+                       t, sel, sz, kr_name(kr), oSz, hex(out, oSz), tag]);
+              if (kr != 0xe00002c2 && kr != 0xe00002c7) {
+                  g_hits++;
+                  ui([NSString stringWithFormat:@"!! %s t%u s%u -> %@ out=%zu %@",
+                      tag, t, sel, kr_name(kr), oSz, hex(out, oSz)]);
+              } else if (always) {
+                  ui([NSString stringWithFormat:@"%s t%u s%u -> %@", tag, t, sel, kr_name(kr)]);
+              }
+              usleep(1200);
+              return kr;
           }
 
-          // ---------- chodzenie po segmentach ----------
-          static void each_writable(int idx, void (^blk)(uintptr_t, size_t)) {
-              const struct mach_header_64* h = (const struct mach_header_64*)_dyld_get_image_header(idx);
-              if (!h || h->magic != MH_MAGIC_64) return;
-              intptr_t slide = _dyld_get_image_vmaddr_slide(idx);
-              uintptr_t p = (uintptr_t)h + sizeof(struct mach_header_64);
-              uintptr_t end = p + h->sizeofcmds;
-              for (uint32_t i = 0; i < h->ncmds && p < end; i++) {
-                  struct load_command* lc = (struct load_command*)p;
-                  if (lc->cmdsize < sizeof(struct load_command)) break;
-                  if (lc->cmd == LC_SEGMENT_64) {
-                      struct segment_command_64* sg = (struct segment_command_64*)lc;
-                      if ((sg->initprot & VM_PROT_WRITE) && sg->vmsize > 64) {
-                          uintptr_t a = (uintptr_t)(sg->vmaddr + slide);
-                          size_t n = sg->vmsize > SEG_CAP ? SEG_CAP : (size_t)sg->vmsize;
-                          blk(a, n);
-                      }
-                  }
-                  p += lc->cmdsize;
+          static void ladder(io_connect_t c, uint32_t t, uint32_t sel) {
+              size_t L[] = { 4096, 4097, 4112, 4224, 4608, 8192, 16384, 65536 };
+              for (int i = 0; i < 8; i++) {
+                  uint8_t* in = calloc(1, L[i]);
+                  char tg[24]; snprintf(tg, sizeof(tg), "lad%u", sel);
+                  callp(tg, c, t, sel, in, L[i], 4096, YES);
+                  free(in);
               }
           }
 
-          // ---------- heurystyka macierzy ----------
-          static BOOL matrix_ok(const float* m) {
-              if (fabsf(m[15]) < 0.85f || fabsf(m[15]) > 1.15f) return NO;
-              if (fabsf(m[3]) > 0.02f || fabsf(m[7]) > 0.02f || fabsf(m[11]) > 0.02f) return NO;
-              if (fabsf(m[0]) < 0.4f || fabsf(m[5]) < 0.4f) return NO;
-              if (!isfinite(m[12]) || !isfinite(m[13])) return NO;
-              if (fabsf(m[12]) > 20000.f || fabsf(m[13]) > 20000.f) return NO;
-              float d = m[0]*m[5] - m[1]*m[4];
-              if (fabsf(d) < 0.05f) return NO;
-              return YES;
-          }
-
-          static uintptr_t find_matrix(int idx) {
-              __block uintptr_t hit = 0;
-              each_writable(idx, ^(uintptr_t a, size_t n) {
-                  if (hit || g_stop) return;
-                  float buf[16];
-                  for (size_t o = 0; o + 64 < n; o += 4) {
-                      if (!rd(a + o, buf, 64)) continue;
-                      if (matrix_ok(buf)) { hit = a + o; return; }
+          static void hitmap(io_connect_t c, uint32_t t, uint32_t sel, int* store, int* nstore) {
+              uint8_t* in = calloc(1, 4096);
+              for (int i = 0; i < 128; i++) {
+                  in[i] = 0xFF;
+                  char tg[28]; snprintf(tg, sizeof(tg), "hm%u.%d", sel, i);
+                  kern_return_t kr = callp(tg, c, t, sel, in, 4096, 4096, YES);
+                  if (kr == 0xe00002c2) {
+                      if (*nstore < 128) store[(*nstore)++] = i;
                   }
-              });
-              return hit;
-          }
-
-          // ---------- heurystyka listy chunkow ----------
-          static BOOL ent_ok(uintptr_t e) {
-              float x = rdf(e), y = rdf(e + 4), z = rdf(e + 8);
-              if (!isfinite(x) || !isfinite(y) || !isfinite(z)) return NO;
-              if (fabsf(x) > 200000.f || fabsf(y) > 200000.f || fabsf(z) > 200000.f) return NO;
-              if (fabsf(x) + fabsf(y) + fabsf(z) < 0.001f) return NO;
-              return YES;
-          }
-
-          static uintptr_t find_list(int idx) {
-              __block uintptr_t hit = 0;
-              __block size_t budget = SCAN_CAP;
-              each_writable(idx, ^(uintptr_t a, size_t n) {
-                  if (hit || g_stop) return;
-                  for (size_t o = 0; o + 8 < n && budget; o += 8, budget--) {
-                      uint64_t cand = 0;
-                      if (!rd(a + o, &cand, 8)) continue;
-                      uintptr_t c = (uintptr_t)cand;
-                      if (c < 0x100000000ULL || (c & 7)) continue;
-                      uintptr_t chunk = (uintptr_t)rd64(c);
-                      if (chunk < 0x100000000ULL || (chunk & 7)) continue;
-                      uintptr_t e0 = (uintptr_t)rd64(chunk);
-                      if (e0 < 0x100000000ULL) continue;
-                      uintptr_t eLast = (uintptr_t)rd64(chunk + 0x1FF * STRIDE);
-                      if (eLast < 0x100000000ULL) continue;
-                      if (!ent_ok(e0) || !ent_ok(eLast)) continue;
-                      hit = a + o;
-                      return;
-                  }
-              });
-              return hit;
-          }
-
-          // ---------- wybor obrazu ----------
-          static BOOL sys_image(const char* path) {
-              return !path || strncmp(path, "/System", 7) == 0 ||
-                     strncmp(path, "/usr/lib", 8) == 0 ||
-                     strncmp(path, "/Developer", 10) == 0;
-          }
-
-          static int pick_image(void) {
-              uint32_t total = _dyld_image_count();
-              if (g_conf.module[0]) {
-                  for (uint32_t i = 0; i < total; i++) {
-                      const char* nm = _dyld_get_image_name(i);
-                      if (nm && strstr(nm, g_conf.module)) return (int)i;
-                  }
-                  return -1;
+                  in[i] = 0;
               }
-              for (uint32_t i = 0; i < total; i++) {
-                  if (sys_image(_dyld_get_image_name(i))) continue;
-                  if (i == 0) return 0;
-              }
-              return 0;
+              free(in);
+              ui([NSString stringWithFormat:@"s%u read-offsets=%d", sel, *nstore]);
           }
 
-          static void scan_all(void) {
-              if (g_scanning) return;
-              g_scanning = 1; g_stop = 0;
-              dispatch_async(dispatch_get_global_queue(0, 0), ^{
-                  g_matrix = 0; g_list = 0;
-                  g_mods = [NSMutableArray array];
+          static void valsweep(io_connect_t c, uint32_t t, uint32_t sel, int off) {
+              uint32_t v32[] = { 1, 8, 0x1000, 0x10000, 0x100000, 0x7fffffffu, 0xffffffffu };
+              uint64_t v64[] = { 0x1000, 0x10000, 0x7fffffffULL, 0xffffffffffffffffULL };
+              for (int i = 0; i < 7; i++) {
+                  uint8_t* in = calloc(1, 4096);
+                  memcpy(in + off, &v32[i], 4);
+                  char tg[32]; snprintf(tg, sizeof(tg), "v%u.%d.u32", sel, off);
+                  callp(tg, c, t, sel, in, 4096, 4096, YES);
+                  free(in);
+              }
+              for (int i = 0; i < 4; i++) {
+                  uint8_t* in = calloc(1, 4096);
+                  memcpy(in + off, &v64[i], 8);
+                  char tg[32]; snprintf(tg, sizeof(tg), "v%u.%d.u64", sel, off);
+                  callp(tg, c, t, sel, in, 4096, 4096, YES);
+                  free(in);
+              }
+          }
 
-                  uint32_t total = _dyld_image_count();
-                  for (uint32_t i = 0; i < total && g_mods.count < 40; i++) {
-                      const char* nm = _dyld_get_image_name(i);
-                      if (sys_image(nm)) continue;
-                      [g_mods addObject:[NSString stringWithFormat:@"%u %s", i,
-                          nm ? strrchr(nm, '/') + 1 : "?"]];
-                  }
+          static void cross_state(void) {
+              ui(@"[E] state cross-check");
+              uint8_t* in = calloc(1, 4096);
+              for (int n = 1; n < g_nconn; n++)
+                  callp("pre4", g_conn[n], g_ctype[n], 4, in, 4096, 4096, YES);
+              for (int n = 0; n < g_nconn; n++)
+                  callp("post5", g_conn[n], g_ctype[n], 5, in, 4096, 4096, YES);
+              free(in);
+          }
 
-                  int first = pick_image();
-                  if (first >= 0) {
-                      const struct mach_header_64* h =
-                          (const struct mach_header_64*)_dyld_get_image_header((uint32_t)first);
-                      if (h) g_base = (uintptr_t)h + _dyld_get_image_vmaddr_slide((uint32_t)first);
-
-                      if (g_conf.off_matrix) g_matrix = g_base + g_conf.off_matrix;
-                      if (g_conf.off_list)   g_list   = g_base + g_conf.off_list;
-                      if (g_conf.off_count)  g_count  = rd32(g_base + g_conf.off_count);
-
-                      if (!g_matrix) {
-                          uint32_t total2 = _dyld_image_count();
-                          for (uint32_t i = 0; i < total2 && !g_matrix && !g_stop; i++) {
-                              if (sys_image(_dyld_get_image_name(i))) continue;
-                              g_matrix = find_matrix((int)i);
-                          }
-                      }
-                      if (!g_list) {
-                          uint32_t total3 = _dyld_image_count();
-                          for (uint32_t i = 0; i < total3 && !g_list && !g_stop; i++) {
-                              if (sys_image(_dyld_get_image_name(i))) continue;
-                              g_list = find_list((int)i);
-                          }
+          static void open_all(void) {
+              io_iterator_t it = 0;
+              if (IOServiceGetMatchingServices(kIOMainPortDefault,
+                      IOServiceMatching("AppleJPEGDriver"), &it) != KERN_SUCCESS) return;
+              io_service_t s; int nodes = 0;
+              while ((s = IOIteratorNext(it)) && nodes < 1 && g_nconn < MAXC) {
+                  nodes++;
+                  for (int t = 0; t <= 40 && g_nconn < MAXC; t++) {
+                      io_connect_t c = 0;
+                      if (IOServiceOpen(s, mach_task_self(), (uint32_t)t, &c) == KERN_SUCCESS) {
+                          g_conn[g_nconn] = c; g_ctype[g_nconn] = (uint32_t)t; g_nconn++;
+                          persist([NSString stringWithFormat:@"OPEN %d", t]);
                       }
                   }
-                  g_status = [NSString stringWithFormat:@"m=%d l=%d", g_matrix ? 1 : 0, g_list ? 1 : 0];
-                  g_scanning = 0;
-              });
+                  IOObjectRelease(s);
+              }
+              IOObjectRelease(it);
           }
 
-          // ---------- rysowanie ----------
-          @interface BUView : UIView
-          @property (nonatomic, strong) NSMutableArray<NSString*>* lines;
+          static void run(void) {
+              char b[512]; state_path(b, sizeof(b));
+              g_fd = open(b, O_CREAT | O_WRONLY | O_APPEND, 0644);
+              g_seen = [NSMutableSet set];
+              load_state();
+              ui([NSString stringWithFormat:@"resume=%lu", (unsigned long)g_seen.count]);
+
+              VTCompressionSessionRef v = NULL;
+              VTCompressionSessionCreate(NULL, 1920, 1080, kCMVideoCodecType_H264,
+                  NULL, NULL, NULL, NULL, NULL, &v);
+              if (v) VTCompressionSessionPrepareToEncodeFrames(v);
+              usleep(250000);
+
+              open_all();
+              NSMutableString* tl = [NSMutableString string];
+              for (int i = 0; i < g_nconn; i++) [tl appendFormat:@"%u,", g_ctype[i]];
+              ui([NSString stringWithFormat:@"conns=%d types=%@", g_nconn, tl]);
+              if (!g_nconn) return;
+
+              io_connect_t c = g_conn[0]; uint32_t t = g_ctype[0];
+
+              ui(@"[0] size ladder");
+              ladder(c, t, 4); ladder(c, t, 5);
+
+              ui(@"[A] s5 byte hitmap 0-127");
+              hitmap(c, t, 5, g_off5, &g_n5);
+
+              ui(@"[B] s4 byte hitmap 0-127");
+              hitmap(c, t, 4, g_off4, &g_n4);
+
+              ui(@"[C] s5 value sweep");
+              for (int i = 0; i < g_n5; i++) valsweep(c, t, 5, g_off5[i]);
+
+              ui(@"[D] s4 value sweep");
+              int use4 = g_n4 ? g_n4 : g_n5;
+              int* src = g_n4 ? g_off4 : g_off5;
+              for (int i = 0; i < use4; i++) valsweep(c, t, 4, src[i]);
+
+              cross_state();
+
+              ui([NSString stringWithFormat:@"FINISHED calls=%d hits=%d", g_done, g_hits]);
+              close(g_fd); g_fd = -1;
+          }
+
+          @interface AppDelegate : UIResponder <UIApplicationDelegate>
+          @property (strong) UIWindow* w;
           @end
 
-          @implementation BUView
-          - (instancetype)initWithFrame:(CGRect)f {
-              if ((self = [super initWithFrame:f])) {
-                  self.backgroundColor = UIColor.clearColor;
-                  self.opaque = NO;
-                  self.userInteractionEnabled = YES;
-                  _lines = [NSMutableArray array];
-                  UITapGestureRecognizer* g =
-                      [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(tap:)];
-                  [self addGestureRecognizer:g];
-              }
-              return self;
-          }
-          - (void)tap:(id)s {
-              CGPoint p = [s locationInView:self];
-              if (p.x > self.bounds.size.width - 90 && p.y < 60) scan_all();
-          }
-          - (void)drawRect:(CGRect)r {
-              NSDictionary* at = @{
-                  NSFontAttributeName: [UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightRegular],
-                  NSForegroundColorAttributeName: UIColor.greenColor };
-              NSDictionary* hd = @{
-                  NSFontAttributeName: [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightBold],
-                  NSForegroundColorAttributeName: UIColor.systemYellowColor };
-              [@"SCAN" drawAtPoint:CGPointMake(r.size.width - 52, 26) withAttributes:hd];
-              CGFloat y = 26;
-              for (NSString* s in self.lines) {
-                  [s drawAtPoint:CGPointMake(6, y) withAttributes:at];
-                  y += 11;
-                  if (y > r.size.height - 30) break;
-              }
+          @implementation AppDelegate
+          - (BOOL)application:(UIApplication*)a didFinishLaunchingWithOptions:(NSDictionary*)o {
+              self.w = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+              UIViewController* vc = [UIViewController new];
+              vc.view.backgroundColor = UIColor.blackColor;
+
+              g_hb = [[UILabel alloc] initWithFrame:CGRectMake(8, 50, 340, 18)];
+              g_hb.textColor = UIColor.systemYellowColor;
+              g_hb.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
+              g_hb.text = @"idle";
+              [vc.view addSubview:g_hb];
+
+              CGRect r = vc.view.bounds;
+              r.origin.y = 72; r.size.height -= 80;
+              g_tv = [[UITextView alloc] initWithFrame:r];
+              g_tv.backgroundColor = UIColor.blackColor;
+              g_tv.textColor = UIColor.greenColor;
+              g_tv.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
+              g_tv.editable = NO;
+              g_tv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+              g_tv.text = @"boot";
+              [vc.view addSubview:g_tv];
+
+              self.w.rootViewController = vc;
+              [self.w makeKeyAndVisible];
+
+              [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer* t) {
+                  g_hb.text = [NSString stringWithFormat:@"calls=%d hits=%d", g_done, g_hits];
+              }];
+
+              dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
+                             dispatch_get_global_queue(0,0), ^{ run(); });
+              return YES;
           }
           @end
 
-          static BUView* g_view;
-
-          static void tick(void) {
-              if (!g_view) return;
-              CGSize sz = UIScreen.mainScreen.bounds.size;
-              NSMutableArray* out = [NSMutableArray array];
-
-              [out addObject:[NSString stringWithFormat:@"base=%p %@", (void*)g_base, g_status]];
-
-              if (g_scanning) [out addObject:@"scanning…"];
-
-              if (!g_matrix) {
-                  [out addObject:@"no matrix"];
-              }
-              if (!g_list) {
-                  [out addObject:@"no list"];
-              }
-              for (NSString* m in g_mods) {
-                  if (out.count > 14) break;
-                  [out addObject:[NSString stringWithFormat:@" mod %@", m]];
-              }
-
-              if (g_matrix && g_list) {
-                  float m[16];
-                  if (!rd(g_matrix, m, sizeof(m))) {
-                      [out addObject:@"matrix gone"];
-                  } else {
-                      uint32_t cnt = g_count;
-                      if (!cnt || cnt > MAX_ENT) cnt = MAX_ENT;
-                      int shown = 0, live = 0;
-                      for (uint32_t i = 0; i < cnt && shown < MAX_DRAW; i++) {
-                          uintptr_t chunk = (uintptr_t)rd64(g_list + ((i >> CHUNK_BITS) * 8));
-                          if (!chunk) continue;
-                          uintptr_t ent = (uintptr_t)rd64(chunk + ((i & 0x1FF) * STRIDE));
-                          if (!ent) continue;
-                          live++;
-                          float x = rdf(ent + 0), y = rdf(ent + 4), z = rdf(ent + 8);
-                          CGPoint p;
-                          if (!w2s(m, x, y, z, &p, sz)) continue;
-                          [out addObject:[NSString stringWithFormat:@"#%u %4.0f,%4.0f", i, p.x, p.y]];
-                          shown++;
-                      }
-                      [out addObject:[NSString stringWithFormat:@"live=%d shown=%d", live, shown]];
-                  }
-              }
-
-              dispatch_async(dispatch_get_main_queue(), ^{
-                  g_view.lines = out;
-                  [g_view setNeedsDisplay];
-              });
-          }
-
-          static void install(void) {
-              if (g_view) return;
-              dispatch_async(dispatch_get_main_queue(), ^{
-                  UIWindow* w = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
-                  w.windowLevel = UIWindowLevelAlert + 1;
-                  w.backgroundColor = UIColor.clearColor;
-                  UIViewController* vc = [UIViewController new];
-                  vc.view.backgroundColor = UIColor.clearColor;
-                  g_view = [[BUView alloc] initWithFrame:UIScreen.mainScreen.bounds];
-                  g_view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-                  [vc.view addSubview:g_view];
-                  w.rootViewController = vc;
-                  [w makeKeyAndVisible];
-                  [NSTimer scheduledTimerWithTimeInterval:0.05 repeats:YES block:^(NSTimer* t) { tick(); }];
-                  NSLog(@"BUURD: overlay up base=%p", (void*)g_base);
-                  scan_all();
-              });
-          }
-
-          __attribute__((constructor))
-          static void buurd_init(void) {
-              load_conf();
-              const struct mach_header_64* h = (const struct mach_header_64*)_dyld_get_image_header(0);
-              if (h) g_base = (uintptr_t)h + _dyld_get_image_vmaddr_slide(0);
-              NSLog(@"BUURD: loaded base=%p", (void*)g_base);
-              dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
-                             dispatch_get_main_queue(), ^{ install(); });
+          int main(int argc, char** argv) {
+              @autoreleasepool { return UIApplicationMain(argc, argv, nil, @"AppDelegate"); }
           }
           EOF
 
-      - name: compile
+      - name: xcodegen
         run: |
-          SDK=$(xcrun -sdk iphoneos --show-sdk-path)
-          xcrun -sdk iphoneos clang -arch arm64e -arch arm64 -dynamiclib -fobjc-arc -O2 \
-            -isysroot "$SDK" \
-            -framework Foundation -framework UIKit -framework CoreGraphics \
-            -install_name @executable_path/buurd.dylib \
-            -Wl,-undefined,dynamic_lookup \
-            -o out/buurd.dylib buurd.m
-          lipo -info out/buurd.dylib
-          file out/buurd.dylib
+          brew install xcodegen
+          xcodegen generate
+
+      - name: build
+        run: |
+          mkdir -p out/Payload
+          xcodebuild -project probe.xcodeproj -target probe \
+            -sdk iphoneos -configuration Release \
+            -arch arm64e -arch arm64 \
+            CONFIGURATION_BUILD_DIR=$PWD/out/Payload \
+            SUPPORTED_PLATFORMS=iphoneos \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            OTHER_CFLAGS="-Wno-implicit-function-declaration" \
+            build
+
+      - name: ipa
+        run: |
+          ls -la out/Payload
+          cd out && zip -r probe.ipa Payload
 
       - uses: actions/upload-artifact@v4
         with:
-          name: buurd-dylib
-          path: out/buurd.dylib
+          name: probe
+          path: out/probe.ipa
           if-no-files-found: error
