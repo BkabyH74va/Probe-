@@ -38,6 +38,7 @@ jobs:
                 - sdk: VideoToolbox.framework
                 - sdk: CoreMedia.framework
                 - sdk: CoreVideo.framework
+                - sdk: Security.framework
           EOF
           cat > probe.entitlements <<'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
@@ -45,6 +46,8 @@ jobs:
           <plist version="1.0"><dict>
             <key>platform-application</key><true/>
             <key>com.apple.private.security.no-container</key><true/>
+            <key>com.apple.security.iokit-user-client-class</key>
+            <array><string>AVEVideoEncoderUserClient</string></array>
           </dict></plist>
           EOF
           cat > Sources/main.m <<'EOF'
@@ -52,13 +55,14 @@ jobs:
           #import <IOKit/IOKitLib.h>
           #import <VideoToolbox/VideoToolbox.h>
           #import <CoreVideo/CoreVideo.h>
+          #import <Security/Security.h>
           #include <unistd.h>
 
           static UITextView* g_tv;
           static UILabel* g_hb;
           static NSUInteger g_ticks = 0;
-          static VTCompressionSessionRef g_vt = NULL;
           static dispatch_semaphore_t g_sem;
+          static VTCompressionSessionRef g_vt = NULL;
 
           static void add_line(NSString* s) {
               dispatch_async(dispatch_get_main_queue(), ^{
@@ -75,8 +79,37 @@ jobs:
                           encoding:NSUTF8StringEncoding error:nil];
           }
 
-          static void vt_out(void* ref, void* src, OSStatus st,
-                             VTEncodeInfoFlags fl, CMSampleBufferRef sbuf) {
+          static void check_entitlements(void) {
+              SecTaskRef t = SecTaskCreateFromSelf(kCFAllocatorDefault);
+              if (!t) { add_line(@"SecTask: nil"); return; }
+              CFTypeRef plat = SecTaskCopyValueForEntitlement(t, CFSTR("platform-application"), NULL);
+              CFTypeRef nocon = SecTaskCopyValueForEntitlement(t, CFSTR("com.apple.private.security.no-container"), NULL);
+              CFTypeRef iok  = SecTaskCopyValueForEntitlement(t, CFSTR("com.apple.security.iokit-user-client-class"), NULL);
+              add_line([NSString stringWithFormat:@"ent platform-application = %@", plat ? @"YES" : @"nil"]);
+              add_line([NSString stringWithFormat:@"ent no-container = %@", nocon ? @"YES" : @"nil"]);
+              add_line([NSString stringWithFormat:@"ent iokit-user-client-class = %@", iok ? @"YES" : @"nil"]);
+              if (plat) CFRelease(plat);
+              if (nocon) CFRelease(nocon);
+              if (iok) CFRelease(iok);
+              CFRelease(t);
+          }
+
+          static void dump_props(io_service_t svc) {
+              CFMutableDictionaryRef props = NULL;
+              if (IORegistryEntryCreateCFProperties(svc, &props, kCFAllocatorDefault, 0) != KERN_SUCCESS || !props) {
+                  add_line(@"props: none"); return;
+              }
+              CFStringRef uc = CFDictionaryGetValue(props, CFSTR("IOUserClientClass"));
+              add_line(uc ? [NSString stringWithFormat:@"IOUserClientClass = %@", (__bridge NSString*)uc]
+                          : @"IOUserClientClass: absent");
+              CFTypeRef acc = IORegistryEntryCreateCFProperty(svc, CFSTR("IOKitUserClientAccess"), kCFAllocatorDefault, 0);
+              if (acc) { add_line(@"IOKitUserClientAccess present"); CFRelease(acc); }
+              CFTypeRef pers = IORegistryEntryCreateCFProperty(svc, CFSTR("IOKitPersonalities"), kCFAllocatorDefault, 0);
+              if (pers) { add_line(@"IOKitPersonalities present"); CFRelease(pers); }
+              CFRelease(props);
+          }
+
+          static void vt_out(void* r, void* s, OSStatus st, VTEncodeInfoFlags f, CMSampleBufferRef sb) {
               dispatch_semaphore_signal(g_sem);
           }
 
@@ -86,56 +119,32 @@ jobs:
                       kCMVideoCodecType_H264, NULL, NULL, NULL, vt_out, NULL, &g_vt);
               add_line([NSString stringWithFormat:@"vt create=%d", (int)st]);
               if (!g_vt) return;
-
               VTCompressionSessionPrepareToEncodeFrames(g_vt);
-
               CVPixelBufferRef pb = NULL;
               CVPixelBufferCreate(NULL, 1920, 1080, kCVPixelFormatType_32BGRA, NULL, &pb);
-              if (pb) {
-                  VTCompressionSessionEncodeFrame(g_vt, pb,
-                      CMTimeMake(1, 30), CMTimeMake(1, 30), NULL, NULL, NULL);
-                  long w = dispatch_semaphore_wait(g_sem,
-                      dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC));
-                  add_line([NSString stringWithFormat:@"vt encode waited=%ld", w]);
-                  CVPixelBufferRelease(pb);
-              }
+              if (!pb) return;
+              VTCompressionSessionEncodeFrame(g_vt, pb, CMTimeMake(1, 30), CMTimeMake(1, 30),
+                                              NULL, NULL, NULL);
+              long w = dispatch_semaphore_wait(g_sem, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC));
+              add_line([NSString stringWithFormat:@"vt encode waited=%ld", w]);
+              CVPixelBufferRelease(pb);
           }
 
-          static int try_open_type(NSString* cls, int type) {
-              io_iterator_t it = 0;
-              if (IOServiceGetMatchingServices(kIOMainPortDefault,
-                      IOServiceMatching(cls.UTF8String), &it) != KERN_SUCCESS) return -1;
-              io_service_t svc = IOIteratorNext(it);
-              IOObjectRelease(it);
-              if (!svc) return 0;
-              io_connect_t c = 0;
-              kern_return_t kr = IOServiceOpen(svc, mach_task_self(), (uint32_t)type, &c);
-              BOOL uc = IOObjectConformsTo(svc, "IOUserClient");
-              IOObjectRelease(svc);
-              add_line([NSString stringWithFormat:@"%@ type=%d uc=%d open=0x%x conn=%u",
-                        cls, type, (int)uc, kr, c]);
-              return kr == KERN_SUCCESS;
-          }
-
-          static void dump_subtree(io_service_t root, const char* plane) {
-              io_iterator_t it = 0;
-              if (IORegistryEntryGetChildIterator(root, plane, &it) != KERN_SUCCESS) return;
-              io_service_t s; int n = 0;
-              while ((s = IOIteratorNext(it)) && n < 200) {
-                  io_name_t nm; IOObjectGetClass(s, nm);
-                  BOOL uc = IOObjectConformsTo(s, "IOUserClient");
+          static void sweep(io_service_t svc, const char* label) {
+              for (int t = 0; t <= 16; t++) {
                   io_connect_t c = 0;
-                  kern_return_t kr = IOServiceOpen(s, mach_task_self(), 0, &c);
-                  add_line([NSString stringWithFormat:@"  child %s uc=%d open=0x%x", nm, (int)uc, kr]);
-                  IOObjectRelease(s); n++;
+                  kern_return_t kr = IOServiceOpen(svc, mach_task_self(), (uint32_t)t, &c);
+                  if (kr == KERN_SUCCESS) {
+                      add_line([NSString stringWithFormat:@"!! %s type=%d OPEN conn=%u", label, t, c]);
+                  } else if (t == 0 || t == 1) {
+                      add_line([NSString stringWithFormat:@"%s type=%d -> 0x%x", label, t, kr]);
+                  }
               }
-              IOObjectRelease(it);
           }
 
           static io_service_t find_one(const char* cls) {
               io_iterator_t it = 0;
-              if (IOServiceGetMatchingServices(kIOMainPortDefault,
-                      IOServiceMatching(cls), &it) != KERN_SUCCESS) return 0;
+              if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching(cls), &it) != KERN_SUCCESS) return 0;
               io_service_t s = IOIteratorNext(it);
               IOObjectRelease(it);
               return s;
@@ -143,24 +152,33 @@ jobs:
 
           static void run_probe(void) {
               add_line(@"[+] probe start");
+              check_entitlements();
 
               io_service_t ave = find_one("AppleAVE2Driver");
-              if (!ave) { add_line(@"no AppleAVE2Driver node yet"); }
-              else {
-                  add_line(@"[*] subtree of AppleAVE2Driver:");
-                  dump_subtree(ave, kIOServicePlane);
-                  IOObjectRelease(ave);
-              }
+              if (!ave) { add_line(@"no driver node"); dump_file(); return; }
 
-              add_line(@"[*] warmup VT with a real frame");
+              dump_props(ave);
+
+              kern_return_t az = IOServiceAuthorize(ave, 0);
+              add_line([NSString stringWithFormat:@"authorize=0x%x", az]);
+
+              add_line(@"[*] encode");
               vt_full();
+              usleep(500000);
 
-              for (int i = 0; i < 4; i++) {
-                  usleep(400000);
-                  add_line([NSString stringWithFormat:@"--- after encode %d ---", i]);
-                  try_open_type(@"AVEVideoEncoder", 0);
-                  for (int t = 0; t <= 3; t++) try_open_type(@"AppleAVE2Driver", t);
+              add_line(@"[*] sweep AppleAVE2Driver");
+              sweep(ave, "drv");
+
+              CFTypeRef uc = IORegistryEntryCreateCFProperty(ave, CFSTR("IOUserClientClass"), kCFAllocatorDefault, 0);
+              if (uc) {
+                  NSString* name = (__bridge NSString*)uc;
+                  add_line([NSString stringWithFormat:@"[*] trying UC class %@", name]);
+                  io_service_t nub = find_one(name.UTF8String);
+                  if (nub) { sweep(nub, "uc"); IOObjectRelease(nub); }
+                  else add_line(@"no node for UC class");
+                  CFRelease(uc);
               }
+              IOObjectRelease(ave);
 
               add_line(@"[*] done");
               dump_file();
@@ -199,8 +217,7 @@ jobs:
 
               [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer* t) {
                   g_ticks++;
-                  g_hb.text = [NSString stringWithFormat:@"alive ticks=%lu",
-                               (unsigned long)g_ticks];
+                  g_hb.text = [NSString stringWithFormat:@"alive ticks=%lu", (unsigned long)g_ticks];
               }];
 
               dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
