@@ -11,7 +11,7 @@ jobs:
           mkdir -p Sources
           cat > project.yml <<'PROJEOF'
           name: probe
-          options: { bundleIdPrefix: com.buurza22, deploymentTarget: { iOS: "18.0" } }
+          options: { bundleIdPrefix: com.buurza23, deploymentTarget: { iOS: "18.0" } }
           targets:
             probe:
               type: application
@@ -21,9 +21,9 @@ jobs:
               info:
                 path: Info.plist
                 properties:
-                  CFBundleDisplayName: buurd22
+                  CFBundleDisplayName: buurd23
                   CFBundleShortVersionString: "1.0"
-                  CFBundleVersion: "22"
+                  CFBundleVersion: "23"
                   UILaunchScreen: {}
               settings:
                 ARCHS: "arm64"
@@ -73,9 +73,9 @@ jobs:
           typedef CFTypeRef (*fn_copy)(SecTaskRef, CFStringRef, CFErrorRef*);
           typedef uint32_t (*fn_surfid)(IOSurfaceRef);
 
-          #define BUILD_TAG "v22-surf"
-          #define MAXC 96
-          #define STEP_MAX 17
+          #define BUILD_TAG "v23-matrix"
+          #define MAXC 128
+          #define STEP_MAX 14
           #define TRY_MAX 2
           #define MAXCHILD 8
           #define TYPE_MAX 7
@@ -108,9 +108,8 @@ jobs:
 
           static const char* STEP_NAME[STEP_MAX + 1] = {
               "boot", "census", "sig-blob", "match-uc", "vt-init", "vt-encode",
-              "dump-tree", "root-open", "oracle", "shape-sweep", "insize-sweep",
-              "hdr-sweep", "field-1", "field-vals", "pair-probe", "surf-probe",
-              "post-fixed", "verdict"
+              "dump-tree", "open-all", "oracle-all", "open-then-4", "rich-desc",
+              "fill-sweep", "surf-probe", "post", "verdict"
           };
 
           static void ui(NSString* s) {
@@ -263,8 +262,11 @@ jobs:
               return kr;
           }
 
+          static kern_return_t t4i(int ci, const char* tag, const uint8_t* in, size_t outsz) {
+              return callp(tag, ci, 4, in, FIXED, outsz, YES);
+          }
           static kern_return_t t4(const char* tag, const uint8_t* in, size_t outsz) {
-              return callp(tag, g_root_idx, 4, in, FIXED, outsz, YES);
+              return t4i(g_root_idx, tag, in, outsz);
           }
           static void t5(const char* tag, const uint8_t* in) {
               callp(tag, g_root_idx, 5, in, FIXED, FIXED, YES);
@@ -430,6 +432,22 @@ jobs:
               ui([NSString stringWithFormat:@"children=%d", g_nchild]);
           }
 
+          static void open_all(void) {
+              int base = g_nconn;
+              int got = probe_open(g_root, 0, TYPE_MAX);
+              if (g_nconn > base) g_root_idx = base;
+              persist([NSString stringWithFormat:@"root got=%d idx=%d nchild=%d", got, g_root_idx, g_nchild]);
+              ui([NSString stringWithFormat:@"root got=%d idx=%d", got, g_root_idx]);
+              for (int i = 1; i <= g_nchild; i++) {
+                  int b = g_nconn;
+                  int g2 = probe_open(g_child[i], i, TYPE_MAX);
+                  persist([NSString stringWithFormat:@"child %d got=%d base=%d", i, g2, b]);
+                  ui([NSString stringWithFormat:@"child %d got=%d", i, g2]);
+              }
+              persist([NSString stringWithFormat:@"conns=%d", g_nconn]);
+              ui([NSString stringWithFormat:@"conns=%d", g_nconn]);
+          }
+
           static void vt_cb(void* ref, void* src, OSStatus st, VTEncodeInfoFlags fl,
                             CMSampleBufferRef sb) { g_vt_done = 1; }
 
@@ -456,75 +474,70 @@ jobs:
               return (int)st;
           }
 
-          static void oracle(int ci) {
-              if (ci < 0 || ci >= g_nconn) { ui(@"oracle no conn"); return; }
-              NSMutableString* line = [NSMutableString string];
-              for (uint32_t s = 0; s <= 31; s++) {
+          static void oracle_all(void) {
+              for (int ci = 0; ci < g_nconn; ci++) {
                   uint8_t* in = calloc(1, FIXED);
-                  char tg[32]; snprintf(tg, sizeof(tg), "o.%u", s);
-                  kern_return_t kr = callp(tg, ci, s, in, FIXED, FIXED, NO);
+                  if (!in) continue;
+                  NSMutableString* line = [NSMutableString string];
+                  for (uint32_t s = 0; s <= 31; s++) {
+                      char tg[40]; snprintf(tg, sizeof(tg), "oa.%d.%u", g_node[ci], s);
+                      kern_return_t kr = callp(tg, ci, s, in, FIXED, FIXED, NO);
+                      [line appendFormat:@"%u:%@ ", s, kr_name(kr)];
+                  }
                   free(in);
-                  [line appendFormat:@"%u:%@ ", s, kr_name(kr)];
-              }
-              persist([NSString stringWithFormat:@"ORACLE n%d %@", g_node[ci], line]);
-              ui([NSString stringWithFormat:@"ORACLE n%d %@", g_node[ci], line]);
-          }
-
-          static void shape_sweep(void) {
-              size_t outs[15] = {0,1,4,8,16,32,64,128,256,512,1024,2048,4096,8192,16384};
-              for (int i = 0; i < 15; i++) {
-                  uint8_t* in = calloc(1, FIXED);
-                  char a[32]; snprintf(a, sizeof(a), "sh4.%zu", outs[i]);
-                  t4(a, in, outs[i]);
-                  char b[32]; snprintf(b, sizeof(b), "sh5.%zu", outs[i]);
-                  callp(b, g_root_idx, 5, in, FIXED, outs[i], YES);
-                  free(in);
+                  persist([NSString stringWithFormat:@"ORACLE n%d t%u %@", g_node[ci], g_ctype[ci], line]);
+                  ui([NSString stringWithFormat:@"OA n%d t%u %@", g_node[ci], g_ctype[ci], line]);
               }
           }
 
-          static void insize_sweep(void) {
-              size_t ins[15] = {0,1,4,8,16,64,256,1024,2048,4095,4096,4097,8192,16384,32768};
-              for (int i = 0; i < 15; i++) {
-                  uint8_t* in = calloc(1, 32768);
-                  char tg[32]; snprintf(tg, sizeof(tg), "is4.%zu", ins[i]);
-                  callp(tg, g_root_idx, 4, in, ins[i], FIXED, YES);
-                  free(in);
+          static void open_then_4(void) {
+              uint8_t* in = calloc(1, FIXED);
+              if (!in) return;
+              for (int ci = 0; ci < g_nconn; ci++) {
+                  char a[40]; snprintf(a, sizeof(a), "ot.o.%d.%u", g_node[ci], g_ctype[ci]);
+                  kern_return_t o = callp(a, ci, 0, in, FIXED, FIXED, YES);
+                  char b[40]; snprintf(b, sizeof(b), "ot.4.%d.%u", g_node[ci], g_ctype[ci]);
+                  kern_return_t f = callp(b, ci, 4, in, FIXED, FIXED, YES);
+                  char c[40]; snprintf(c, sizeof(c), "ot.5.%d.%u", g_node[ci], g_ctype[ci]);
+                  kern_return_t g = callp(c, ci, 5, in, FIXED, FIXED, YES);
+                  persist([NSString stringWithFormat:@"ot n%d t%u o=%@ f=%@ f5=%@",
+                           g_node[ci], g_ctype[ci], kr_name(o), kr_name(f), kr_name(g)]);
+                  ui([NSString stringWithFormat:@"ot n%d t%u %@ %@ %@",
+                      g_node[ci], g_ctype[ci], kr_name(o), kr_name(f), kr_name(g)]);
               }
+              free(in);
           }
 
-          static void hdr_sweep(void) {
-              uint32_t v[27] = {0,1,2,3,4,5,6,7,8,9,10,12,16,20,32,64,100,255,256,512,
-                                1024,1920,1080,0x1000,0x10000,0x1000000,0xFFFFFFFF};
-              for (int i = 0; i < 27; i++) {
-                  uint8_t* in = calloc(1, FIXED);
-                  memcpy(in, &v[i], 4);
-                  char tg[40]; snprintf(tg, sizeof(tg), "hd4.%u", v[i]);
-                  t4(tg, in, FIXED);
-                  free(in);
-              }
-          }
-
-          static void field_probe(uint32_t val, const char* pfx) {
-              for (int off = 0; off <= 32; off += 4) {
-                  uint8_t* in = calloc(1, FIXED);
-                  memcpy(in + off, &val, 4);
-                  char tg[40]; snprintf(tg, sizeof(tg), "%s%d", pfx, off);
-                  t4(tg, in, FIXED);
-                  free(in);
-              }
-          }
-
-          static void pair_probe(void) {
-              uint32_t one = 1;
-              for (int a = 0; a <= 32; a += 4) {
-                  for (int b = a + 4; b <= 32; b += 4) {
+          static void rich_desc(void) {
+              uint32_t sid = g_sid, w = 1920, h = 1080, f = 0x42475241, bpr = 7680, pl = 1;
+              for (int base = 0; base <= 0x20; base += 8) {
+                  for (int sel = 0; sel <= 5; sel++) {
                       uint8_t* in = calloc(1, FIXED);
-                      memcpy(in + a, &one, 4);
-                      memcpy(in + b, &one, 4);
-                      char tg[40]; snprintf(tg, sizeof(tg), "pr4.%d.%d", a, b);
-                      t4(tg, in, FIXED);
+                      if (!in) continue;
+                      memcpy(in + base, &sid, 4);
+                      memcpy(in + base + 4, &w, 4);
+                      memcpy(in + base + 8, &h, 4);
+                      memcpy(in + base + 12, &f, 4);
+                      memcpy(in + base + 16, &bpr, 4);
+                      memcpy(in + base + 20, &pl, 4);
+                      char tg[48]; snprintf(tg, sizeof(tg), "rd.%d.%d", base, sel);
+                      callp(tg, g_root_idx, sel, in, FIXED, FIXED, YES);
                       free(in);
                   }
+              }
+          }
+
+          static void fill_sweep(void) {
+              uint8_t pats[3] = {0xFF, 0x01, 0xCC};
+              for (int i = 0; i < 3; i++) {
+                  uint8_t* in = calloc(1, FIXED);
+                  if (!in) continue;
+                  memset(in, pats[i], FIXED);
+                  char tg[32]; snprintf(tg, sizeof(tg), "fs4.%02x", pats[i]);
+                  t4(tg, in, FIXED);
+                  char b[32]; snprintf(b, sizeof(b), "fs5.%02x", pats[i]);
+                  t5(b, in);
+                  free(in);
               }
           }
 
@@ -549,35 +562,34 @@ jobs:
               if (!g_surf) { ui(@"no surf"); return; }
               uint32_t sid = g_sid;
               persist([NSString stringWithFormat:@"sid=%u", sid]);
-              for (int off = 0; off <= 32; off += 4) {
+              for (int ci = 0; ci < g_nconn; ci++) {
                   uint8_t* in = calloc(1, FIXED);
-                  memcpy(in + off, &sid, 4);
-                  char a[40]; snprintf(a, sizeof(a), "sf4.%d", off);
-                  kern_return_t kr = t4(a, in, FIXED);
-                  char b[40]; snprintf(b, sizeof(b), "sf5.%d", off);
-                  t5(b, in);
-                  if (kr != KERN_SUCCESS) {
-                      uint32_t w = 1920, h = 1080;
-                      memcpy(in + off + 4, &w, 4);
-                      memcpy(in + off + 8, &h, 4);
-                      char c[40]; snprintf(c, sizeof(c), "sd4.%d", off);
-                      t4(c, in, FIXED);
-                  }
+                  if (!in) continue;
+                  memcpy(in, &sid, 4);
+                  uint32_t w = 1920, h = 1080, f = 0x42475241;
+                  memcpy(in + 4, &w, 4);
+                  memcpy(in + 8, &h, 4);
+                  memcpy(in + 12, &f, 4);
+                  char tg[40]; snprintf(tg, sizeof(tg), "sp.%d.%u", g_node[ci], g_ctype[ci]);
+                  callp(tg, ci, 4, in, FIXED, FIXED, YES);
                   free(in);
               }
               uint8_t* in = calloc(1, FIXED);
-              memcpy(in, &sid, 4);
-              uint32_t w = 1920, h = 1080, f = 0x42475241;
-              memcpy(in + 4, &w, 4);
-              memcpy(in + 8, &h, 4);
-              memcpy(in + 12, &f, 4);
-              t4("sx4.full", in, FIXED);
-              t5("sx5.full", in);
-              free(in);
+              if (in) {
+                  memcpy(in, &sid, 4);
+                  uint32_t w = 1920, h = 1080, f = 0x42475241;
+                  memcpy(in + 4, &w, 4);
+                  memcpy(in + 8, &h, 4);
+                  memcpy(in + 12, &f, 4);
+                  t4("sx4.full", in, FIXED);
+                  t5("sx5.full", in);
+                  free(in);
+              }
           }
 
           static void post_fixed(void) {
               uint8_t* in = calloc(1, FIXED);
+              if (!in) return;
               kern_return_t a = t4("pf4", in, FIXED);
               t5("pf5", in);
               kern_return_t c = t4("pf4b", in, FIXED);
@@ -589,8 +601,8 @@ jobs:
           static void verdict(void) {
               persist([NSString stringWithFormat:@"VERDICT ok4=%d hits=%d conns=%d root_idx=%d sid=%u",
                        g_ok4, g_hits, g_nconn, g_root_idx, g_sid]);
-              ui([NSString stringWithFormat:@"VERDICT ok4=%d hits=%d idx=%d sid=%u",
-                  g_ok4, g_hits, g_root_idx, g_sid]);
+              ui([NSString stringWithFormat:@"VERDICT ok4=%d hits=%d idx=%d conns=%d",
+                  g_ok4, g_hits, g_root_idx, g_nconn]);
           }
 
           static void do_step(int s) {
@@ -602,28 +614,14 @@ jobs:
                   case 4: vt_start(); break;
                   case 5: ui([NSString stringWithFormat:@"vt=%d", (int)vt_encode()]); break;
                   case 6: dump_tree(); break;
-                  case 7: {
-                      int base = g_nconn;
-                      int got = probe_open(g_root, 0, TYPE_MAX);
-                      if (g_nconn > base) g_root_idx = base;
-                      persist([NSString stringWithFormat:@"root got=%d idx=%d", got, g_root_idx]);
-                      ui([NSString stringWithFormat:@"root got=%d idx=%d", got, g_root_idx]);
-                      break;
-                  }
-                  case 8: oracle(g_root_idx); break;
-                  case 9: shape_sweep(); break;
-                  case 10: insize_sweep(); break;
-                  case 11: hdr_sweep(); break;
-                  case 12: field_probe(1, "f1."); break;
-                  case 13:
-                      field_probe(1920, "fw.");
-                      field_probe(1080, "fh.");
-                      field_probe(0x1000, "fp.");
-                      break;
-                  case 14: pair_probe(); break;
-                  case 15: surf_make(); surf_probe(); break;
-                  case 16: post_fixed(); break;
-                  case 17: verdict(); break;
+                  case 7: open_all(); break;
+                  case 8: oracle_all(); break;
+                  case 9: open_then_4(); break;
+                  case 10: surf_make(); rich_desc(); break;
+                  case 11: fill_sweep(); break;
+                  case 12: surf_probe(); break;
+                  case 13: post_fixed(); break;
+                  case 14: verdict(); break;
               }
           }
 
@@ -777,5 +775,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: probe
-          path: out/probe.ipa
+          artifact: out/probe.ipa
           if-no-files-found: error
