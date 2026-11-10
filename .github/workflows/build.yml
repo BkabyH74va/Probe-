@@ -11,7 +11,7 @@ concurrency:
 
 jobs:
   stage:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: prune
@@ -33,6 +33,7 @@ jobs:
           #import <IOKit/IOKitLib.h>
           #import <VideoToolbox/VideoToolbox.h>
           #import <CoreVideo/CoreVideo.h>
+          #import <IOSurface/IOSurface.h>
           #import <Security/Security.h>
           #import <mach/mach.h>
           #include <unistd.h>
@@ -1365,7 +1366,7 @@ jobs:
 
   linux:
     needs: stage
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/download-artifact@v4.1.8
@@ -1375,30 +1376,43 @@ jobs:
       - name: toolchain
         run: |
           set -uo pipefail
-          sudo apt-get update -qq || true
-          PKGS="clang lld zip unzip curl file ca-certificates"
-          if ! sudo apt-get install -y -qq $PKGS; then
-            echo "first apt pass failed, refreshing"
-            sudo apt-get update || true
-            sudo apt-get install -y $PKGS
-          fi
+          export DEBIAN_FRONTEND=noninteractive
+          APT="sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30"
+          $APT update -qq || $APT update || true
+          PKGS="clang lld zip unzip curl file ca-certificates python3"
+          $APT install -y -qq $PKGS || $APT install -y --fix-missing $PKGS || true
+
           for b in clang zip unzip curl file; do
             command -v "$b" >/dev/null || { echo "MISSING $b"; exit 1; }
           done
-          LD64="$(command -v ld64.lld || true)"
+
+          LD64=""
+          for p in /usr/lib/llvm-*/bin/ld64.lld /usr/bin/ld64.lld /usr/local/bin/ld64.lld; do
+            [ -x "$p" ] && LD64="$p" && break
+          done
           if [ -z "$LD64" ]; then
-            for c in /usr/lib/llvm-*/bin/ld64.lld /usr/bin/ld64.lld; do
-              [ -x "$c" ] && LD64="$c" && break
+            LD64="$(find / -maxdepth 6 -name 'ld64.lld*' -type f 2>/dev/null | head -1)"
+          fi
+          if [ -z "$LD64" ]; then
+            echo "ld64.lld absent, trying versioned lld packages"
+            for v in 20 19 18 17 16; do
+              $APT install -y -qq "lld-$v" >/dev/null 2>&1 || true
+              if [ -x "/usr/lib/llvm-$v/bin/ld64.lld" ]; then LD64="/usr/lib/llvm-$v/bin/ld64.lld"; break; fi
             done
           fi
           if [ -z "$LD64" ]; then
-            echo "ld64.lld NOT FOUND after install"
-            dpkg -L lld 2>/dev/null | grep -i ld64 || true
-            ls /usr/lib/llvm-*/bin/ 2>/dev/null | head -40 || true
+            echo "--- ld64.lld NOT FOUND"
+            dpkg -l | grep -i lld || true
+            ls -la /usr/lib/llvm-*/bin/ 2>/dev/null | grep -iE 'ld|lld' || true
+            find / -maxdepth 6 -name 'lld*' -type f 2>/dev/null | head -20 || true
             exit 1
           fi
+
+          mkdir -p "$PWD/tc"
+          ln -sf "$LD64" "$PWD/tc/ld64.lld"
+          echo "TCBIN=$PWD/tc" >> "$GITHUB_ENV"
           echo "ld64.lld=$LD64"
-          clang --version | head -1
+          clang --version | head -1 || true
           echo "toolchain ok"
 
       - name: sdk
@@ -1415,30 +1429,39 @@ jobs:
           }
 
           got=0
-          echo "--- optional newer SDK mirrors"
-          for u in \
-            "https://github.com/xybp888/iOS-SDKs/raw/master/iPhoneOS17.5.sdk.zip" \
-            "https://github.com/xybp888/iOS-SDKs/raw/master/iPhoneOS17.4.sdk.zip"; do
-            echo "try $u"
-            if curl -fsSL --retry 1 --max-time 90 -o sdk.zip "$u"; then
-              if unzip -q -o sdk.zip -d "$EX" 2>/dev/null; then
-                D="$(pick "$EX")"
-                if [ -n "$D" ]; then mv "$D" "$SDKROOT/sdk"; got=1; echo "zip ok"; break; fi
-              fi
+          echo "--- quick zip attempt (may be dead)"
+          if curl -fsSL --retry 1 --max-time 45 -o sdk.zip \
+             "https://github.com/xybp888/iOS-SDKs/raw/master/iPhoneOS17.5.sdk.zip"; then
+            if unzip -q -o sdk.zip -d "$EX" 2>/dev/null; then
+              D="$(pick "$EX")"
+              if [ -n "$D" ]; then mv "$D" "$SDKROOT/sdk"; got=1; echo "zip ok"; fi
             fi
-          done
+          fi
+          rm -f sdk.zip
 
           if [ "$got" -eq 0 ]; then
-            echo "--- theos tarball (primary)"
-            curl -fsSL --retry 3 --retry-delay 3 --max-time 300 -o sdk.tar.gz \
-              "https://codeload.github.com/theos/sdks/tar.gz/refs/heads/master"
-            test -s sdk.tar.gz || { echo "TARBALL EMPTY"; exit 1; }
-            tar xzf sdk.tar.gz -C "$EX"
-            D="$(pick "$EX")"
-            test -n "$D" || { echo "NO .sdk IN TARBALL"; find "$EX" -maxdepth 2 | head -20; exit 1; }
-            mv "$D" "$SDKROOT/sdk"
-            echo "tarball ok"
+            for u in \
+              "https://codeload.github.com/theos/sdks/tar.gz/refs/heads/master" \
+              "https://codeload.github.com/theos/sdks/tar.gz/refs/heads/main" \
+              "https://github.com/theos/sdks/archive/refs/heads/master.tar.gz"; do
+              echo "--- tarball $u"
+              rm -f sdk.tar.gz
+              if curl -fsSL --retry 2 --retry-delay 2 --max-time 240 -o sdk.tar.gz "$u"; then
+                if tar xzf sdk.tar.gz -C "$EX" 2>/dev/null; then
+                  D="$(pick "$EX")"
+                  if [ -n "$D" ]; then mv "$D" "$SDKROOT/sdk"; got=1; echo "tarball ok"; break; fi
+                  echo "no .sdk inside $u"
+                else
+                  echo "untar failed for $u"
+                fi
+              else
+                echo "download failed for $u"
+              fi
+              rm -rf "$EX"; mkdir -p "$EX"
+            done
           fi
+
+          test "$got" -eq 1 || { echo "NO SDK SOURCE WORKED"; find "$EX" -maxdepth 2 | head -20; exit 1; }
 
           SDK_DIR="$SDKROOT/sdk"
           test -d "$SDK_DIR" || { echo "SDK_DIR MISSING: $SDK_DIR"; ls -la "$SDKROOT"; exit 1; }
@@ -1485,6 +1508,7 @@ jobs:
       - name: build
         run: |
           set -euo pipefail
+          export PATH="$TCBIN:$PATH"
           APP=out/Payload/probe.app
           mkdir -p "$APP"
           set +e
@@ -1493,14 +1517,15 @@ jobs:
             -Wl,-platform_version,ios,"$MINVER","$MINVER" -Wl,-adhoc_codesign \
             -framework UIKit -framework Foundation -framework CoreFoundation \
             -framework IOKit -framework VideoToolbox -framework CoreMedia \
-            -framework CoreVideo -framework Security \
+            -framework CoreVideo -framework IOSurface -framework Security \
             Sources/main.m -o "$APP/probe" > c.log 2>&1
           rc=$?
           set -e
-          echo "=== cc rc=$rc ==="
-          grep -nE "error:|undefined|Undefined|ld64|invalid linker" c.log | head -40 || true
+          echo "=== cc rc=$rc ld=$(command -v ld64.lld || echo none) ==="
+          grep -nE "error:|undefined|Undefined|ld64|invalid linker|ld: " c.log | head -40 || true
           tail -25 c.log || true
           echo "=== end ==="
+          if [ $rc -ne 0 ]; then ls -la "$SDKROOT"; ls -la "$SDKROOT/sdk/usr/lib" 2>/dev/null | head; fi
           test $rc -eq 0
           chmod +x "$APP/probe"
           file "$APP/probe"
@@ -1553,7 +1578,21 @@ jobs:
           sha256sum out/probe.ipa
           unzip -l out/probe.ipa
 
+      - name: logs
+        if: failure()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: logs-${{ github.run_number }}-${{ github.run_attempt }}
+          path: |
+            s.log
+            c.log
+            *.log
+          if-no-files-found: ignore
+          retention-days: 2
+          compression-level: 0
+
       - uses: actions/upload-artifact@v4.6.2
+        if: success()
         with:
           name: probe-ipa-${{ github.run_number }}-${{ github.run_attempt }}
           path: out/probe.ipa
@@ -1564,7 +1603,7 @@ jobs:
   mac:
     needs: [stage, linux]
     if: needs.linux.result == 'failure'
-    runs-on: macos-13
+    runs-on: macos-14
     timeout-minutes: 15
     steps:
       - uses: actions/download-artifact@v4.1.8
@@ -1582,7 +1621,7 @@ jobs:
             -isysroot "$SDK" -O1 -Wno-implicit-function-declaration \
             -framework UIKit -framework Foundation -framework CoreFoundation \
             -framework IOKit -framework VideoToolbox -framework CoreMedia \
-            -framework CoreVideo -framework Security \
+            -framework CoreVideo -framework IOSurface -framework Security \
             Sources/main.m -o "$APP/probe"
           chmod +x "$APP/probe"
           file "$APP/probe"
