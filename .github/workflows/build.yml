@@ -1,6 +1,10 @@
 name: build
 on: [push, workflow_dispatch]
 
+permissions:
+  contents: read
+  actions: write
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -8,15 +12,28 @@ concurrency:
 jobs:
   ipa:
     runs-on: macos-15
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+
+      - name: prune
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "repos/${{ github.repository }}/actions/artifacts?per_page=100" \
+            --jq '.artifacts[].id' > ids.txt || exit 0
+          wc -l < ids.txt
+          head -n 60 ids.txt | while read -r id; do
+            gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/$id" >/dev/null 2>&1 || true
+          done
 
       - name: scaffold
         run: |
           mkdir -p Sources
           cat > project.yml <<'PROJEOF'
           name: probe
-          options: { bundleIdPrefix: com.buurza37, deploymentTarget: { iOS: "18.0" } }
+          options: { bundleIdPrefix: com.buurza38, deploymentTarget: { iOS: "18.0" } }
           targets:
             probe:
               type: application
@@ -26,9 +43,9 @@ jobs:
               info:
                 path: Info.plist
                 properties:
-                  CFBundleDisplayName: buurd37
+                  CFBundleDisplayName: buurd38
                   CFBundleShortVersionString: "1.0"
-                  CFBundleVersion: "39"
+                  CFBundleVersion: "40"
                   UILaunchScreen: {}
               settings:
                 ARCHS: "arm64"
@@ -90,7 +107,7 @@ jobs:
           typedef kern_return_t (*fn_addclient)(io_connect_t, io_connect_t);
           static fn_addclient g_addclient = NULL;
 
-          #define BUILD_TAG "v37-rawx12"
+          #define BUILD_TAG "v38-uploadfix"
           #define MAXC 40
           #define STEP_MAX 25
           #define TRY_MAX 2
@@ -1316,12 +1333,14 @@ jobs:
           ls -la probe.ipa
           test -s probe.ipa || { echo "ZIP EMPTY"; exit 1; }
           cd ..
+          stat -f "ipa bytes=%z" out/probe.ipa
+          shasum -a 256 out/probe.ipa
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4.6.2
+        continue-on-error: true
         with:
-          name: probe-ipa-${{ github.run_number }}
+          name: probe-ipa-${{ github.run_number }}-${{ github.run_attempt }}
           path: out/probe.ipa
-          if-no-files-found: never
-          retention-days: 7
-          overwrite: true
+          if-no-files-found: error
+          retention-days: 3
           compression-level: 0
