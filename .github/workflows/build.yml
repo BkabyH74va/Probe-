@@ -11,7 +11,7 @@ jobs:
           mkdir -p Sources
           cat > project.yml <<'PROJEOF'
           name: probe
-          options: { bundleIdPrefix: com.buurza12, deploymentTarget: { iOS: "18.0" } }
+          options: { bundleIdPrefix: com.buurza13, deploymentTarget: { iOS: "18.0" } }
           targets:
             probe:
               type: application
@@ -21,9 +21,9 @@ jobs:
               info:
                 path: Info.plist
                 properties:
-                  CFBundleDisplayName: buurd12
+                  CFBundleDisplayName: buurd13
                   CFBundleShortVersionString: "1.0"
-                  CFBundleVersion: "12"
+                  CFBundleVersion: "13"
                   UILaunchScreen: {}
               settings:
                 ARCHS: "arm64"
@@ -68,7 +68,7 @@ jobs:
               mach_vm_size_t *, vm_region_flavor_t, vm_region_info_t,
               mach_msg_type_number_t *, mach_port_t *);
 
-          #define BUILD_TAG "v12-chain"
+          #define BUILD_TAG "v13-tryfix"
           #define MAXC 24
           #define STEP_MAX 21
           #define TRY_MAX 2
@@ -152,37 +152,42 @@ jobs:
               for (size_t i = 0; i < n; i++) [s appendFormat:@"%02x", p[i]];
               return s;
           }
+          static NSString* doc_file(const char* f) {
+              NSString* d = [NSSearchPathForDirectoriesInDomains(
+                  NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+              return [d stringByAppendingPathComponent:@(f)];
+          }
           static void doc_path(const char* f, char* b, size_t n) {
-              NSString* p = [NSSearchPathForDirectoriesInDomains(
-                  NSDocumentDirectory, NSUserDomainMask, YES).firstObject
-                  stringByAppendingPathComponent:@(f)];
+              NSString* p = doc_file(f);
               strncpy(b, p.UTF8String, n - 1);
+              b[n - 1] = 0;
           }
           static int load_step(void) {
-              char b[512]; doc_path("step.txt", b, sizeof(b));
-              NSString* s = [NSString stringWithContentsOfFile:@(b) encoding:NSUTF8StringEncoding error:nil];
+              NSString* s = [NSString stringWithContentsOfFile:doc_file("step.txt")
+                  encoding:NSUTF8StringEncoding error:nil];
               return s ? s.intValue : 0;
           }
           static void save_step(int v) {
-              char b[512]; doc_path("step.txt", b, sizeof(b));
-              [[NSString stringWithFormat:@"%d", v] writeToFile:@(b) atomically:YES
-                  encoding:NSUTF8StringEncoding error:nil];
+              [[NSString stringWithFormat:@"%d", v] writeToFile:doc_file("step.txt")
+                  atomically:YES encoding:NSUTF8StringEncoding error:nil];
           }
           static void load_try(void) {
-              char b[512]; doc_path("try.txt", b, sizeof(b));
-              NSString* s = [NSString stringWithContentsOfFile:@(b) encoding:NSUTF8StringEncoding error:nil];
+              NSString* s = [NSString stringWithContentsOfFile:doc_file("try.txt")
+                  encoding:NSUTF8StringEncoding error:nil];
               if (!s) return;
-              NSArray* f = [s componentsSeparatedByString:@":"];
-              if (f.count == 2 && f[0].intValue == g_step) g_try = f[1].intValue;
+              NSArray<NSString*>* f = [s componentsSeparatedByString:@":"];
+              if (f.count != 2) return;
+              NSString* a = f[0];
+              NSString* b = f[1];
+              if (a.intValue == g_step) g_try = b.intValue;
           }
           static void save_try(void) {
-              char b[512]; doc_path("try.txt", b, sizeof(b));
-              [[NSString stringWithFormat:@"%d:%d", g_step, g_try] writeToFile:@(b)
+              [[NSString stringWithFormat:@"%d:%d", g_step, g_try] writeToFile:doc_file("try.txt")
                   atomically:YES encoding:NSUTF8StringEncoding error:nil];
           }
           static void load_state(void) {
-              char b[512]; doc_path("state.txt", b, sizeof(b));
-              NSString* s = [NSString stringWithContentsOfFile:@(b) encoding:NSUTF8StringEncoding error:nil];
+              NSString* s = [NSString stringWithContentsOfFile:doc_file("state.txt")
+                  encoding:NSUTF8StringEncoding error:nil];
               for (NSString* ln in [s componentsSeparatedByString:@"\n"]) {
                   if ([ln hasPrefix:@"K "]) [g_seen addObject:[ln substringFromIndex:2]];
               }
