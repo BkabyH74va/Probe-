@@ -11,7 +11,7 @@ jobs:
           mkdir -p Sources
           cat > project.yml <<'PROJEOF'
           name: probe
-          options: { bundleIdPrefix: com.buurza18, deploymentTarget: { iOS: "18.0" } }
+          options: { bundleIdPrefix: com.buurza19, deploymentTarget: { iOS: "18.0" } }
           targets:
             probe:
               type: application
@@ -21,9 +21,9 @@ jobs:
               info:
                 path: Info.plist
                 properties:
-                  CFBundleDisplayName: buurd18
+                  CFBundleDisplayName: buurd19
                   CFBundleShortVersionString: "1.0"
-                  CFBundleVersion: "18"
+                  CFBundleVersion: "19"
                   UILaunchScreen: {}
               settings:
                 ARCHS: "arm64"
@@ -76,12 +76,14 @@ jobs:
           typedef SecTaskRef (*fn_create)(CFAllocatorRef);
           typedef CFTypeRef (*fn_copy)(SecTaskRef, CFStringRef, CFErrorRef*);
 
-          #define BUILD_TAG "v18-ent"
+          #define BUILD_TAG "v19-shape"
           #define MAXC 96
-          #define STEP_MAX 12
+          #define STEP_MAX 15
           #define TRY_MAX 2
           #define MAXCHILD 8
           #define TYPE_MAX 7
+          #define NSIZE 12
+          #define NPAT 5
 
           static UITextView* g_tv;
           static UILabel* g_hb;
@@ -105,10 +107,12 @@ jobs:
           static int g_node[MAXC];
           static int g_nconn = 0;
 
+          static const size_t SIZES[NSIZE] = {0,4,8,16,32,64,128,256,512,1024,2048,4096};
+
           static const char* STEP_NAME[STEP_MAX + 1] = {
-              "boot", "census", "entitlements", "vt-init", "vt-encode",
-              "dump-tree", "child-open", "root-open", "oracle-root",
-              "oracle-child", "s4-iso", "single-conn", "map64-0-7"
+              "boot", "census", "sig-blob", "match-uc", "vt-init", "vt-encode",
+              "dump-tree", "child-open", "root-open", "oracle", "m4-struct",
+              "m4-scalar", "m4-mixed", "map64-0-7", "map32-0-7", "post-4-5"
           };
 
           static void ui(NSString* s) {
@@ -254,6 +258,37 @@ jobs:
               return kr;
           }
 
+          static kern_return_t callmix(const char* tag, int ci, uint32_t sel,
+                                       const uint64_t* sc, uint32_t scn,
+                                       const uint8_t* in, size_t sz, size_t outsz) {
+              if (ci < 0) ci = 0;
+              int nd = g_node[ci];
+              NSString* key = [NSString stringWithFormat:@"x%d:%u:%u:%zu:%zu:%s", nd, scn, sel, sz, outsz, tag];
+              if (seen_key(key)) return (kern_return_t)0xdeadbeef;
+              bread(tag);
+              uint8_t out[4096]; size_t oSz = outsz;
+              uint64_t os[8]; uint32_t ocn = 8;
+              memset(out, 0xCC, sizeof(out));
+              kern_return_t kr = IOConnectCallMethod(g_conn[ci], sel, sc, scn, in, sz,
+                                                     outsz ? os : NULL, outsz ? &ocn : NULL,
+                                                     outsz ? out : NULL, outsz ? &oSz : NULL);
+              __sync_fetch_and_add(&g_done, 1);
+              if (kr == KERN_SUCCESS) {
+                  persist([NSString stringWithFormat:@"OKX %s s%u n%d sc=%u sz=%zu oc=%u o=%zu %@",
+                           tag, sel, nd, scn, sz, ocn, oSz, hex(out, oSz)]);
+                  __sync_fetch_and_add(&g_hits, 1);
+                  ui([NSString stringWithFormat:@"!!! OKX %s sc=%u sz=%zu o=%zu %@", tag, scn, sz, oSz, hex(out, oSz)]);
+              } else {
+                  persist([NSString stringWithFormat:@"X %u %u %zu %@ | %s", scn, sel, sz, kr_name(kr), tag]);
+                  if (kr != 0xe00002c2 && kr != 0xe00002cc) {
+                      __sync_fetch_and_add(&g_hits, 1);
+                      ui([NSString stringWithFormat:@"!! %s sc=%u sz=%zu -> %@", tag, scn, sz, kr_name(kr)]);
+                  }
+              }
+              usleep(300);
+              return kr;
+          }
+
           static int find_root(void) {
               io_iterator_t it = 0;
               if (IOServiceGetMatchingServices(kIOMainPortDefault,
@@ -276,15 +311,18 @@ jobs:
               }
               NSMutableSet* seen = [NSMutableSet set];
               io_object_t o; int n = 0, jpeg = 0;
-              while ((o = IOIteratorNext(it)) && n < 500) {
+              while ((o = IOIteratorNext(it)) && n < 4000) {
                   n++;
                   io_name_t cls; IOObjectGetClass(o, cls);
                   NSString* s = @(cls);
                   if ([s rangeOfString:@"JPEG"].location != NSNotFound ||
-                      [s rangeOfString:@"jpeg"].location != NSNotFound) {
+                      [s rangeOfString:@"jpeg"].location != NSNotFound ||
+                      [s rangeOfString:@"ISP"].location != NSNotFound ||
+                      [s rangeOfString:@"Codec"].location != NSNotFound ||
+                      [s rangeOfString:@"Video"].location != NSNotFound ||
+                      [s rangeOfString:@"Cam"].location != NSNotFound) {
                       jpeg++;
-                      persist([NSString stringWithFormat:@"JPEGNODE %s", cls]);
-                      ui([NSString stringWithFormat:@"JPEGNODE %s", cls]);
+                      persist([NSString stringWithFormat:@"HIT %s", cls]);
                   }
                   if (![seen containsObject:s]) {
                       [seen addObject:s];
@@ -293,9 +331,9 @@ jobs:
                   IOObjectRelease(o);
               }
               IOObjectRelease(it);
-              persist([NSString stringWithFormat:@"census nodes=%d cls=%lu jpeg=%d",
+              persist([NSString stringWithFormat:@"census nodes=%d cls=%lu hit=%d",
                        n, (unsigned long)seen.count, jpeg]);
-              ui([NSString stringWithFormat:@"census=%d cls=%lu jpeg=%d",
+              ui([NSString stringWithFormat:@"census=%d cls=%lu hit=%d",
                   n, (unsigned long)seen.count, jpeg]);
           }
 
@@ -304,7 +342,7 @@ jobs:
               char* buf = malloc(sz);
               if (!buf) return;
               memset(buf, 0, sz);
-              int brc = csops(getpid(), 5, buf, sz);
+              int brc = csops(getpid(), 7, buf, sz);
               persist([NSString stringWithFormat:@"BLOB rc=%d", brc]);
               ui([NSString stringWithFormat:@"BLOB rc=%d", brc]);
               if (brc == 0) {
@@ -331,61 +369,80 @@ jobs:
               NSString* p = [[[NSBundle mainBundle] bundlePath]
                   stringByAppendingPathComponent:@"embedded.mobileprovision"];
               NSDictionary* a = [[NSFileManager defaultManager] attributesOfItemAtPath:p error:nil];
-              if (!a) { persist(@"PROV none"); ui(@"PROV none"); return; }
-              persist([NSString stringWithFormat:@"PROV size=%llu",
-                       [a fileSize]]);
-              ui([NSString stringWithFormat:@"PROV size=%llu", [a fileSize]]);
-              NSData* d = [NSData dataWithContentsOfFile:p];
-              if (d && d.length > 512) {
-                  NSString* t = [[NSString alloc] initWithData:[d subdataWithRange:NSMakeRange(0, 512)]
-                      encoding:NSUTF8StringEncoding];
-                  if (t) persist(t);
+              if (!a) { persist(@"PROV none"); ui(@"PROV none"); }
+              else {
+                  persist([NSString stringWithFormat:@"PROV size=%llu", [a fileSize]]);
+                  ui([NSString stringWithFormat:@"PROV size=%llu", [a fileSize]]);
               }
+              NSString* cr = [[[NSBundle mainBundle] bundlePath]
+                  stringByAppendingPathComponent:@"_CodeSignature/CodeResources"];
+              persist([NSString stringWithFormat:@"CODESIG=%d",
+                       [[NSFileManager defaultManager] fileExistsAtPath:cr] ? 1 : 0]);
           }
 
-          static void self_sign(void) {
+          static void dump_sig(void) {
               unsigned int fl = 0;
               int rc = csops(getpid(), 0, &fl, sizeof(fl));
-              persist([NSString stringWithFormat:@"csops rc=%d f=0x%x valid=%d plat=%d dbg=%d gta=%d",
-                       rc, fl, (fl & 1) ? 1 : 0, (fl & 0x04000000) ? 1 : 0,
-                       (fl & 0x10000000) ? 1 : 0, (fl & 4) ? 1 : 0]);
+              persist([NSString stringWithFormat:
+                       @"csops rc=%d f=0x%x valid=%d gta=%d hard=%d kill=%d enf=%d lv=%d rt=%d dpl=%d plat=%d dbg=%d",
+                       rc, fl, (fl & 1) ? 1 : 0, (fl & 4) ? 1 : 0, (fl & 0x100) ? 1 : 0,
+                       (fl & 0x200) ? 1 : 0, (fl & 0x1000) ? 1 : 0, (fl & 0x2000) ? 1 : 0,
+                       (fl & 0x10000) ? 1 : 0, (fl & 0x2000000) ? 1 : 0,
+                       (fl & 0x4000000) ? 1 : 0, (fl & 0x10000000) ? 1 : 0]);
               ui([NSString stringWithFormat:@"csops rc=%d f=0x%x plat=%d",
-                  rc, fl, (fl & 0x04000000) ? 1 : 0]);
+                  rc, fl, (fl & 0x4000000) ? 1 : 0]);
+
+              char path[1024]; memset(path, 0, sizeof(path));
+              int r1 = csops(getpid(), 4, path, sizeof(path));
+              persist([NSString stringWithFormat:@"PIDPATH rc=%d %s", r1, r1 == 0 ? path : "-"]);
+
+              uint8_t cd[20]; memset(cd, 0, sizeof(cd));
+              int r2 = csops(getpid(), 5, cd, sizeof(cd));
+              persist([NSString stringWithFormat:@"CDHASH rc=%d %@", r2, hex(cd, 20)]);
+              ui([NSString stringWithFormat:@"CDHASH rc=%d %@", r2, hex(cd, 20)]);
 
               dump_blob();
               dump_prov();
 
               fn_create create = (fn_create)dlsym(RTLD_DEFAULT, "SecTaskCreateFromSelf");
               fn_copy copy = (fn_copy)dlsym(RTLD_DEFAULT, "SecTaskCopyValueForEntitlement");
-              persist([NSString stringWithFormat:@"SYM create=%d copy=%d",
-                       create ? 1 : 0, copy ? 1 : 0]);
-              ui([NSString stringWithFormat:@"SYM c=%d v=%d", create ? 1 : 0, copy ? 1 : 0]);
               if (!create || !copy) { persist(@"sectask unavailable"); return; }
-
               SecTaskRef t = create(kCFAllocatorDefault);
-              if (!t) { persist(@"no sectask"); ui(@"no sectask"); return; }
+              if (!t) { persist(@"no sectask"); return; }
               CFTypeRef d = copy(t, NULL, NULL);
               if (d && CFGetTypeID(d) == CFDictionaryGetTypeID()) {
                   CFIndex n = CFDictionaryGetCount((CFDictionaryRef)d);
                   persist([NSString stringWithFormat:@"ENT count=%ld", (long)n]);
                   ui([NSString stringWithFormat:@"ENT count=%ld", (long)n]);
-                  CFStringRef keys[64];
-                  CFIndex k = n > 64 ? 64 : n;
-                  CFDictionaryGetKeysAndValues((CFDictionaryRef)d, (const void**)keys, NULL);
-                  for (CFIndex i = 0; i < k; i++)
-                      persist([NSString stringWithFormat:@"  E %@", (__bridge NSString*)keys[i]]);
               } else { persist(@"ENT none"); ui(@"ENT none"); }
               if (d) CFRelease(d);
-
-              const char* probe[3] = {"platform-application", "get-task-allow",
-                                      "com.apple.private.security.no-container"};
-              for (int i = 0; i < 3; i++) {
-                  CFTypeRef v = copy(t, (__bridge CFStringRef)@(probe[i]), NULL);
-                  persist([NSString stringWithFormat:@"CHK %s=%s", probe[i], v ? "YES" : "NO"]);
-                  ui([NSString stringWithFormat:@"CHK %s=%s", probe[i], v ? "YES" : "NO"]);
-                  if (v) CFRelease(v);
-              }
               CFRelease(t);
+          }
+
+          static void match_uc(void) {
+              io_iterator_t it = 0;
+              if (IOServiceGetMatchingServices(kIOMainPortDefault,
+                      IOServiceMatching("AppleJPEGDriverUserClient"), &it) != KERN_SUCCESS) {
+                  ui(@"no uc match"); return;
+              }
+              io_object_t o; int n = 0, got = 0;
+              while ((o = IOIteratorNext(it)) && n < 16) {
+                  n++;
+                  io_connect_t c = 0;
+                  kern_return_t kr = IOServiceOpen(o, mach_task_self(), 0, &c);
+                  persist([NSString stringWithFormat:@"uc %d open=%@", n, kr_name(kr)]);
+                  ui([NSString stringWithFormat:@"uc %d -> %@", n, kr_name(kr)]);
+                  if (kr == KERN_SUCCESS) {
+                      got++;
+                      if (g_nconn < MAXC) {
+                          g_conn[g_nconn] = c; g_ctype[g_nconn] = 0; g_node[g_nconn] = 100 + n;
+                          g_nconn++;
+                      }
+                  }
+                  IOObjectRelease(o);
+              }
+              IOObjectRelease(it);
+              persist([NSString stringWithFormat:@"uc nodes=%d got=%d", n, got]);
           }
 
           static void dump_node(io_object_t o, int node) {
@@ -459,7 +516,7 @@ jobs:
               return (int)st;
           }
 
-          static void sel_oracle(int ci) {
+          static void oracle(int ci) {
               if (ci < 0) ci = 0;
               NSMutableString* line = [NSMutableString string];
               for (uint32_t s = 0; s <= 31; s++) {
@@ -473,48 +530,69 @@ jobs:
               ui([NSString stringWithFormat:@"ORACLE n%d %@", g_node[ci], line]);
           }
 
-          static void s_zero(uint32_t sel) {
-              uint8_t* in = calloc(1, 4096);
-              char tg[32]; snprintf(tg, sizeof(tg), "z%u", sel);
-              callp(tg, g_open_idx, sel, in, 4096, 4096, YES);
-              free(in);
+          static void fill_pat(uint8_t* in, size_t sz, int pat) {
+              switch (pat) {
+                  case 0: break;
+                  case 1: memset(in, 0xFF, sz); break;
+                  case 2: if (sz >= 8) { memcpy(in, "\x80\x07\x00\x00\x38\x04\x00\x00", 8); } break;
+                  case 3: for (size_t i = 0; i + 4 <= sz; i += 4) { uint32_t o = 1; memcpy(in + i, &o, 4); } break;
+                  case 4: if (sz >= 12) { uint32_t a = 1, b = 1920, c = 1080;
+                              memcpy(in, &a, 4); memcpy(in + 4, &b, 4); memcpy(in + 8, &c, 4); } break;
+              }
           }
 
-          static void single_conn(void) {
-              for (int i = 0; i < g_nconn; i++) IOServiceClose(g_conn[i]);
-              g_nconn = 0; g_open_idx = -1;
-              io_connect_t c = 0;
-              kern_return_t kr = IOServiceOpen(g_root, mach_task_self(), 0, &c);
-              persist([NSString stringWithFormat:@"single open=%@", kr_name(kr)]);
-              if (kr != KERN_SUCCESS) { ui(@"single open FAIL"); return; }
-              g_conn[0] = c; g_ctype[0] = 0; g_node[0] = 0; g_nconn = 1;
-              uint8_t* in = calloc(1, 4096);
-              kern_return_t a = callp("s5-one", 0, 5, in, 4096, 4096, YES);
-              kern_return_t b = callp("s4-one", 0, 4, in, 4096, 4096, YES);
-              free(in);
-              ui([NSString stringWithFormat:@"single s5=%@ s4=%@", kr_name(a), kr_name(b)]);
-              persist([NSString stringWithFormat:@"single s5=%@ s4=%@", kr_name(a), kr_name(b)]);
+          static void m4_struct(int ci) {
+              if (ci < 0) return;
+              for (int si = 0; si < NSIZE; si++) {
+                  for (int p = 0; p < NPAT; p++) {
+                      for (int oz = 0; oz < 2; oz++) {
+                          uint8_t* in = calloc(1, 4096);
+                          fill_pat(in, SIZES[si], p);
+                          char tg[48]; snprintf(tg, sizeof(tg), "m4.%zu.%d.%d", SIZES[si], p, oz);
+                          callp(tg, ci, 4, in, SIZES[si], oz ? 4096 : 0, YES);
+                          free(in);
+                      }
+                  }
+              }
           }
 
-          static size_t map_extent(mach_vm_address_t addr, mach_vm_size_t claim, BOOL* wr) {
-              *wr = NO;
-              mach_vm_address_t q = addr; mach_vm_size_t qsz = 0;
-              vm_region_basic_info_data_64_t info;
-              mach_port_t obj = MACH_PORT_NULL;
-              mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
-              kern_return_t r = mach_vm_region(mach_task_self(), &q, &qsz, VM_REGION_BASIC_INFO_64,
-                                               (vm_region_info_t)&info, &cnt, &obj);
-              if (obj != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), obj);
-              if (r != KERN_SUCCESS) return 0;
-              *wr = (info.protection & VM_PROT_WRITE) != 0;
-              size_t real = (size_t)qsz;
-              if (real > (size_t)claim) real = (size_t)claim;
-              if (real > (1u << 20)) real = 1u << 20;
-              return real;
+          static void m4_scalar(int ci) {
+              if (ci < 0) return;
+              uint64_t vals[4] = {0, 1920, 1080, 1};
+              for (uint32_t n = 0; n <= 4; n++) {
+                  uint64_t in[8] = {0};
+                  for (uint32_t i = 0; i < n; i++) in[i] = vals[i % 4];
+                  char tg[32]; snprintf(tg, sizeof(tg), "sc4.%u", n);
+                  uint64_t out[8]; uint32_t oc = 8;
+                  bread(tg);
+                  kern_return_t kr = IOConnectCallScalarMethod(g_conn[ci], 4, in, n, out, &oc);
+                  __sync_fetch_and_add(&g_done, 1);
+                  persist([NSString stringWithFormat:@"scalar4 %u %@ oc=%u | %s", n, kr_name(kr), oc, tg]);
+                  if (kr == KERN_SUCCESS) {
+                      __sync_fetch_and_add(&g_hits, 1);
+                      ui([NSString stringWithFormat:@"!!! %s OK oc=%u v0=%llu", tg, oc, oc ? out[0] : 0]);
+                  } else ui([NSString stringWithFormat:@"%s -> %@", tg, kr_name(kr)]);
+                  usleep(300);
+              }
+          }
+
+          static void m4_mixed(int ci) {
+              if (ci < 0) return;
+              uint64_t sets[3][2] = {{1, 0}, {1920, 1080}, {0, 0}};
+              for (int k = 0; k < 3; k++) {
+                  for (int si = 0; si < 5; si++) {
+                      uint8_t* in = calloc(1, 4096);
+                      fill_pat(in, SIZES[si], k);
+                      char tg[40]; snprintf(tg, sizeof(tg), "mx.%d.%zu", k, SIZES[si]);
+                      callmix(tg, ci, 4, sets[k], 2, in, SIZES[si], 4096);
+                      free(in);
+                  }
+              }
           }
 
           static void mm_range64(uint32_t lo, uint32_t hi) {
-              int ci = g_open_idx < 0 ? 0 : g_open_idx;
+              int ci = g_nconn ? 0 : -1;
+              if (ci < 0) return;
               for (uint32_t mt = lo; mt <= hi; mt++) {
                   char tg[32]; snprintf(tg, sizeof(tg), "m64.%u", mt);
                   bread(tg);
@@ -524,38 +602,71 @@ jobs:
                   persist([NSString stringWithFormat:@"map64 %u %@ %llu | %s", mt, kr_name(kr), size, tg]);
                   if (kr != KERN_SUCCESS) { ui([NSString stringWithFormat:@"%s -> %@", tg, kr_name(kr)]); continue; }
                   __sync_fetch_and_add(&g_hits, 1);
-                  BOOL wr = NO; size_t ext = map_extent(addr, size, &wr);
-                  ui([NSString stringWithFormat:@"!!! %s claim=%llu real=%zu wr=%d", tg, size, ext, (int)wr]);
+                  ui([NSString stringWithFormat:@"!!! %s claim=%llu", tg, size]);
                   IOConnectUnmapMemory64(g_conn[ci], mt, mach_task_self(), addr);
               }
+          }
+
+          static void mm_range32(uint32_t lo, uint32_t hi) {
+              int ci = g_nconn ? 0 : -1;
+              if (ci < 0) return;
+              for (uint32_t mt = lo; mt <= hi; mt++) {
+                  char tg[32]; snprintf(tg, sizeof(tg), "m32.%u", mt);
+                  bread(tg);
+                  vm_address_t addr = 0; vm_size_t size = 0;
+                  kern_return_t kr = IOConnectMapMemory(g_conn[ci], mt, mach_task_self(),
+                                                        &addr, &size, kIOMapAnywhere);
+                  persist([NSString stringWithFormat:@"map32 %u %@ %lu | %s", mt, kr_name(kr),
+                           (unsigned long)size, tg]);
+                  if (kr != KERN_SUCCESS) { ui([NSString stringWithFormat:@"%s -> %@", tg, kr_name(kr)]); continue; }
+                  __sync_fetch_and_add(&g_hits, 1);
+                  ui([NSString stringWithFormat:@"!!! %s claim=%lu", tg, (unsigned long)size]);
+                  IOConnectUnmapMemory(g_conn[ci], mt, mach_task_self(), addr);
+              }
+          }
+
+          static void post_45(void) {
+              if (!g_nconn) return;
+              uint8_t* in = calloc(1, 4096);
+              kern_return_t a = callp("q4", 0, 4, in, 0, 0, YES);
+              kern_return_t b = callp("q5", 0, 5, in, 0, 0, YES);
+              kern_return_t c = callp("q4b", 0, 4, in, 0, 0, YES);
+              free(in);
+              persist([NSString stringWithFormat:@"post 4=%@ 5=%@ 4b=%@",
+                       kr_name(a), kr_name(b), kr_name(c)]);
+              ui([NSString stringWithFormat:@"post 4=%@ 5=%@ 4b=%@",
+                  kr_name(a), kr_name(b), kr_name(c)]);
           }
 
           static void do_step(int s) {
               switch (s) {
                   case 0: break;
                   case 1: census(); break;
-                  case 2: self_sign(); break;
-                  case 3: vt_start(); break;
-                  case 4: ui([NSString stringWithFormat:@"vt=%d done=%d", (int)vt_encode(), g_vt_done]); break;
-                  case 5: dump_tree(); break;
-                  case 6:
+                  case 2: dump_sig(); break;
+                  case 3: match_uc(); break;
+                  case 4: vt_start(); break;
+                  case 5: ui([NSString stringWithFormat:@"vt=%d done=%d", (int)vt_encode(), g_vt_done]); break;
+                  case 6: dump_tree(); break;
+                  case 7:
                       for (int i = 1; i <= g_nchild; i++) {
                           int got = probe_open(g_child[i], i, TYPE_MAX);
                           persist([NSString stringWithFormat:@"child %d got=%d", i, got]);
                           ui([NSString stringWithFormat:@"child %d got=%d", i, got]);
                       }
                       break;
-                  case 7: {
+                  case 8: {
                       int got = probe_open(g_root, 0, TYPE_MAX);
                       persist([NSString stringWithFormat:@"root got=%d", got]);
                       ui([NSString stringWithFormat:@"root got=%d", got]);
                       break;
                   }
-                  case 8: if (g_nconn) sel_oracle(0); else ui(@"no conn"); break;
-                  case 9: if (g_nconn > 1) sel_oracle(g_nconn - 1); else ui(@"no child conn"); break;
-                  case 10: if (g_nconn) s_zero(4); else ui(@"no conn"); break;
-                  case 11: single_conn(); break;
-                  case 12: if (g_nconn) mm_range64(0, 7); else ui(@"no conn"); break;
+                  case 9: if (g_nconn) oracle(0); else ui(@"no conn"); break;
+                  case 10: m4_struct(0); break;
+                  case 11: m4_scalar(0); break;
+                  case 12: m4_mixed(0); break;
+                  case 13: mm_range64(0, 7); break;
+                  case 14: mm_range32(0, 7); break;
+                  case 15: post_45(); break;
               }
           }
 
