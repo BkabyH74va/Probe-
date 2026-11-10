@@ -18,6 +18,13 @@ jobs:
               platform: iOS
               sources: [Sources]
               entitlements: { path: probe.entitlements }
+              info:
+                path: Sources/Info.plist
+                properties:
+                  CFBundleDisplayName: buurd
+                  CFBundleShortVersionString: "1.0"
+                  CFBundleVersion: "1"
+                  UILaunchScreen: {}
               settings:
                 ARCHS: "arm64e arm64"
                 SUPPORTED_PLATFORMS: "iphoneos"
