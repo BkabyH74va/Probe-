@@ -11,7 +11,7 @@ jobs:
           mkdir -p Sources
           cat > project.yml <<'PROJEOF'
           name: probe
-          options: { bundleIdPrefix: com.buurza33, deploymentTarget: { iOS: "18.0" } }
+          options: { bundleIdPrefix: com.buurza34, deploymentTarget: { iOS: "18.0" } }
           targets:
             probe:
               type: application
@@ -21,9 +21,9 @@ jobs:
               info:
                 path: Info.plist
                 properties:
-                  CFBundleDisplayName: buurd33
+                  CFBundleDisplayName: buurd34
                   CFBundleShortVersionString: "1.0"
-                  CFBundleVersion: "35"
+                  CFBundleVersion: "36"
                   UILaunchScreen: {}
               settings:
                 ARCHS: "arm64"
@@ -74,6 +74,7 @@ jobs:
           #include <string.h>
           #include <stdio.h>
           #include <stdarg.h>
+          #include <stdint.h>
           #include <dlfcn.h>
           #include <sys/utsname.h>
           #include <sys/sysctl.h>
@@ -84,7 +85,7 @@ jobs:
           typedef kern_return_t (*fn_addclient)(io_connect_t, io_connect_t);
           static fn_addclient g_addclient = NULL;
 
-          #define BUILD_TAG "v33-cliff"
+          #define BUILD_TAG "v34-nodename"
           #define MAXC 40
           #define STEP_MAX 26
           #define TRY_MAX 2
@@ -419,6 +420,7 @@ jobs:
 
           static void sysctl_str(const char* key) {
               char b[128]; size_t n = sizeof(b);
+              memset(b, 0, sizeof(b));
               if (sysctlbyname(key, b, &n, NULL, 0) != 0) {
                   plog(@"DEV %s = <err>", key);
                   ulog(@"DEV %s = <err>", key);
@@ -431,9 +433,14 @@ jobs:
 
           static void dev_info(void) {
               struct utsname u;
+              memset(&u, 0, sizeof(u));
               if (uname(&u) == 0) {
-                  plog(@"DEV uname sys=%s node=%s rel=%s ver=%s mach=%s", u.sysname, u.node, u.release, u.version, u.machine);
+                  plog(@"DEV uname sys=%s nodename=%s rel=%s ver=%s mach=%s",
+                       u.sysname, u.nodename, u.release, u.version, u.machine);
                   ulog(@"DEV uname %s %s", u.machine, u.release);
+              } else {
+                  plog(@"DEV uname <err>");
+                  ulog(@"DEV uname <err>");
               }
               sysctl_str("hw.machine");
               sysctl_str("hw.model");
