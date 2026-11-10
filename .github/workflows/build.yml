@@ -11,7 +11,7 @@ jobs:
           mkdir -p Sources
           cat > project.yml <<'PROJEOF'
           name: probe
-          options: { bundleIdPrefix: com.buurza10, deploymentTarget: { iOS: "18.0" } }
+          options: { bundleIdPrefix: com.buurza11, deploymentTarget: { iOS: "18.0" } }
           targets:
             probe:
               type: application
@@ -21,9 +21,9 @@ jobs:
               info:
                 path: Info.plist
                 properties:
-                  CFBundleDisplayName: buurd10
+                  CFBundleDisplayName: buurd11
                   CFBundleShortVersionString: "1.0"
-                  CFBundleVersion: "10"
+                  CFBundleVersion: "11"
                   UILaunchScreen: {}
               settings:
                 ARCHS: "arm64"
@@ -55,7 +55,7 @@ jobs:
           #import <IOKit/IOKitLib.h>
           #import <VideoToolbox/VideoToolbox.h>
           #import <mach/mach.h>
-          #import <mach/mach_vm.h>
+          #import <mach/vm_region.h>
           #include <unistd.h>
           #include <fcntl.h>
           #include <signal.h>
@@ -64,7 +64,11 @@ jobs:
           #include <string.h>
           #include <stdio.h>
 
-          #define BUILD_TAG "v10-hdr"
+          extern kern_return_t mach_vm_region(vm_map_t, mach_vm_address_t *,
+              mach_vm_size_t *, vm_region_flavor_t, vm_region_info_t,
+              mach_msg_type_number_t *, mach_port_t *);
+
+          #define BUILD_TAG "v11-vmreg"
           #define MAXC 24
           #define STEP_MAX 21
 
@@ -452,7 +456,7 @@ jobs:
         run: |
           set +e
           xcrun -sdk iphoneos clang -fsyntax-only -x objective-c \
-            -arch arm64 -miphoneos-version-min=18.0 \
+            -target arm64-apple-ios18.0 \
             -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" \
             -Wno-implicit-function-declaration \
             Sources/main.m > s.log 2>&1
