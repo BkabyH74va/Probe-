@@ -2,12 +2,27 @@
 #import <IOKit/IOKitLib.h>
 #import <VideoToolbox/VideoToolbox.h>
 #import <mach/mach.h>
+#import <mach/mach_vm.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <pthread.h>
 
+// ===== PRZELACZNIKI FAZ =====
+#define PH_MEMMAP 1
+#define PH_CMD    1
+#define PH_HMAP   1
+#define PH_INV    1
+#define PH_MIX    1
+#define PH_FUZZ   1
+// ============================
+
+#define USE_CONNS 8
+#define UI_LINES  250
+
 static UITextView* g_tv;
 static UILabel* g_hb;
+static NSMutableArray* g_lines;
+static NSString* g_phase = @"idle";
 static volatile int g_hits = 0, g_done = 0;
 static int g_fd = -1;
 static NSMutableSet* g_seen;
@@ -20,9 +35,16 @@ static int g_nconn = 0;
 
 static void ui(NSString* s) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        g_tv.text = [g_tv.text stringByAppendingFormat:@"\n%@", s];
-        [g_tv scrollRangeToVisible:NSMakeRange(g_tv.text.length, 0)];
+        [g_lines addObject:s];
+        if (g_lines.count > UI_LINES) {
+            [g_lines removeObjectsInRange:NSMakeRange(0, 50)];
+        }
     });
+}
+static void flush_ui(void) {
+    g_tv.text = [g_lines componentsJoinedByString:@"\n"];
+    if (g_lines.count)
+        [g_tv scrollRangeToVisible:NSMakeRange(g_tv.text.length, 0)];
 }
 static void persist(NSString* s) {
     if (g_fd < 0) return;
@@ -30,6 +52,11 @@ static void persist(NSString* s) {
     pthread_mutex_lock(&g_lk);
     write(g_fd, d.bytes, d.length);
     pthread_mutex_unlock(&g_lk);
+}
+static void phase(NSString* p) {
+    g_phase = p;
+    persist([NSString stringWithFormat:@"=== PHASE %@ calls=%d hits=%d", p, g_done, g_hits]);
+    ui([NSString stringWithFormat:@"=== %@", p]);
 }
 static NSString* kr_name(kern_return_t kr) {
     switch (kr) {
@@ -103,7 +130,7 @@ static kern_return_t callp(const char* tag, io_connect_t c, uint32_t t, uint32_t
         if (always) ui([NSString stringWithFormat:@"%s t%u s%u -> %@",
                         tag, t, sel, kr_name(kr)]);
     }
-    usleep(200);
+    usleep(300);
     return kr;
 }
 
@@ -122,10 +149,16 @@ static void cmd_hunt(io_connect_t c, uint32_t t, uint32_t sel) {
     ui([NSString stringWithFormat:@"cmd_hunt s%u done", sel]);
 }
 
+static int shard_n(void) {
+    int n = g_nconn < USE_CONNS ? g_nconn : USE_CONNS;
+    return n < 1 ? 1 : n;
+}
+
 static void par_hmap(io_connect_t c, uint32_t t, uint32_t sel) {
+    int sh = shard_n();
     dispatch_group_t g = dispatch_group_create();
-    int lo = 128, hi = 4095, span = (hi - lo) / g_nconn + 1;
-    for (int n = 0; n < g_nconn; n++) {
+    int lo = 128, hi = 4095, span = (hi - lo) / sh + 1;
+    for (int n = 0; n < sh; n++) {
         dispatch_group_async(g, dispatch_get_global_queue(0,0), ^{
             int a = lo + n * span, b = a + span; if (b > hi + 1) b = hi + 1;
             uint8_t* in = calloc(1, 4096);
@@ -143,9 +176,10 @@ static void par_hmap(io_connect_t c, uint32_t t, uint32_t sel) {
 }
 
 static void par_imap(io_connect_t c, uint32_t t, uint32_t sel) {
+    int sh = shard_n();
     dispatch_group_t g = dispatch_group_create();
-    int lo = 0, hi = 511, span = (hi - lo) / g_nconn + 1;
-    for (int n = 0; n < g_nconn; n++) {
+    int lo = 0, hi = 511, span = (hi - lo) / sh + 1;
+    for (int n = 0; n < sh; n++) {
         dispatch_group_async(g, dispatch_get_global_queue(0,0), ^{
             int a = lo + n * span, b = a + span; if (b > hi + 1) b = hi + 1;
             uint8_t* in = malloc(4096);
@@ -217,6 +251,25 @@ static void open_all(void) {
     IOObjectRelease(it);
 }
 
+// sprawdza realny zasieg mapy zanim cokolwiek dotknie
+static size_t map_extent(mach_vm_address_t addr, mach_vm_size_t claim, BOOL* writable) {
+    *writable = NO;
+    mach_vm_address_t q = addr;
+    mach_vm_size_t qsz = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_port_t obj = MACH_PORT_NULL;
+    mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+    kern_return_t r = mach_vm_region(mach_task_self(), &q, &qsz, VM_REGION_BASIC_INFO_64,
+                                     (vm_region_info_t)&info, &cnt, &obj);
+    if (obj != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), obj);
+    if (r != KERN_SUCCESS) return 0;
+    *writable = (info.protection & VM_PROT_WRITE) != 0;
+    size_t real = (size_t)qsz;
+    if (real > (size_t)claim) real = (size_t)claim;
+    if (real > (16u << 20)) real = 16u << 20;
+    return real;
+}
+
 static void memmap_sweep(io_connect_t c, uint32_t t) {
     for (uint32_t mt = 0; mt < 32; mt++) {
         mach_vm_address_t addr = 0;
@@ -231,16 +284,21 @@ static void memmap_sweep(io_connect_t c, uint32_t t) {
             continue;
         }
         __sync_fetch_and_add(&g_hits, 1);
-        ui([NSString stringWithFormat:@"!!! %s MAPPED size=%llu @%llx", tg, size, addr]);
 
-        if (size >= 64) {
+        BOOL wr = NO;
+        size_t ext = map_extent(addr, size, &wr);
+        ui([NSString stringWithFormat:@"!!! %s MAPPED claim=%llu real=%zu wr=%d @%llx",
+            tg, size, ext, (int)wr, addr]);
+
+        if (ext >= 64 && wr) {
             uint8_t* p = (uint8_t*)addr;
-            size_t dump = size > 64 ? 64 : (size_t)size;
+            size_t dump = ext > 64 ? 64 : ext;
             NSMutableString* hx = [NSMutableString string];
             for (size_t i = 0; i < dump; i++) [hx appendFormat:@"%02x", p[i]];
             ui([NSString stringWithFormat:@"    pre %@", hx]);
 
-            memset(p, 0xFF, size > 4096 ? 4096 : (size_t)size);
+            size_t touch = ext > 4096 ? 4096 : ext;
+            memset(p, 0xFF, touch);
 
             uint8_t* in = calloc(1, 4096);
             callp("post_mm", c, t, 5, in, 4096, 4096, YES);
@@ -250,11 +308,10 @@ static void memmap_sweep(io_connect_t c, uint32_t t) {
             hx = [NSMutableString string];
             for (size_t i = 0; i < dump; i++) [hx appendFormat:@"%02x", p[i]];
             ui([NSString stringWithFormat:@"    post %@", hx]);
-
-            IOConnectUnmapMemory64(c, mt, mach_task_self(), addr);
-        } else {
-            IOConnectUnmapMemory64(c, mt, mach_task_self(), addr);
+        } else if (ext >= 64) {
+            ui(@"    read-only, skip memset");
         }
+        IOConnectUnmapMemory64(c, mt, mach_task_self(), addr);
     }
     ui(@"memmap_sweep done");
 }
@@ -264,6 +321,7 @@ static void run(void) {
     g_fd = open(b, O_CREAT | O_WRONLY | O_APPEND, 0644);
     g_seen = [NSMutableSet set];
     load_state();
+    phase(@"boot");
     ui([NSString stringWithFormat:@"resume=%lu", (unsigned long)g_seen.count]);
 
     VTCompressionSessionRef v = NULL;
@@ -272,39 +330,53 @@ static void run(void) {
     if (v) VTCompressionSessionPrepareToEncodeFrames(v);
     usleep(200000);
 
+    phase(@"open");
     open_all();
-    ui([NSString stringWithFormat:@"conns=%d", g_nconn]);
+    ui([NSString stringWithFormat:@"conns=%d shard=%d", g_nconn, shard_n()]);
     if (!g_nconn) return;
 
     io_connect_t c = g_conn[0]; uint32_t t = g_ctype[0];
 
-    ui(@"[M] memmap sweep");
+#if PH_MEMMAP
+    phase(@"memmap");
     memmap_sweep(g_conn[0], g_ctype[0]);
     if (g_nconn > 1) memmap_sweep(g_conn[1], g_ctype[1]);
+#endif
 
-    ui(@"[A] command id hunt s5");
+#if PH_CMD
+    phase(@"cmd5");
     cmd_hunt(c, t, 5);
-    ui(@"[A2] command id hunt s4");
+    phase(@"cmd4");
     cmd_hunt(c, t, 4);
+#endif
 
-    ui(@"[B] par hmap s5 128-4095");
+#if PH_HMAP
+    phase(@"hmap5");
     par_hmap(c, t, 5);
-    ui(@"[B2] par hmap s4 128-4095");
+    phase(@"hmap4");
     par_hmap(c, t, 4);
+#endif
 
-    ui(@"[C] par inverse s5");
+#if PH_INV
+    phase(@"inv5");
     par_imap(c, t, 5);
-    ui(@"[C2] par inverse s4");
+    phase(@"inv4");
     par_imap(c, t, 4);
+#endif
 
-    ui(@"[D] mixed ABI");
+#if PH_MIX
+    phase(@"mix");
     mixed(c, t, 5);
     mixed(c, t, 4);
+#endif
 
-    ui(@"[E] fuzz");
+#if PH_FUZZ
+    phase(@"fuzz");
     fuzz(c, t, 5, 400);
     fuzz(c, t, 4, 400);
+#endif
 
+    phase(@"done");
     ui([NSString stringWithFormat:@"FINISHED calls=%d hits=%d", g_done, g_hits]);
     close(g_fd); g_fd = -1;
 }
@@ -315,6 +387,9 @@ static void run(void) {
 
 @implementation AppDelegate
 - (BOOL)application:(UIApplication*)a didFinishLaunchingWithOptions:(NSDictionary*)o {
+    g_lines = [NSMutableArray array];
+
+    NSSetUncaughtExceptionHandler(NULL);
     self.w = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
     UIViewController* vc = [UIViewController new];
     vc.view.backgroundColor = UIColor.blackColor;
@@ -339,8 +414,9 @@ static void run(void) {
     self.w.rootViewController = vc;
     [self.w makeKeyAndVisible];
 
-    [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer* t) {
-        g_hb.text = [NSString stringWithFormat:@"calls=%d hits=%d", g_done, g_hits];
+    [NSTimer scheduledTimerWithTimeInterval:0.25 repeats:YES block:^(NSTimer* tm) {
+        g_hb.text = [NSString stringWithFormat:@"%@ c=%d h=%d", g_phase, g_done, g_hits];
+        flush_ui();
     }];
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
