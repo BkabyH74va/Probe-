@@ -9,7 +9,7 @@
 #include <pthread.h>
 
 #define MAXC 24
-#define STEP_MAX 18
+#define STEP_MAX 21
 
 static UITextView* g_tv;
 static UILabel* g_hb;
@@ -27,9 +27,10 @@ static int g_nconn = 0;
 
 static const char* STEP_NAME[STEP_MAX + 1] = {
     "boot-only", "open-1", "open-all", "s4-zero", "s5-zero",
-    "mm-0", "mm-0-7", "mm-8-31", "cmd5-124-0-31", "cmd5-124-full",
-    "cmd5-126", "cmd5-128", "hmap5-128-255", "hmap5-256-511",
-    "hmap5-512-4095", "hmap4-128-511", "inv5", "inv4", "fuzz-200"
+    "mm-0", "mm-1-7", "mm-8-31", "mix-s5", "mix-s4",
+    "cmd124-0-31", "cmd124-32-255", "cmd122-0-63", "cmd126-0-255",
+    "cmd128-0-255", "hmap5-128-255", "hmap5-256-511", "hmap5-512-4095",
+    "hmap4-128-511", "inv5", "inv4", "fuzz-200"
 };
 
 static void ui(NSString* s) {
@@ -52,10 +53,6 @@ static void persist(NSString* s) {
 static void bread(const char* tag) {
     persist([NSString stringWithFormat:@"PRE step=%d %s", g_step, tag]);
     if (g_fd >= 0) fsync(g_fd);
-}
-static void phase(NSString* p) {
-    g_phase = p;
-    ui([NSString stringWithFormat:@"=== %@", p]);
 }
 static void sigh(int sig) {
     char b[96];
@@ -136,8 +133,7 @@ static kern_return_t callp(const char* tag, io_connect_t c, uint32_t t, uint32_t
         __sync_fetch_and_add(&g_hits, 1);
         ui([NSString stringWithFormat:@"!!! OK %s out=%zu %@", tag, oSz, hex(out, oSz)]);
     } else if (kr != 0xe00002c2 && kr != 0xe00002c7) {
-        persist([NSString stringWithFormat:@"%u %u %zu %@ | %s",
-                 t, sel, sz, kr_name(kr), tag]);
+        persist([NSString stringWithFormat:@"%u %u %zu %@ | %s", t, sel, sz, kr_name(kr), tag]);
         __sync_fetch_and_add(&g_hits, 1);
         ui([NSString stringWithFormat:@"!! %s -> %@", tag, kr_name(kr)]);
     } else {
@@ -213,11 +209,30 @@ static void mm_range(uint32_t lo, uint32_t hi) {
 static void cmd_at(uint32_t off, uint32_t from, uint32_t to) {
     for (uint32_t v = from; v <= to; v++) {
         uint8_t* in = calloc(1, 4096);
-        if (off == 126) { uint16_t h = v; memcpy(in + 126, &h, 2); }
+        if (off == 126 || off == 122) { uint16_t h = v; memcpy(in + off, &h, 2); }
         else memcpy(in + off, &v, 4);
         char tg[40]; snprintf(tg, sizeof(tg), "cmd%u.%u", off, v);
         callp(tg, g_conn[0], g_ctype[0], 5, in, 4096, 4096, NO);
         free(in);
+    }
+}
+
+static void mixed(uint32_t sel) {
+    for (uint32_t ic = 0; ic <= 6; ic++) {
+        uint64_t inS[8] = {0}, outS[16] = {0}; uint32_t oc = 16;
+        uint8_t* in = calloc(1, 4096);
+        uint8_t out[4096]; size_t oSz = sizeof(out);
+        memset(out, 0xCC, sizeof(out));
+        char tg[32]; snprintf(tg, sizeof(tg), "m%u.%u", sel, ic);
+        bread(tg);
+        kern_return_t kr = IOConnectCallMethod(g_conn[0], sel, inS, ic, in, 4096,
+                                              outS, &oc, out, &oSz);
+        free(in);
+        persist([NSString stringWithFormat:@"mixed %u sc=%u %@ | %s", sel, ic, kr_name(kr), tg]);
+        if (kr != 0xe00002c2 && kr != 0xe00002c7) {
+            __sync_fetch_and_add(&g_hits, 1);
+            ui([NSString stringWithFormat:@"!! %s -> %@ oc=%u %@", tg, kr_name(kr), oc, hex(out, oSz)]);
+        } else ui([NSString stringWithFormat:@"%s -> %@", tg, kr_name(kr)]);
     }
 }
 
@@ -270,9 +285,10 @@ static void run(void) {
     persist([NSString stringWithFormat:@"=== LAUNCH step=%d %s", g_step,
              STEP_NAME[g_step < STEP_MAX+1 ? g_step : STEP_MAX]]);
     if (g_fd >= 0) fsync(g_fd);
-    ui([NSString stringWithFormat:@"STEP %d: %s", g_step, STEP_NAME[g_step < STEP_MAX+1 ? g_step : STEP_MAX]]);
+    ui([NSString stringWithFormat:@"STEP %d/%d: %s", g_step, STEP_MAX,
+        STEP_NAME[g_step < STEP_MAX+1 ? g_step : STEP_MAX]]);
 
-    if (g_step > STEP_MAX) { ui(@"ALL STEPS DONE"); return; }
+    if (g_step > STEP_MAX) { ui(@"ALL DONE"); return; }
 
     if (g_step >= 1) {
         VTCompressionSessionRef v = NULL;
@@ -291,25 +307,28 @@ static void run(void) {
         case 3: s_zero(4); break;
         case 4: s_zero(5); break;
         case 5: mm_range(0, 0); break;
-        case 6: mm_range(0, 7); break;
+        case 6: mm_range(1, 7); break;
         case 7: mm_range(8, 31); break;
-        case 8: cmd_at(124, 0, 31); break;
-        case 9: cmd_at(124, 32, 255); break;
-        case 10: cmd_at(126, 0, 255); break;
-        case 11: cmd_at(128, 0, 255); break;
-        case 12: hmap(5, 128, 255); break;
-        case 13: hmap(5, 256, 511); break;
-        case 14: hmap(5, 512, 4095); break;
-        case 15: hmap(4, 128, 511); break;
-        case 16: imap(5); break;
-        case 17: imap(4); break;
-        case 18: fuzz(200); break;
+        case 8: mixed(5); break;
+        case 9: mixed(4); break;
+        case 10: cmd_at(124, 0, 31); break;
+        case 11: cmd_at(124, 32, 255); break;
+        case 12: cmd_at(122, 0, 63); break;
+        case 13: cmd_at(126, 0, 255); break;
+        case 14: cmd_at(128, 0, 255); break;
+        case 15: hmap(5, 128, 255); break;
+        case 16: hmap(5, 256, 511); break;
+        case 17: hmap(5, 512, 4095); break;
+        case 18: hmap(4, 128, 511); break;
+        case 19: imap(5); break;
+        case 20: imap(4); break;
+        case 21: fuzz(200); break;
     }
 
     persist([NSString stringWithFormat:@"STEP %d OK calls=%d hits=%d", g_step, g_done, g_hits]);
     if (g_fd >= 0) fsync(g_fd);
     save_step(g_step + 1);
-    ui([NSString stringWithFormat:@"STEP %d SURVIVED — relaunch for %d", g_step, g_step + 1]);
+    ui([NSString stringWithFormat:@"STEP %d SURVIVED — relaunch", g_step]);
     close(g_fd); g_fd = -1;
 }
 
