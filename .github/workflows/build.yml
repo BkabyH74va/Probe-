@@ -11,7 +11,7 @@ jobs:
           mkdir -p Sources
           cat > project.yml <<'PROJEOF'
           name: probe
-          options: { bundleIdPrefix: com.buurza23, deploymentTarget: { iOS: "18.0" } }
+          options: { bundleIdPrefix: com.buurza24, deploymentTarget: { iOS: "18.0" } }
           targets:
             probe:
               type: application
@@ -21,9 +21,9 @@ jobs:
               info:
                 path: Info.plist
                 properties:
-                  CFBundleDisplayName: buurd23
+                  CFBundleDisplayName: buurd24
                   CFBundleShortVersionString: "1.0"
-                  CFBundleVersion: "23"
+                  CFBundleVersion: "24"
                   UILaunchScreen: {}
               settings:
                 ARCHS: "arm64"
@@ -73,13 +73,15 @@ jobs:
           typedef CFTypeRef (*fn_copy)(SecTaskRef, CFStringRef, CFErrorRef*);
           typedef uint32_t (*fn_surfid)(IOSurfaceRef);
 
-          #define BUILD_TAG "v23-matrix"
+          #define BUILD_TAG "v24-sizes"
           #define MAXC 128
           #define STEP_MAX 14
           #define TRY_MAX 2
           #define MAXCHILD 8
           #define TYPE_MAX 7
           #define FIXED 4096
+          #define SZ_N 15
+          #define SEL_N 32
 
           static UITextView* g_tv;
           static UILabel* g_hb;
@@ -106,10 +108,19 @@ jobs:
           static int g_node[MAXC];
           static int g_nconn = 0;
 
+          static int g_found_in[SEL_N];
+          static int g_found_out[SEL_N];
+          static size_t g_best_in[SEL_N];
+          static size_t g_best_out[SEL_N];
+
+          static const size_t SZ[SZ_N] = {
+              0,1,4,8,16,32,64,128,256,512,1024,2048,4096,8192,16384
+          };
+
           static const char* STEP_NAME[STEP_MAX + 1] = {
               "boot", "census", "sig-blob", "match-uc", "vt-init", "vt-encode",
-              "dump-tree", "open-all", "oracle-all", "open-then-4", "rich-desc",
-              "fill-sweep", "surf-probe", "post", "verdict"
+              "dump-tree", "open-all", "out-sweep", "in-sweep", "combo",
+              "surf-probe", "fill-sweep", "confirm", "verdict"
           };
 
           static void ui(NSString* s) {
@@ -154,6 +165,7 @@ jobs:
                   case 0xe00002cc: return @"NotOpen";
                   case 0xe00002d4: return @"Busy";
                   case 0xe00002e2: return @"NotPerm";
+                  case 0xdeadbeef: return @"dup";
                   default: return [NSString stringWithFormat:@"0x%x", kr];
               }
           }
@@ -249,7 +261,7 @@ jobs:
                   if (sel == 4) __sync_fetch_and_add(&g_ok4, 1);
                   ui([NSString stringWithFormat:@"!!! OK %s n%d t%u out=%zu %@",
                       tag, nd, t, oSz, hexn(out, oSz, 32)]);
-              } else if (kr != 0xe00002c2 && kr != 0xe00002c7 && kr != 0xe00002cc) {
+              } else if (kr != 0xe00002c2 && kr != 0xe00002c7 && kr != 0xe00002cc && kr != 0xdeadbeef) {
                   persist([NSString stringWithFormat:@"%d %u %u %zu %@ | %s", nd, t, sel, sz, kr_name(kr), tag]);
                   __sync_fetch_and_add(&g_hits, 1);
                   ui([NSString stringWithFormat:@"!! %s n%d t%u -> %@", tag, nd, t, kr_name(kr)]);
@@ -262,11 +274,8 @@ jobs:
               return kr;
           }
 
-          static kern_return_t t4i(int ci, const char* tag, const uint8_t* in, size_t outsz) {
-              return callp(tag, ci, 4, in, FIXED, outsz, YES);
-          }
           static kern_return_t t4(const char* tag, const uint8_t* in, size_t outsz) {
-              return t4i(g_root_idx, tag, in, outsz);
+              return callp(tag, g_root_idx, 4, in, FIXED, outsz, YES);
           }
           static void t5(const char* tag, const uint8_t* in) {
               callp(tag, g_root_idx, 5, in, FIXED, FIXED, YES);
@@ -440,9 +449,19 @@ jobs:
               ui([NSString stringWithFormat:@"root got=%d idx=%d", got, g_root_idx]);
               for (int i = 1; i <= g_nchild; i++) {
                   int b = g_nconn;
-                  int g2 = probe_open(g_child[i], i, TYPE_MAX);
-                  persist([NSString stringWithFormat:@"child %d got=%d base=%d", i, g2, b]);
-                  ui([NSString stringWithFormat:@"child %d got=%d", i, g2]);
+                  NSMutableString* l = [NSMutableString string];
+                  for (uint32_t t = 0; t <= TYPE_MAX; t++) {
+                      io_connect_t c = 0;
+                      kern_return_t kr = IOServiceOpen(g_child[i], mach_task_self(), t, &c);
+                      [l appendFormat:@"%u:%@ ", t, kr_name(kr)];
+                      if (kr == KERN_SUCCESS && g_nconn < MAXC) {
+                          int idx = g_nconn;
+                          g_conn[idx] = c; g_ctype[idx] = t; g_node[idx] = i;
+                          g_nconn++;
+                      }
+                  }
+                  persist([NSString stringWithFormat:@"child %d base=%d %@", i, b, l]);
+                  ui([NSString stringWithFormat:@"child %d %@", i, l]);
               }
               persist([NSString stringWithFormat:@"conns=%d", g_nconn]);
               ui([NSString stringWithFormat:@"conns=%d", g_nconn]);
@@ -474,45 +493,52 @@ jobs:
               return (int)st;
           }
 
-          static void oracle_all(void) {
-              for (int ci = 0; ci < g_nconn; ci++) {
+          static void out_sweep(void) {
+              for (uint32_t s = 0; s < SEL_N; s++) {
                   uint8_t* in = calloc(1, FIXED);
                   if (!in) continue;
-                  NSMutableString* line = [NSMutableString string];
-                  for (uint32_t s = 0; s <= 31; s++) {
-                      char tg[40]; snprintf(tg, sizeof(tg), "oa.%d.%u", g_node[ci], s);
-                      kern_return_t kr = callp(tg, ci, s, in, FIXED, FIXED, NO);
-                      [line appendFormat:@"%u:%@ ", s, kr_name(kr)];
+                  NSMutableString* l = [NSMutableString string];
+                  for (int i = 0; i < SZ_N; i++) {
+                      char tg[48]; snprintf(tg, sizeof(tg), "ow.%u.%zu", s, SZ[i]);
+                      kern_return_t kr = callp(tg, g_root_idx, s, in, FIXED, SZ[i], NO);
+                      [l appendFormat:@"%zu:%@ ", SZ[i], kr_name(kr)];
+                      if (kr != 0xe00002c2 && kr != 0xe00002cc && kr != 0xdeadbeef && !g_found_out[s]) {
+                          g_found_out[s] = 1; g_best_out[s] = SZ[i];
+                      }
                   }
                   free(in);
-                  persist([NSString stringWithFormat:@"ORACLE n%d t%u %@", g_node[ci], g_ctype[ci], line]);
-                  ui([NSString stringWithFormat:@"OA n%d t%u %@", g_node[ci], g_ctype[ci], line]);
+                  persist([NSString stringWithFormat:@"OW s%u %@", s, l]);
+                  ui([NSString stringWithFormat:@"OW s%u %@", s, l]);
               }
           }
 
-          static void open_then_4(void) {
-              uint8_t* in = calloc(1, FIXED);
-              if (!in) return;
-              for (int ci = 0; ci < g_nconn; ci++) {
-                  char a[40]; snprintf(a, sizeof(a), "ot.o.%d.%u", g_node[ci], g_ctype[ci]);
-                  kern_return_t o = callp(a, ci, 0, in, FIXED, FIXED, YES);
-                  char b[40]; snprintf(b, sizeof(b), "ot.4.%d.%u", g_node[ci], g_ctype[ci]);
-                  kern_return_t f = callp(b, ci, 4, in, FIXED, FIXED, YES);
-                  char c[40]; snprintf(c, sizeof(c), "ot.5.%d.%u", g_node[ci], g_ctype[ci]);
-                  kern_return_t g = callp(c, ci, 5, in, FIXED, FIXED, YES);
-                  persist([NSString stringWithFormat:@"ot n%d t%u o=%@ f=%@ f5=%@",
-                           g_node[ci], g_ctype[ci], kr_name(o), kr_name(f), kr_name(g)]);
-                  ui([NSString stringWithFormat:@"ot n%d t%u %@ %@ %@",
-                      g_node[ci], g_ctype[ci], kr_name(o), kr_name(f), kr_name(g)]);
+          static void in_sweep(void) {
+              for (uint32_t s = 0; s < SEL_N; s++) {
+                  uint8_t* in = calloc(1, 16384);
+                  if (!in) continue;
+                  NSMutableString* l = [NSMutableString string];
+                  for (int i = 0; i < SZ_N; i++) {
+                      char tg[48]; snprintf(tg, sizeof(tg), "iw.%u.%zu", s, SZ[i]);
+                      kern_return_t kr = callp(tg, g_root_idx, s, in, SZ[i], FIXED, NO);
+                      [l appendFormat:@"%zu:%@ ", SZ[i], kr_name(kr)];
+                      if (kr != 0xe00002c2 && kr != 0xe00002cc && kr != 0xdeadbeef && !g_found_in[s]) {
+                          g_found_in[s] = 1; g_best_in[s] = SZ[i];
+                      }
+                  }
+                  free(in);
+                  persist([NSString stringWithFormat:@"IW s%u %@", s, l]);
+                  ui([NSString stringWithFormat:@"IW s%u %@", s, l]);
               }
-              free(in);
           }
 
           static void rich_desc(void) {
               uint32_t sid = g_sid, w = 1920, h = 1080, f = 0x42475241, bpr = 7680, pl = 1;
               for (int base = 0; base <= 0x20; base += 8) {
                   for (int sel = 0; sel <= 5; sel++) {
-                      uint8_t* in = calloc(1, FIXED);
+                      size_t outsz = g_found_out[sel] ? g_best_out[sel] : FIXED;
+                      size_t insz = g_found_in[sel] ? g_best_in[sel] : FIXED;
+                      if (insz < (size_t)base + 24) insz = base + 24;
+                      uint8_t* in = calloc(1, insz);
                       if (!in) continue;
                       memcpy(in + base, &sid, 4);
                       memcpy(in + base + 4, &w, 4);
@@ -521,7 +547,47 @@ jobs:
                       memcpy(in + base + 16, &bpr, 4);
                       memcpy(in + base + 20, &pl, 4);
                       char tg[48]; snprintf(tg, sizeof(tg), "rd.%d.%d", base, sel);
-                      callp(tg, g_root_idx, sel, in, FIXED, FIXED, YES);
+                      callp(tg, g_root_idx, sel, in, insz, outsz, YES);
+                      free(in);
+                  }
+              }
+          }
+
+          static void combo(void) {
+              NSDictionary* p = @{ (id)kCVPixelBufferIOSurfacePropertiesKey: @{} };
+              CVReturn r = CVPixelBufferCreate(NULL, 1920, 1080, kCVPixelFormatType_32BGRA,
+                                               (__bridge CFDictionaryRef)p, &g_surf);
+              if (r == kCVReturnSuccess && g_surf) {
+                  IOSurfaceRef s = CVPixelBufferGetIOSurface(g_surf);
+                  fn_surfid idf = (fn_surfid)dlsym(RTLD_DEFAULT, "IOSurfaceGetID");
+                  g_sid = (s && idf) ? idf(s) : 0;
+                  persist([NSString stringWithFormat:@"surf=1 id=%u", g_sid]);
+                  ui([NSString stringWithFormat:@"surf=1 id=%u", g_sid]);
+              } else {
+                  persist([NSString stringWithFormat:@"surf=0 rc=%d", (int)r]);
+                  ui([NSString stringWithFormat:@"surf=0 rc=%d", (int)r]);
+              }
+              rich_desc();
+          }
+
+          static void surf_probe(void) {
+              if (!g_surf) { ui(@"no surf"); return; }
+              uint32_t sid = g_sid;
+              persist([NSString stringWithFormat:@"sid=%u", sid]);
+              for (int ci = 0; ci < g_nconn; ci++) {
+                  for (int sel = 0; sel <= 5; sel++) {
+                      size_t outsz = g_found_out[sel] ? g_best_out[sel] : FIXED;
+                      size_t insz = g_found_in[sel] ? g_best_in[sel] : FIXED;
+                      if (insz < 16) insz = 16;
+                      uint8_t* in = calloc(1, insz);
+                      if (!in) continue;
+                      uint32_t w = 1920, h = 1080, f = 0x42475241;
+                      memcpy(in, &sid, 4);
+                      memcpy(in + 4, &w, 4);
+                      memcpy(in + 8, &h, 4);
+                      memcpy(in + 12, &f, 4);
+                      char tg[48]; snprintf(tg, sizeof(tg), "sp.%d.%u.%d", g_node[ci], g_ctype[ci], sel);
+                      callp(tg, ci, sel, in, insz, outsz, YES);
                       free(in);
                   }
               }
@@ -541,68 +607,35 @@ jobs:
               }
           }
 
-          static void surf_make(void) {
-              NSDictionary* p = @{ (id)kCVPixelBufferIOSurfacePropertiesKey: @{} };
-              CVReturn r = CVPixelBufferCreate(NULL, 1920, 1080, kCVPixelFormatType_32BGRA,
-                                               (__bridge CFDictionaryRef)p, &g_surf);
-              if (r != kCVReturnSuccess || !g_surf) {
-                  persist([NSString stringWithFormat:@"surf=0 rc=%d", (int)r]);
-                  ui([NSString stringWithFormat:@"surf=0 rc=%d", (int)r]);
-                  return;
-              }
-              IOSurfaceRef s = CVPixelBufferGetIOSurface(g_surf);
-              fn_surfid idf = (fn_surfid)dlsym(RTLD_DEFAULT, "IOSurfaceGetID");
-              g_sid = (s && idf) ? idf(s) : 0;
-              persist([NSString stringWithFormat:@"surf=1 iosurf=%d idfn=%d id=%u",
-                       s ? 1 : 0, idf ? 1 : 0, g_sid]);
-              ui([NSString stringWithFormat:@"surf=%d id=%u", s ? 1 : 0, g_sid]);
-          }
-
-          static void surf_probe(void) {
-              if (!g_surf) { ui(@"no surf"); return; }
-              uint32_t sid = g_sid;
-              persist([NSString stringWithFormat:@"sid=%u", sid]);
+          static void confirm_all(void) {
               for (int ci = 0; ci < g_nconn; ci++) {
-                  uint8_t* in = calloc(1, FIXED);
-                  if (!in) continue;
-                  memcpy(in, &sid, 4);
-                  uint32_t w = 1920, h = 1080, f = 0x42475241;
-                  memcpy(in + 4, &w, 4);
-                  memcpy(in + 8, &h, 4);
-                  memcpy(in + 12, &f, 4);
-                  char tg[40]; snprintf(tg, sizeof(tg), "sp.%d.%u", g_node[ci], g_ctype[ci]);
-                  callp(tg, ci, 4, in, FIXED, FIXED, YES);
-                  free(in);
+                  NSMutableString* l = [NSMutableString string];
+                  for (uint32_t s = 0; s < SEL_N; s++) {
+                      size_t outsz = g_found_out[s] ? g_best_out[s] : FIXED;
+                      size_t insz = g_found_in[s] ? g_best_in[s] : FIXED;
+                      uint8_t* in = calloc(1, insz ? insz : 1);
+                      if (!in) continue;
+                      char tg[48]; snprintf(tg, sizeof(tg), "cf.%d.%u.%u", g_node[ci], g_ctype[ci], s);
+                      kern_return_t kr = callp(tg, ci, s, in, insz, outsz, YES);
+                      [l appendFormat:@"%u:%@ ", s, kr_name(kr)];
+                      free(in);
+                  }
+                  persist([NSString stringWithFormat:@"CF n%d t%u %@", g_node[ci], g_ctype[ci], l]);
+                  ui([NSString stringWithFormat:@"CF n%d t%u %@", g_node[ci], g_ctype[ci], l]);
               }
-              uint8_t* in = calloc(1, FIXED);
-              if (in) {
-                  memcpy(in, &sid, 4);
-                  uint32_t w = 1920, h = 1080, f = 0x42475241;
-                  memcpy(in + 4, &w, 4);
-                  memcpy(in + 8, &h, 4);
-                  memcpy(in + 12, &f, 4);
-                  t4("sx4.full", in, FIXED);
-                  t5("sx5.full", in);
-                  free(in);
-              }
-          }
-
-          static void post_fixed(void) {
-              uint8_t* in = calloc(1, FIXED);
-              if (!in) return;
-              kern_return_t a = t4("pf4", in, FIXED);
-              t5("pf5", in);
-              kern_return_t c = t4("pf4b", in, FIXED);
-              free(in);
-              persist([NSString stringWithFormat:@"postfixed 4=%@ 4b=%@", kr_name(a), kr_name(c)]);
-              ui([NSString stringWithFormat:@"postfixed 4=%@ 4b=%@", kr_name(a), kr_name(c)]);
           }
 
           static void verdict(void) {
-              persist([NSString stringWithFormat:@"VERDICT ok4=%d hits=%d conns=%d root_idx=%d sid=%u",
-                       g_ok4, g_hits, g_nconn, g_root_idx, g_sid]);
-              ui([NSString stringWithFormat:@"VERDICT ok4=%d hits=%d idx=%d conns=%d",
-                  g_ok4, g_hits, g_root_idx, g_nconn]);
+              NSMutableString* b = [NSMutableString string];
+              for (uint32_t s = 0; s < SEL_N; s++) {
+                  if (g_found_in[s] || g_found_out[s])
+                      [b appendFormat:@"%u(i=%d/%zu,o=%d/%zu) ",
+                       s, g_found_in[s], g_best_in[s], g_found_out[s], g_best_out[s]];
+              }
+              persist([NSString stringWithFormat:@"VERDICT ok4=%d hits=%d conns=%d idx=%d found=[%@]",
+                       g_ok4, g_hits, g_nconn, g_root_idx, b]);
+              ui([NSString stringWithFormat:@"VERDICT ok4=%d hits=%d idx=%d found=[%@]",
+                  g_ok4, g_hits, g_root_idx, b]);
           }
 
           static void do_step(int s) {
@@ -615,12 +648,12 @@ jobs:
                   case 5: ui([NSString stringWithFormat:@"vt=%d", (int)vt_encode()]); break;
                   case 6: dump_tree(); break;
                   case 7: open_all(); break;
-                  case 8: oracle_all(); break;
-                  case 9: open_then_4(); break;
-                  case 10: surf_make(); rich_desc(); break;
-                  case 11: fill_sweep(); break;
-                  case 12: surf_probe(); break;
-                  case 13: post_fixed(); break;
+                  case 8: out_sweep(); break;
+                  case 9: in_sweep(); break;
+                  case 10: combo(); break;
+                  case 11: surf_probe(); break;
+                  case 12: fill_sweep(); break;
+                  case 13: confirm_all(); break;
                   case 14: verdict(); break;
               }
           }
@@ -632,6 +665,7 @@ jobs:
               g_seen = [NSMutableSet set];
               load_state();
               g_step = load_step();
+              for (int i = 0; i < SEL_N; i++) { g_best_in[i] = FIXED; g_best_out[i] = FIXED; }
 
               persist([NSString stringWithFormat:@"=== LAUNCH step=%d build=%s", g_step, BUILD_TAG]);
               if (g_fd >= 0) fsync(g_fd);
