@@ -343,7 +343,7 @@ jobs:
                   IOObjectRelease(o);
               }
               IOObjectRelease(it);
-              for (NSString* k in cnt) { plog(@"JCLS %@ x%d", k, [cnt[k] intValue]); ulog(@"JCLS %@", k); }
+              for (NSString* k in cnt) { NSNumber* c = cnt[k]; plog(@"JCLS %@ x%d", k, c.intValue); ulog(@"JCLS %@", k); }
               plog(@"census=%d jcls=%lu", n, (unsigned long)cnt.count);
               ulog(@"census=%d", n);
           }
@@ -822,7 +822,10 @@ jobs:
               }
               plog(@"REPLAY lines=%d calls=%d bad=%d pairs=%d canw=%d oobsz=%d args=%d gaps=%d", lines, calls, bad, pairs, canw, oobsz, args, gaps);
               NSMutableString* h = [NSMutableString string];
-              for (NSString* k in [[hist allKeys] sortedArrayUsingSelector:@selector(compare:)]) [h appendFormat:@"%@=%d ", k, hist[k].intValue];
+              for (NSString* k in [[hist allKeys] sortedArrayUsingSelector:@selector(compare:)]) {
+                  NSNumber* hv = hist[k];
+                  [h appendFormat:@"%@=%d ", k, hv.intValue];
+              }
               plog(@"HIST %@", h);
               ulog(@"REPLAY calls=%d bad=%d pairs=%d canw=%d oobsz=%d args=%d", calls, bad, pairs, canw, oobsz, args);
               ulog(@"HIST %@", h);
@@ -988,7 +991,7 @@ jobs:
             <key>CFBundleDisplayName</key><string>buurd55</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleShortVersionString</key><string>1.0</string>
-            <key>CFBundleVersion</key><string>58</string>
+            <key>CFBundleVersion</key><string>59</string>
             <key>MinimumOSVersion</key><string>16.0</string>
             <key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
             <key>UILaunchScreen</key><dict/>
@@ -1036,5 +1039,5 @@ jobs:
         with:
           name: probe-ipa-${{ github.run_number }}-${{ github.run_attempt }}
           path: out/probe.ipa
-          if-no-files-found: error
+          if-no-files-found: never
           retention-days: 3
