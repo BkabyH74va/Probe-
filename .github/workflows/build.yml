@@ -18,12 +18,31 @@ jobs:
         run: |
           sw_vers
           xcodebuild -version
-          xcrun --sdk iphoneos --show-sdk-path
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          echo "sdk=$SDK"
+          F="$SDK/System/Library/Frameworks/IOSurface.framework"
+          ls -la "$F" || true
+          find "$F" -maxdepth 2 2>/dev/null || echo "framework absent"
           df -h /
 
       - name: source
         run: |
-          mkdir -p Sources out/Payload/probe.app
+          mkdir -p Sources stub/IOSurface out/Payload/probe.app
+          cat > stub/IOSurface/IOSurface.h <<'STUBEOF'
+          #ifndef PROBE_STUB_IOSURFACE_H
+          #define PROBE_STUB_IOSURFACE_H
+          #include <stdint.h>
+          #include <stddef.h>
+          typedef struct __IOSurface *IOSurfaceRef;
+          uint32_t IOSurfaceGetID(IOSurfaceRef buffer);
+          size_t IOSurfaceGetAllocSize(IOSurfaceRef buffer);
+          void *IOSurfaceGetBaseAddress(IOSurfaceRef buffer);
+          IOSurfaceRef IOSurfaceLookup(uint32_t csid);
+          #endif
+          STUBEOF
+          test -f stub/IOSurface/IOSurface.h
+          wc -c stub/IOSurface/IOSurface.h
+
           cat > Sources/main.m <<'MAINEOF'
           #import <UIKit/UIKit.h>
           #import <IOKit/IOKitLib.h>
@@ -48,10 +67,13 @@ jobs:
           extern int csops(pid_t pid, unsigned int ops, void* uaddr, size_t usize);
 
           typedef uint32_t (*fn_surfid)(IOSurfaceRef);
+          typedef IOSurfaceRef (*fn_getsurf)(CVPixelBufferRef);
           typedef kern_return_t (*fn_addclient)(io_connect_t, io_connect_t);
           static fn_addclient g_addclient = NULL;
+          static fn_getsurf g_getsurf = NULL;
+          static fn_surfid g_surfid = NULL;
 
-          #define BUILD_TAG "v49-pinned"
+          #define BUILD_TAG "v52-stub"
           #define MAXC 40
           #define STEP_MAX 27
           #define TRY_MAX 2
@@ -636,13 +658,12 @@ jobs:
                   ulog(@"surf=0 rc=%d", (int)r);
                   return 0;
               }
-              IOSurfaceRef s = CVPixelBufferGetIOSurface(g_surf);
-              fn_surfid idf = (fn_surfid)dlsym(RTLD_DEFAULT, "IOSurfaceGetID");
-              g_sid = (s && idf) ? idf(s) : 0;
+              IOSurfaceRef s = g_getsurf ? g_getsurf(g_surf) : NULL;
+              g_sid = (s && g_surfid) ? g_surfid(s) : 0;
               if (g_sid) SV[3] = g_sid;
-              plog(@"surf=1 id=%u", g_sid);
+              plog(@"surf=1 id=%u getsurf=%p surfid=%p", g_sid, (void*)g_getsurf, (void*)g_surfid);
               ulog(@"surf=1 id=%u", g_sid);
-              return 1;
+              return g_sid ? 1 : 0;
           }
 
           static void root_open(void) {
@@ -1227,7 +1248,9 @@ jobs:
               void* ik = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY);
               g_addclient = (fn_addclient)dlsym(RTLD_DEFAULT, "IOConnectAddClient");
               if (!g_addclient && ik) g_addclient = (fn_addclient)dlsym(ik, "IOConnectAddClient");
-              plog(@"addclient sym=%p", (void*)g_addclient);
+              g_getsurf = (fn_getsurf)dlsym(RTLD_DEFAULT, "CVPixelBufferGetIOSurface");
+              g_surfid = (fn_surfid)dlsym(RTLD_DEFAULT, "IOSurfaceGetID");
+              plog(@"syms addclient=%p getsurf=%p surfid=%p", (void*)g_addclient, (void*)g_getsurf, (void*)g_surfid);
 
               plog(@"=== LAUNCH step=%d build=%s wake=0x%x", g_step, BUILD_TAG, g_wake);
               if (g_fd >= 0) fsync(g_fd);
@@ -1334,10 +1357,10 @@ jobs:
             <key>CFBundleIdentifier</key><string>com.buurza47.probe</string>
             <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
             <key>CFBundleName</key><string>probe</string>
-            <key>CFBundleDisplayName</key><string>buurd49</string>
+            <key>CFBundleDisplayName</key><string>buurd52</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleShortVersionString</key><string>1.0</string>
-            <key>CFBundleVersion</key><string>51</string>
+            <key>CFBundleVersion</key><string>54</string>
             <key>MinimumOSVersion</key><string>16.0</string>
             <key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
             <key>UILaunchScreen</key><dict/>
@@ -1355,17 +1378,26 @@ jobs:
           APP=out/Payload/probe.app
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
           echo "sdk=$SDK"
+          echo "--- stub ---"
+          find stub -type f
+          echo "--- probe include resolution ---"
+          printf '#import <IOSurface/IOSurface.h>\nint main(void){IOSurfaceRef s=0;return (int)(size_t)s;}\n' > /tmp/res.c
+          xcrun -sdk iphoneos clang -arch arm64 -isysroot "$SDK" -I stub -E /tmp/res.c > /dev/null && echo "STUB RESOLVES"
+          echo "--- real build ---"
           xcrun --sdk iphoneos clang --version | head -1
           xcrun -sdk iphoneos clang \
             -arch arm64 -miphoneos-version-min=16.0 -fobjc-arc \
-            -isysroot "$SDK" -O1 -Wno-implicit-function-declaration \
+            -isysroot "$SDK" -I stub -O1 -std=gnu11 \
+            -Wno-implicit-function-declaration -Wno-typedef-redefinition \
+            -Wno-deprecated-declarations -Wno-nullability-completeness \
             -framework UIKit -framework Foundation -framework CoreFoundation \
             -framework IOKit -framework VideoToolbox -framework CoreMedia \
-            -framework CoreVideo -framework IOSurface -framework Security \
+            -framework CoreVideo -framework Security \
             Sources/main.m -o "$APP/probe"
           chmod +x "$APP/probe"
           file "$APP/probe"
           lipo -info "$APP/probe"
+          otool -L "$APP/probe" | head -20
 
       - name: sign
         run: |
