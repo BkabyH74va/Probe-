@@ -102,7 +102,7 @@ jobs:
           static fn_trap5 g_trap5 = NULL;
           static fn_trap6 g_trap6 = NULL;
 
-          #define BUILD_TAG "v61-rehydrate"
+          #define BUILD_TAG "v62-fallback"
           #define MAXC 128
           #define STEP_MAX 22
           #define TRY_MAX 2
@@ -275,6 +275,7 @@ jobs:
               NSString* bt = [NSString stringWithContentsOfFile:doc_file("build.txt") encoding:NSUTF8StringEncoding error:nil];
               if ([bt isEqualToString:@BUILD_TAG]) return;
               unlink(doc_file("state.txt").UTF8String);
+              unlink(doc_file("try.txt").UTF8String);
               save_step(0); g_try = 0; save_try();
               g_root_idx = -1; g_best = -1; g_s4ci = -1;
               [@BUILD_TAG writeToFile:doc_file("build.txt") atomically:YES encoding:NSUTF8StringEncoding error:nil];
@@ -626,6 +627,7 @@ jobs:
           }
 
           static void sel_sweep(void) {
+              if (!g_nconn) { plog(@"SWEEP noconn"); ulog(@"SWEEP no conn"); return; }
               ulog(@"SWEEP 0-%d x %d conns", SELSWEEP - 1, g_nconn);
               for (int ci = 0; ci < g_nconn; ci++) {
                   if (!g_conn[ci]) continue;
@@ -891,7 +893,8 @@ jobs:
                       [ln hasPrefix:@"SO0 "] || [ln hasPrefix:@"GAP "] || [ln hasPrefix:@"CH "] || [ln hasPrefix:@"PK "] ||
                       [ln hasPrefix:@"PKO "] || [ln hasPrefix:@"SIGNAL "] || [ln hasPrefix:@"VIC "] || [ln hasPrefix:@"NODE "] ||
                       [ln hasPrefix:@"DEV "] || [ln hasPrefix:@"STEP "] || [ln hasPrefix:@"MAP "] || [ln hasPrefix:@"LIVE "] ||
-                      [ln hasPrefix:@"PROLOGUE "] || [ln hasPrefix:@"census"] || [ln hasPrefix:@"JCLS "]) {
+                      [ln hasPrefix:@"SVC "] || [ln hasPrefix:@"PROLOGUE "] || [ln hasPrefix:@"REHYDRATE "] ||
+                      [ln hasPrefix:@"census"] || [ln hasPrefix:@"JCLS "]) {
                       [keep addObject:ln]; continue;
                   }
               }
@@ -905,6 +908,10 @@ jobs:
 
           static void verdict(void) {
               refresh_counts();
+              if (g_nconn == 0 || g_pairn == 0) {
+                  plog(@"VERDICT: DRY conns=%d pairs=%d vic=%d - tail metrics vacuous", g_nconn, g_pairn, g_vicn);
+                  ulog(@"VERDICT: DRY conns=%d pairs=%d", g_nconn, g_pairn);
+              }
               plog(@"VERDICT probes=%d badarg=%d writes=%d oob=%d gap=%d outw=%d nonbad=%d so0=%d sicok=%d addok=%d trapok=%d tblmask=0x%x livemask=0x%x conns=%d",
                    g_probes, g_badarg, g_canary_w, g_oobsz, g_gapread, g_outw, g_nonbad, g_s0nz, g_sic_ok, g_addok, g_trap_ok, g_tbl_mask, g_live_sel, g_nconn);
               ulog(@"VERDICT probes=%d badarg=%d writes=%d oob=%d outw=%d nonbad=%d sicok=%d addok=%d trapok=%d", g_probes, g_badarg, g_canary_w, g_oobsz, g_outw, g_nonbad, g_sic_ok, g_addok, g_trap_ok);
@@ -920,18 +927,31 @@ jobs:
               if (g_nonbad == 0) { plog(@"VERDICT: nothing responded anywhere"); ulog(@"VERDICT: nothing responded"); }
           }
 
-          static void prologue(void) {
+          static int prologue(void) {
               ulog(@"PROLOGUE rebuild");
               plog(@"PROLOGUE start");
+              unlink(doc_file("try.txt").UTF8String);
               if (!g_root) find_root();
-              if (!g_root) { plog(@"PROLOGUE no root"); ulog(@"PROLOGUE no root"); return; }
+              if (!g_root) { plog(@"PROLOGUE FAIL no-root"); ulog(@"PROLOGUE FAIL no-root"); return 0; }
+              int c0 = g_nconn;
               svc_open();
+              plog(@"PROLOGUE svc +%d", g_nconn - c0); ulog(@"PROLOGUE svc +%d", g_nconn - c0);
+              c0 = g_nconn;
               root_open();
+              plog(@"PROLOGUE root +%d", g_nconn - c0); ulog(@"PROLOGUE root +%d", g_nconn - c0);
+              c0 = g_nconn;
               child_open();
+              plog(@"PROLOGUE child +%d", g_nconn - c0); ulog(@"PROLOGUE child +%d", g_nconn - c0);
+              c0 = g_nconn;
+              parent_kids();
+              plog(@"PROLOGUE pk +%d", g_nconn - c0); ulog(@"PROLOGUE pk +%d", g_nconn - c0);
               surf_make();
               surf_alloc();
               plog(@"PROLOGUE conns=%d vic=%d pair=%d sid=0x%x", g_nconn, g_vicn, g_pairn, g_sid);
               ulog(@"PROLOGUE conns=%d vic=%d pair=%d", g_nconn, g_vicn, g_pairn);
+              if (g_nconn < 1) { plog(@"PROLOGUE FAIL conns=0"); ulog(@"PROLOGUE FAIL conns=0"); return 0; }
+              if (g_pairn < 1) { plog(@"PROLOGUE WARN pairs=0"); ulog(@"PROLOGUE WARN pairs=0"); }
+              return 1;
           }
 
           static void do_step(int s) {
@@ -1009,12 +1029,18 @@ jobs:
               ulog(@"BUILD %s", BUILD_TAG);
               ulog(@"STEP %d/%d: %s", g_step, STEP_MAX, STEP_NAME[g_step < STEP_MAX+1 ? g_step : STEP_MAX]);
 
-              if (g_step > STEP_MAX) {
-                  ulog(@"REPLAY TAIL from 16");
-                  prologue();
-                  g_step = 16;
-                  save_step(g_step);
-                  g_try = 0; save_try();
+              if (g_step > 15 && (g_nconn == 0 || g_pairn == 0)) {
+                  ulog(@"REHYDRATE from %d (conns=%d pair=%d)", g_step, g_nconn, g_pairn);
+                  plog(@"REHYDRATE need conns=%d pair=%d step=%d", g_nconn, g_pairn, g_step);
+                  if (prologue()) {
+                      g_step = 16; save_step(g_step);
+                      ulog(@"REHYDRATE ok -> resume 16");
+                  } else {
+                      g_step = 5; save_step(g_step);
+                      unlink(doc_file("try.txt").UTF8String);
+                      ulog(@"REHYDRATE fail -> restart 5");
+                      plog(@"REHYDRATE FAIL restart 5");
+                  }
               }
 
               int svc = find_root();
@@ -1030,8 +1056,8 @@ jobs:
                   do_step(g_step);
                   int dh = g_hits - h0, dd = g_done - d0;
                   plog(@"STEP %d calls+%d hits+%d relive=%d", g_step, dd, dh, g_relive);
-                  plog(@"LIVE step=%d conns=%d vic=%d pair=%d probes=%d badarg=%d writes=%d oob=%d gap=%d outw=%d trapok=%d",
-                       g_step, g_nconn, g_vicn, g_pairn, g_probes, g_badarg, g_canary_w, g_oobsz, g_gapread, g_outw, g_trap_ok);
+                  plog(@"LIVE step=%d conns=%d vic=%d pair=%d probes=%d badarg=%d writes=%d oob=%d gap=%d outw=%d trapok=%d tblmask=0x%x",
+                       g_step, g_nconn, g_vicn, g_pairn, g_probes, g_badarg, g_canary_w, g_oobsz, g_gapread, g_outw, g_trap_ok, g_tbl_mask);
                   if (g_fd >= 0) fsync(g_fd);
                   ulog(@"STEP %d SURVIVED (+%d calls)", g_step, dd);
                   g_step++; save_step(g_step);
@@ -1056,8 +1082,8 @@ jobs:
               vc.view.backgroundColor = UIColor.blackColor;
               g_hb = [[UILabel alloc] initWithFrame:CGRectMake(8, 44, 344, 44)];
               g_hb.textColor = UIColor.systemYellowColor;
-              g_hb.font = [UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightRegular];
-              g_hb.numberOfLines = 2;
+              g_hb.font = [UIFont monospacedSystemFontOfSize:9 weight:UIFontWeightRegular];
+              g_hb.numberOfLines = 3;
               g_hb.text = @BUILD_TAG;
               [vc.view addSubview:g_hb];
               CGRect r = vc.view.bounds; r.origin.y = 92; r.size.height -= 100;
@@ -1074,7 +1100,7 @@ jobs:
               [NSTimer scheduledTimerWithTimeInterval:0.25 repeats:YES block:^(NSTimer*) {
                   g_tick++;
                   if (g_tick % 4 == 0) refresh_counts();
-                  g_hb.text = [NSString stringWithFormat:@"%s %d/%d conn=%d vic=%d pair=%d pr=%d bad=%d w=%d oob=%d gap=%d ow=%d add=%d tr=%d", BUILD_TAG, g_step, STEP_MAX, g_nconn, g_vicn, g_pairn, g_probes, g_badarg, g_canary_w, g_oobsz, g_gapread, g_outw, g_addok, g_trap_ok];
+                  g_hb.text = [NSString stringWithFormat:@"%s %d/%d conn=%d vic=%d pair=%d pr=%d bad=%d w=%d oob=%d gap=%d ow=%d add=%d tr=%d tm=%x", BUILD_TAG, g_step, STEP_MAX, g_nconn, g_vicn, g_pairn, g_probes, g_badarg, g_canary_w, g_oobsz, g_gapread, g_outw, g_addok, g_trap_ok, g_tbl_mask];
                   flush_ui();
               }];
               dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_global_queue(0,0), ^{ run(); });
@@ -1096,10 +1122,10 @@ jobs:
             <key>CFBundleIdentifier</key><string>com.buurza47.probe</string>
             <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
             <key>CFBundleName</key><string>probe</string>
-            <key>CFBundleDisplayName</key><string>buurd65</string>
+            <key>CFBundleDisplayName</key><string>buurd66</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleShortVersionString</key><string>1.0</string>
-            <key>CFBundleVersion</key><string>65</string>
+            <key>CFBundleVersion</key><string>66</string>
             <key>MinimumOSVersion</key><string>16.0</string>
             <key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
             <key>UILaunchScreen</key><dict/>
