@@ -47,6 +47,9 @@ jobs:
 
           cat > Sources/main.m <<'MAINEOF'
           #import <UIKit/UIKit.h>
+
+          #include <TargetConditionals.h>
+
           #import <IOKit/IOKitLib.h>
           #import <VideoToolbox/VideoToolbox.h>
           #import <CoreVideo/CoreVideo.h>
@@ -102,7 +105,7 @@ jobs:
           static fn_trap5 g_trap5 = NULL;
           static fn_trap6 g_trap6 = NULL;
 
-          #define BUILD_TAG "v64-widesweep"
+          #define BUILD_TAG "v65-widesweep"
           #define MAXC 128
           #define STEP_MAX 23
           #define TRY_MAX 2
@@ -853,31 +856,52 @@ jobs:
               free(in);
           }
 
+          // IOConnectSetCFProperty is macOS-only: the iOS SDK marks it unavailable.
+          // Shim it so the single source tree compiles against both SDKs.
+          #if TARGET_OS_OSX
+          static kern_return_t probe_set_cfprop(io_connect_t c, CFStringRef key, CFTypeRef val) {
+              return IOConnectSetCFProperty(c, key, val);
+          }
+          #else
+          static kern_return_t probe_set_cfprop(io_connect_t c, CFStringRef key, CFTypeRef val) {
+              (void)c; (void)key; (void)val;
+              return (kern_return_t)0xe00002c7;   // kIOReturnUnsupported
+          }
+          #endif
+
           static void setprop(void) {
               if (!g_nconn) { ulog(@"setprop no conn"); return; }
+
               const char* keys[8] = { "IOSurfaceID", "BufferSize", "IOSurface", "buffer", "size", "width", "height", "pixelFormat" };
-              ulog(@"PROP start conns=%d", g_nconn);
+
+              ulog(@"PROP start conns=%d osx=%d", g_nconn, (int)TARGET_OS_OSX);
+
               for (int ci = 0; ci < g_nconn; ci++) {
                   if (!g_conn[ci]) continue;
+
                   for (int k = 0; k < 8; k++) {
                       CFTypeRef v = (__bridge CFTypeRef)@(g_sid);
                       if (k == 1 || k == 4) v = (__bridge CFTypeRef)@(4096);
                       if (k == 5) v = (__bridge CFTypeRef)@(64);
                       if (k == 6) v = (__bridge CFTypeRef)@(64);
                       if (k == 7) v = (__bridge CFTypeRef)@(0x42475241);
-                      kern_return_t kr = IOConnectSetCFProperty(g_conn[ci], (__bridge CFStringRef)@(keys[k]), v);
+
+                      kern_return_t kr = probe_set_cfprop(g_conn[ci], (__bridge CFStringRef)@(keys[k]), v);
                       __sync_fetch_and_add(&g_done, 1);
+
                       if (kr == KERN_SUCCESS) {
                           __sync_fetch_and_add(&g_propok, 1);
                           plog(@"PROP n%d set %s OK", g_node[ci], keys[k]);
                           ulog(@"!!! PROP n%d set %s OK", g_node[ci], keys[k]);
-                          probe1(ci, 9, 0, 0, 0, 0, "s9prop");
-                          probe1(ci, 9, 0, 0, 3, 0, "s9prop");
                       } else {
                           plog(@"PROP n%d set %s -> %@", g_node[ci], keys[k], kr_name(kr));
                       }
+
+                      probe1(ci, 9, 0, 0, 0, 0, "s9prop");
+                      probe1(ci, 9, 0, 0, 3, 0, "s9prop");
                   }
               }
+
               ulog(@"prop done ok=%d", g_propok);
           }
 
@@ -1222,6 +1246,17 @@ jobs:
           int main(int argc, char** argv) { @autoreleasepool { return UIApplicationMain(argc, argv, nil, @"AppDelegate"); } }
           MAINEOF
 
+      - name: api-guard
+        run: |
+          set -e
+          # APIs the iOS SDK marks unavailable — must be inside TARGET_OS_OSX
+          for sym in IOConnectSetCFProperty IOServiceAddMatchingNotification \
+                     IORegistryEntryCreateCFProperty IOConnectSetNotificationPort; do
+            if grep -n "$sym" Sources/main.m; then
+              echo "::warning::$sym present — verify it is OS-guarded"
+            fi
+          done
+
       - name: plist
         run: |
           cat > out/Payload/probe.app/Info.plist <<'PEOF'
@@ -1233,10 +1268,10 @@ jobs:
             <key>CFBundleIdentifier</key><string>com.buurza47.probe</string>
             <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
             <key>CFBundleName</key><string>probe</string>
-            <key>CFBundleDisplayName</key><string>buurd68</string>
+            <key>CFBundleDisplayName</key><string>buurd69</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleShortVersionString</key><string>1.0</string>
-            <key>CFBundleVersion</key><string>68</string>
+            <key>CFBundleVersion</key><string>69</string>
             <key>MinimumOSVersion</key><string>16.0</string>
             <key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
             <key>UILaunchScreen</key><dict/>
