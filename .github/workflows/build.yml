@@ -113,9 +113,9 @@ jobs:
           static fn_trap5 g_trap5 = NULL;
           static fn_trap6 g_trap6 = NULL;
 
-          #define BUILD_TAG "v68-reqprobe"
+          #define BUILD_TAG "v69-arity"
           #define MAXC 128
-          #define STEP_MAX 30
+          #define STEP_MAX 32
           #define TRY_MAX 2
           #define MAXCHILD 16
           #define PKID_MAX 24
@@ -161,8 +161,11 @@ jobs:
           static volatile int g_probe_ok = 0;
           static volatile int g_notifok = 0;
           static volatile int g_hi_sel = 0;
+          static volatile int g_probesym = 0;
+          static volatile int g_replay = 0;
           static volatile int g_addfail[4][4];
           static volatile uint64_t g_live_sel = 0;
+          static volatile uint64_t g_ok_sel = 0;
           static volatile uint64_t g_tbl_mask = 0;
           static volatile uint16_t g_sig[64];
           static volatile uint8_t g_any_sel[HI_MAX];
@@ -212,7 +215,7 @@ jobs:
               "root-open", "child-open", "map-all", "surf-make", "surf-alloc",
               "traps", "addclient", "can-void", "prop-rich", "prop-read",
               "seq", "gap-forensics", "argmatrix", "s9-sid", "wide-sweep",
-              "notif", "probe-req", "s9-after", "summary", "verdict"
+              "notif", "probe-req", "s9-after", "arity", "arm-matrix", "summary", "verdict"
           };
 
           static void ulog(NSString* fmt, ...) {
@@ -262,6 +265,12 @@ jobs:
                   default: return [NSString stringWithFormat:@"0x%x", kr];
               }
           }
+          static int krclass(kern_return_t kr) {
+              if (kr == KERN_SUCCESS) return 0;
+              if (kr == 0xe00002bc) return 1;
+              if (kr == 0xe00002c2) return 2;
+              return 3;
+          }
           static NSString* hexn(const uint8_t* p, size_t n, size_t cap) {
               if (!n) return @"-";
               if (n > cap) n = cap;
@@ -309,7 +318,8 @@ jobs:
           static void refresh_counts(void) {
               NSString* st = [NSString stringWithContentsOfFile:doc_file("state.txt") encoding:NSUTF8StringEncoding error:nil];
               if (!st) return;
-              int pr = 0, w = 0, ob = 0, gp = 0, ow = 0, nb = 0, so = 0, ao = 0, to = 0, ba = 0, pp = 0, po = 0, nf = 0, gpo = 0, pq = 0;
+              int pr = 0, w = 0, ob = 0, gp = 0, ow = 0, nb = 0, so = 0, ao = 0, to = 0, ba = 0, pp = 0, po = 0, nf = 0, gpo = 0, pq = 0, sp = 0, hs = 0, sk = 0;
+              uint64_t tm = 0, okm = 0;
               for (NSString* ln in [st componentsSeparatedByString:@"\n"]) {
                   if ([ln hasPrefix:@"CAN "]) { pr++; if ([ln rangeOfString:@"hit=1"].location != NSNotFound) w++; continue; }
                   if ([ln hasPrefix:@"OOBSZ "]) ob++;
@@ -318,13 +328,37 @@ jobs:
                   if ([ln hasPrefix:@"P "] || [ln hasPrefix:@"X "]) { pp++; if ([ln rangeOfString:@"-> BadArg"].location != NSNotFound) ba++; else nb++; }
                   if ([ln hasPrefix:@"SO0 "]) so++;
                   if ([ln hasPrefix:@"ADD OK"]) ao++;
-                  if ([ln hasPrefix:@"PROP "]) po++;
+                  if ([ln hasPrefix:@"PROP "]) { po++; if ([ln rangeOfString:@"-> OK"].location != NSNotFound) sk++; }
                   if ([ln hasPrefix:@"GETP "] && [ln rangeOfString:@"-> OK"].location != NSNotFound) gpo++;
                   if ([ln hasPrefix:@"PROBE "] && [ln rangeOfString:@"-> OK"].location != NSNotFound) pq++;
                   if ([ln hasPrefix:@"NOTIF "] && [ln rangeOfString:@"-> OK"].location != NSNotFound) nf++;
                   if ([ln hasPrefix:@"TRAP "] && [ln rangeOfString:@"-> OK"].location != NSNotFound) to++;
+                  if ([ln hasPrefix:@"PROBESYM "]) { if ([ln rangeOfString:@" ok"].location != NSNotFound) g_probesym = 1; else g_probesym = -1; continue; }
+                  if ([ln hasPrefix:@"SIG "]) {
+                      int nd = 0; unsigned int s = 0, sic = 0;
+                      if (sscanf(ln.UTF8String, "SIG n%d s%u sic%u", &nd, &s, &sic) == 3) {
+                          sp++;
+                          if (s < HI_MAX) g_any_sel[s] = 1;
+                          if (s < 64) {
+                              tm |= (1ULL << (s & 63));
+                              g_sig[s] |= (uint16_t)(1u << (sic & 15));
+                              if ([ln rangeOfString:@"-> OK"].location != NSNotFound) okm |= (1ULL << (s & 63));
+                          }
+                      }
+                      continue;
+                  }
+                  if ([ln hasPrefix:@"WS "]) {
+                      int nd = 0; unsigned int s = 0;
+                      if (sscanf(ln.UTF8String, "WS n%d s%u", &nd, &s) == 2) {
+                          hs++;
+                          if (s < HI_MAX) g_any_sel[s] = 1;
+                      }
+                      continue;
+                  }
               }
               g_probes = pr + pp; g_badarg = ba; g_canary_w = w; g_oobsz = ob; g_gapread = gp; g_outw = ow; g_nonbad = nb; g_s0nz = so; g_addok = ao; g_trap_ok = to; g_propok = po; g_getpropok = gpo; g_probe_ok = pq; g_notifok = nf;
+              g_sigp = sp; g_tbl_mask = tm; g_ok_sel = okm; g_hi_sel = hs;
+              for (uint32_t s = 0; s < 64; s++) if (g_sig[s]) g_sic_ok++;
           }
           static void load_state(void) {
               NSString* s = [NSString stringWithContentsOfFile:doc_file("state.txt") encoding:NSUTF8StringEncoding error:nil];
@@ -708,7 +742,7 @@ jobs:
                           __sync_fetch_and_add(&g_done, 1);
                           if (kr != 0xe00002c2) {
                               g_any_sel[s] = 1;
-                              if (s < 64) { g_tbl_mask |= (1ULL << s); g_sig[s] |= (uint16_t)(1u << sic); }
+                              if (s < 64) { g_tbl_mask |= (1ULL << s); g_sig[s] |= (uint16_t)(1u << sic); if (kr == KERN_SUCCESS) g_ok_sel |= (1ULL << s); }
                               __sync_fetch_and_add(&g_sigp, 1);
                               plog(@"SIG n%d s%u sic%u -> %@ so0=%llu", g_node[ci], s, sic, kr_name(kr), (unsigned long long)so[0]);
                               ulog(@"SIG n%d s%u sic%u -> %@", g_node[ci], s, sic, kr_name(kr));
@@ -717,8 +751,8 @@ jobs:
                   }
               }
               for (uint32_t s = 0; s < 64; s++) if (g_sig[s]) { plog(@"SIGMASK s%u = 0x%x", s, g_sig[s]); ulog(@"SIGMASK s%u = 0x%x", s, g_sig[s]); }
-              plog(@"SWEEP mask=0x%llx sigp=%d", (unsigned long long)g_tbl_mask, g_sigp);
-              ulog(@"SWEEP mask=0x%llx", (unsigned long long)g_tbl_mask);
+              plog(@"SWEEP mask=0x%llx sigp=%d ok=0x%llx", (unsigned long long)g_tbl_mask, g_sigp, (unsigned long long)g_ok_sel);
+              ulog(@"SWEEP mask=0x%llx ok=0x%llx", (unsigned long long)g_tbl_mask, (unsigned long long)g_ok_sel);
           }
 
           static void map_all(void) {
@@ -1233,6 +1267,71 @@ jobs:
               ulog(@"s9a moved=%d", moved);
           }
 
+          static void arity(void) {
+              if (!g_nconn) { ulog(@"AR no conn"); return; }
+              ulog(@"AR start conns=%d sels 0-15 sic 0-16", g_nconn);
+              for (int ci = 0; ci < g_nconn; ci++) {
+                  if (!g_conn[ci]) continue;
+                  for (uint32_t s = 0; s <= 15; s++) {
+                      int ok = 0, err = 0, bad = 0, oth = 0, last = -1;
+                      for (uint32_t sic = 0; sic <= 16; sic++) {
+                          uint64_t sin[SCO] = {0};
+                          uint64_t so[SCO] = {0}; size_t sc = 0;
+                          uint8_t sb[512]; size_t szb = 512;
+                          memset(sb, AAM, sizeof(sb));
+                          kern_return_t kr = rawv(g_conn[ci], s, 0, sin, sic, NULL, 0, so, &sc, sb, &szb);
+                          __sync_fetch_and_add(&g_done, 1);
+                          int c = krclass(kr);
+                          if (c == 0) { ok++; g_ok_sel |= (1ULL << (s & 63)); }
+                          else if (c == 1) err++;
+                          else if (c == 2) bad++;
+                          else oth++;
+                          if (c != 2 && c != last) {
+                              plog(@"AR n%d s%u sic%u -> %@ sc%zu szb%zu so0=%llu", g_node[ci], s, sic, kr_name(kr), sc, szb, (unsigned long long)so[0]);
+                              if (c == 0) ulog(@"!!! AR n%d s%u sic%u OK", g_node[ci], s, sic);
+                          }
+                          last = c;
+                          usleep(20);
+                      }
+                      plog(@"ARSUM n%d s%u ok=%d err=%d bad=%d oth=%d", g_node[ci], s, ok, err, bad, oth);
+                      if (ok || err || oth) ulog(@"ARSUM n%d s%u ok=%d err=%d bad=%d oth=%d", g_node[ci], s, ok, err, bad, oth);
+                  }
+              }
+              ulog(@"ar done okmask=0x%llx", (unsigned long long)g_ok_sel);
+          }
+
+          static void arm_matrix(void) {
+              static const int arms[16] = { 0, 2, 1, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 9 };
+              if (!g_nconn) { ulog(@"ARM no conn"); return; }
+              ulog(@"ARM start conns=%d", g_nconn);
+              int flips = 0;
+              for (int ci = 0; ci < g_nconn; ci++) {
+                  if (!g_conn[ci]) continue;
+                  for (int ai = 0; ai < 16; ai++) {
+                      uint32_t arm = (uint32_t)arms[ai];
+                      for (int v = 0; v < 3; v++) {
+                          uint64_t sin[SCO] = {0};
+                          if (v == 1) sin[0] = g_sid;
+                          else if (v == 2) sin[0] = (uint64_t)g_conn[ci];
+                          uint64_t so[SCO] = {0}; size_t sc = 0;
+                          uint8_t sb[512]; size_t szb = 512; memset(sb, AAM, sizeof(sb));
+                          kern_return_t akr = rawv(g_conn[ci], arm, 0, sin, 0, NULL, 0, so, &sc, sb, &szb);
+                          uint64_t sin2[SCO] = {0};
+                          if (v == 1) sin2[0] = g_sid;
+                          else if (v == 2) sin2[0] = (uint64_t)g_conn[ci];
+                          uint64_t so2[SCO] = {0}; size_t sc2 = 0;
+                          uint8_t sb2[512]; size_t szb2 = 512; memset(sb2, AAM, sizeof(sb2));
+                          kern_return_t skr = rawv(g_conn[ci], 9, 0, sin2, 0, NULL, 0, so2, &sc2, sb2, &szb2);
+                          __sync_fetch_and_add(&g_done, 2);
+                          plog(@"ARM n%d arm%u v%d akr=%@ s9=%@ szb=%zu", g_node[ci], arm, v, kr_name(akr), kr_name(skr), szb2);
+                          if (skr == KERN_SUCCESS) { flips++; __sync_fetch_and_add(&g_hits, 1); ulog(@"!!! ARM n%d arm%u v%d -> s9 OK", g_node[ci], arm, v); }
+                          usleep(25);
+                      }
+                  }
+              }
+              ulog(@"arm done flips=%d", flips);
+          }
+
           static void agg_table(NSString* st) {
               int cnt[64][3][9]; memset(cnt, 0, sizeof(cnt));
               for (NSString* ln in [st componentsSeparatedByString:@"\n"]) {
@@ -1273,8 +1372,8 @@ jobs:
                   if ([ln hasPrefix:@"ADD "] || [ln hasPrefix:@"ADDM "] || [ln hasPrefix:@"TRAP "] || [ln hasPrefix:@"SWEEP "] || [ln hasPrefix:@"SIG "] ||
                       [ln hasPrefix:@"SIGMASK "] || [ln hasPrefix:@"PROP "] || [ln hasPrefix:@"SETPS "] || [ln hasPrefix:@"GETP "] ||
                       [ln hasPrefix:@"SEQ "] || [ln hasPrefix:@"GAPCH "] || [ln hasPrefix:@"S9SID "] || [ln hasPrefix:@"S9A "] ||
-                      [ln hasPrefix:@"WS "] || [ln hasPrefix:@"PROBE "] ||
-                      [ln hasPrefix:@"NOTIF "] || [ln hasPrefix:@"AM "] ||
+                      [ln hasPrefix:@"WS "] || [ln hasPrefix:@"PROBE "] || [ln hasPrefix:@"PROBESYM "] ||
+                      [ln hasPrefix:@"NOTIF "] || [ln hasPrefix:@"AM "] || [ln hasPrefix:@"AR "] || [ln hasPrefix:@"ARSUM "] || [ln hasPrefix:@"ARM "] ||
                       [ln hasPrefix:@"OOBSZ "] || [ln hasPrefix:@"OUTW "] ||
                       [ln hasPrefix:@"SO0 "] || [ln hasPrefix:@"GAP "] || [ln hasPrefix:@"CH "] || [ln hasPrefix:@"PK "] ||
                       [ln hasPrefix:@"PKO "] || [ln hasPrefix:@"SIGNAL "] || [ln hasPrefix:@"VIC "] || [ln hasPrefix:@"NODE "] ||
@@ -1294,20 +1393,25 @@ jobs:
 
           static void verdict(void) {
               refresh_counts();
+              if (g_replay) { plog(@"VERDICT: REPLAYED from state, counters restored"); ulog(@"VERDICT: replayed, counters restored"); }
               if (g_nconn == 0 || g_pairn == 0) {
                   plog(@"VERDICT: DRY conns=%d pairs=%d vic=%d - tail metrics vacuous", g_nconn, g_pairn, g_vicn);
                   ulog(@"VERDICT: DRY conns=%d pairs=%d", g_nconn, g_pairn);
               }
               int hi = 0;
               for (int s = 16; s < HI_MAX; s++) if (g_any_sel[s]) hi++;
-              plog(@"VERDICT probes=%d badarg=%d writes=%d oob=%d gap=%d outw=%d nonbad=%d so0=%d sicok=%d addok=%d trapok=%d sigp=%d propok=%d getpok=%d probeok=%d notifok=%d hi=%d tblmask=0x%llx livemask=0x%llx conns=%d",
-                   g_probes, g_badarg, g_canary_w, g_oobsz, g_gapread, g_outw, g_nonbad, g_s0nz, g_sic_ok, g_addok, g_trap_ok, g_sigp, g_propok, g_getpropok, g_probe_ok, g_notifok, hi, (unsigned long long)g_tbl_mask, (unsigned long long)g_live_sel, g_nconn);
+              plog(@"VERDICT probes=%d badarg=%d writes=%d oob=%d gap=%d outw=%d nonbad=%d so0=%d sicok=%d addok=%d trapok=%d sigp=%d propok=%d getpok=%d probeok=%d notifok=%d hi=%d tblmask=0x%llx okmask=0x%llx livemask=0x%llx conns=%d",
+                   g_probes, g_badarg, g_canary_w, g_oobsz, g_gapread, g_outw, g_nonbad, g_s0nz, g_sic_ok, g_addok, g_trap_ok, g_sigp, g_propok, g_getpropok, g_probe_ok, g_notifok, hi, (unsigned long long)g_tbl_mask, (unsigned long long)g_ok_sel, (unsigned long long)g_live_sel, g_nconn);
               ulog(@"VERDICT probes=%d badarg=%d writes=%d oob=%d outw=%d nonbad=%d sicok=%d addok=%d trapok=%d sigp=%d propok=%d getpok=%d probeok=%d notifok=%d hi=%d", g_probes, g_badarg, g_canary_w, g_oobsz, g_outw, g_nonbad, g_sic_ok, g_addok, g_trap_ok, g_sigp, g_propok, g_getpropok, g_probe_ok, g_notifok, hi);
-              if (g_tbl_mask) { plog(@"VERDICT: table mask 0x%llx", (unsigned long long)g_tbl_mask); ulog(@"VERDICT: table mask 0x%llx", (unsigned long long)g_tbl_mask); }
+              if (g_tbl_mask) { plog(@"VERDICT: table mask 0x%llx okmask 0x%llx", (unsigned long long)g_tbl_mask, (unsigned long long)g_ok_sel); ulog(@"VERDICT: table mask 0x%llx ok=0x%llx", (unsigned long long)g_tbl_mask, (unsigned long long)g_ok_sel); }
               if (hi) { plog(@"VERDICT: selectors above 15: %d", hi); ulog(@"VERDICT: selectors above 15: %d", hi); }
               if (g_sigp == 0) { plog(@"VERDICT: no signature anywhere"); ulog(@"VERDICT: no signature anywhere"); }
+              else { plog(@"VERDICT: live responses=%d, succeeding selectors=0x%llx", g_sigp, (unsigned long long)g_ok_sel); ulog(@"VERDICT: live=%d ok=0x%llx", g_sigp, (unsigned long long)g_ok_sel); }
+              if (g_probesym == 1) { plog(@"VERDICT: reqprobe present"); ulog(@"VERDICT: reqprobe present"); }
+              else if (g_probesym == -1) { plog(@"VERDICT: reqprobe ABSENT - step 27 dead, drop it"); ulog(@"VERDICT: reqprobe absent, drop step 27"); }
+              else { plog(@"VERDICT: reqprobe unresolved"); ulog(@"VERDICT: reqprobe unresolved"); }
               if (g_getpropok) { plog(@"VERDICT: GETPROP READBACK WORKS x%d", g_getpropok); ulog(@"VERDICT: getprop readback works"); }
-              else { plog(@"VERDICT: no property readback - setprop unverified"); ulog(@"VERDICT: no readback"); }
+              else { plog(@"VERDICT: no property readback - setprop unverified despite %d OK", g_propok); ulog(@"VERDICT: no readback, setprop unverified"); }
               if (g_probe_ok) { plog(@"VERDICT: request-probe ok x%d", g_probe_ok); ulog(@"VERDICT: probe req ok"); }
               if (g_addok) { plog(@"VERDICT: ADDCLIENT ACCEPTED x%d", g_addok); ulog(@"VERDICT: ADDCLIENT ACCEPTED"); }
               if (g_trap_ok) { plog(@"VERDICT: trap succeeded x%d", g_trap_ok); ulog(@"VERDICT: trap succeeded"); }
@@ -1384,8 +1488,10 @@ jobs:
                   case 26: notif(); break;
                   case 27: probe_req(); break;
                   case 28: s9_after(); break;
-                  case 29: summary(); break;
-                  case 30: verdict(); break;
+                  case 29: arity(); break;
+                  case 30: arm_matrix(); break;
+                  case 31: summary(); break;
+                  case 32: verdict(); break;
               }
           }
 
@@ -1396,6 +1502,7 @@ jobs:
               g_seen = [NSMutableSet set];
               load_state();
               g_step = load_step();
+              if (g_step > STEP_MAX) g_replay = 1;
 
               mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &g_wake);
               mach_port_insert_right(mach_task_self(), g_wake, g_wake, MACH_MSG_TYPE_MAKE_SEND);
@@ -1429,6 +1536,7 @@ jobs:
                    is, (void*)g_surfcreate, (void*)g_surflock, (void*)g_baseaddr, (void*)g_allocusize,
                    (void*)g_addclient, (void*)g_setprop, (void*)g_setprops, (void*)g_getprop, (void*)g_setnotif,
                    (void*)g_reqprobe, ntr);
+              plog(@"PROBESYM %s", g_reqprobe ? "ok" : "no");
               ulog(@"IOSurface=%s addclient=%s setprop=%s setprops=%s getprop=%s setnotif=%s reqprobe=%s traps=%d",
                    is ? "ok" : "FAIL", g_addclient ? "ok" : "FAIL", g_setprop ? "ok" : "FAIL",
                    g_setprops ? "ok" : "FAIL", g_getprop ? "ok" : "FAIL", g_setnotif ? "ok" : "FAIL",
@@ -1510,7 +1618,7 @@ jobs:
               [NSTimer scheduledTimerWithTimeInterval:0.25 repeats:YES block:^(NSTimer*) {
                   g_tick++;
                   if (g_tick % 4 == 0) refresh_counts();
-                  g_hb.text = [NSString stringWithFormat:@"%s %d/%d conn=%d vic=%d pair=%d pr=%d bad=%d w=%d oob=%d gap=%d ow=%d add=%d tr=%d pp=%d gpo=%d pq=%d nf=%d sg=%d hi=%d tm=%llx", BUILD_TAG, g_step, STEP_MAX, g_nconn, g_vicn, g_pairn, g_probes, g_badarg, g_canary_w, g_oobsz, g_gapread, g_outw, g_addok, g_trap_ok, g_propok, g_getpropok, g_probe_ok, g_notifok, g_sigp, g_hi_sel, (unsigned long long)g_tbl_mask];
+                  g_hb.text = [NSString stringWithFormat:@"%s %d/%d conn=%d vic=%d pair=%d pr=%d bad=%d w=%d oob=%d gap=%d ow=%d add=%d tr=%d pp=%d gpo=%d pq=%d nf=%d sg=%d hi=%d tm=%llx ok=%llx", BUILD_TAG, g_step, STEP_MAX, g_nconn, g_vicn, g_pairn, g_probes, g_badarg, g_canary_w, g_oobsz, g_gapread, g_outw, g_addok, g_trap_ok, g_propok, g_getpropok, g_probe_ok, g_notifok, g_sigp, g_hi_sel, (unsigned long long)g_tbl_mask, (unsigned long long)g_ok_sel];
                   flush_ui();
               }];
               dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_global_queue(0,0), ^{ run(); });
@@ -1532,10 +1640,10 @@ jobs:
             <key>CFBundleIdentifier</key><string>com.buurza47.probe</string>
             <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
             <key>CFBundleName</key><string>probe</string>
-            <key>CFBundleDisplayName</key><string>buurd71</string>
+            <key>CFBundleDisplayName</key><string>buurd72</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleShortVersionString</key><string>1.0</string>
-            <key>CFBundleVersion</key><string>71</string>
+            <key>CFBundleVersion</key><string>72</string>
             <key>MinimumOSVersion</key><string>16.0</string>
             <key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
             <key>UILaunchScreen</key><dict/>
