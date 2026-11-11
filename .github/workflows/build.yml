@@ -1466,5 +1466,5 @@ jobs:
         with:
           name: probe-ipa-${{ github.run_number }}-${{ github.run_attempt }}
           path: out/probe.ipa
-          if-no-files-found: never
+          if-no-files-found: error
           retention-days: 3
