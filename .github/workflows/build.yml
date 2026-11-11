@@ -81,6 +81,7 @@ jobs:
           typedef kern_return_t (*fn_setprops)(io_connect_t, CFDictionaryRef);
           typedef kern_return_t (*fn_getprop)(io_connect_t, CFStringRef, CFTypeRef*);
           typedef kern_return_t (*fn_setnotif)(io_connect_t, uint32_t, mach_port_t);
+          typedef kern_return_t (*fn_reqprobe)(io_service_t, uint32_t);
 
           typedef kern_return_t (*fn_trap0)(io_connect_t, uint32_t);
           typedef kern_return_t (*fn_trap1)(io_connect_t, uint32_t, uintptr_t);
@@ -102,6 +103,7 @@ jobs:
           static fn_setprops g_setprops = NULL;
           static fn_getprop g_getprop = NULL;
           static fn_setnotif g_setnotif = NULL;
+          static fn_reqprobe g_reqprobe = NULL;
 
           static fn_trap0 g_trap0 = NULL;
           static fn_trap1 g_trap1 = NULL;
@@ -111,7 +113,7 @@ jobs:
           static fn_trap5 g_trap5 = NULL;
           static fn_trap6 g_trap6 = NULL;
 
-          #define BUILD_TAG "v67-propread"
+          #define BUILD_TAG "v68-reqprobe"
           #define MAXC 128
           #define STEP_MAX 30
           #define TRY_MAX 2
@@ -1193,20 +1195,21 @@ jobs:
           }
 
           static void probe_req(void) {
+              if (!g_reqprobe) { plog(@"PROBE no sym"); ulog(@"probe no sym"); return; }
               if (g_root) {
-                  kern_return_t kr = IOServiceRequestProbe(g_root, 0);
+                  kern_return_t kr = g_reqprobe(g_root, 0);
                   plog(@"PROBE root -> %@", kr_name(kr)); ulog(@"PROBE root %@", kr_name(kr));
                   if (kr == KERN_SUCCESS) __sync_fetch_and_add(&g_probe_ok, 1);
               }
               for (int i = 1; i <= g_nchild; i++) {
                   if (!g_child[i]) continue;
-                  kern_return_t kr = IOServiceRequestProbe(g_child[i], 0);
+                  kern_return_t kr = g_reqprobe(g_child[i], 0);
                   plog(@"PROBE c%d -> %@", i, kr_name(kr));
                   if (kr == KERN_SUCCESS) __sync_fetch_and_add(&g_probe_ok, 1);
               }
               for (int i = 1; i <= g_pn; i++) {
                   if (!g_pkid[i]) continue;
-                  kern_return_t kr = IOServiceRequestProbe(g_pkid[i], 0);
+                  kern_return_t kr = g_reqprobe(g_pkid[i], 0);
                   plog(@"PROBE pk%d -> %@", i, kr_name(kr));
                   if (kr == KERN_SUCCESS) __sync_fetch_and_add(&g_probe_ok, 1);
               }
@@ -1413,6 +1416,7 @@ jobs:
               g_setprops = (fn_setprops)dlsym(ih, "IOConnectSetCFProperties");
               g_getprop = (fn_getprop)dlsym(ih, "IOConnectGetCFProperty");
               g_setnotif = (fn_setnotif)dlsym(ih, "IOConnectSetNotificationPort");
+              g_reqprobe = (fn_reqprobe)dlsym(ih, "IOServiceRequestProbe");
               g_trap0 = (fn_trap0)dlsym(ih, "IOConnectTrap0");
               g_trap1 = (fn_trap1)dlsym(ih, "IOConnectTrap1");
               g_trap2 = (fn_trap2)dlsym(ih, "IOConnectTrap2");
@@ -1421,12 +1425,14 @@ jobs:
               g_trap5 = (fn_trap5)dlsym(ih, "IOConnectTrap5");
               g_trap6 = (fn_trap6)dlsym(ih, "IOConnectTrap6");
               int ntr = (g_trap0?1:0)+(g_trap1?1:0)+(g_trap2?1:0)+(g_trap3?1:0)+(g_trap4?1:0)+(g_trap5?1:0)+(g_trap6?1:0);
-              plog(@"syms is=%p create=%p lock=%p base=%p alloc=%p addclient=%p setprop=%p setprops=%p getprop=%p setnotif=%p traps=%d",
+              plog(@"syms is=%p create=%p lock=%p base=%p alloc=%p addclient=%p setprop=%p setprops=%p getprop=%p setnotif=%p reqprobe=%p traps=%d",
                    is, (void*)g_surfcreate, (void*)g_surflock, (void*)g_baseaddr, (void*)g_allocusize,
-                   (void*)g_addclient, (void*)g_setprop, (void*)g_setprops, (void*)g_getprop, (void*)g_setnotif, ntr);
-              ulog(@"IOSurface=%s addclient=%s setprop=%s setprops=%s getprop=%s setnotif=%s traps=%d",
+                   (void*)g_addclient, (void*)g_setprop, (void*)g_setprops, (void*)g_getprop, (void*)g_setnotif,
+                   (void*)g_reqprobe, ntr);
+              ulog(@"IOSurface=%s addclient=%s setprop=%s setprops=%s getprop=%s setnotif=%s reqprobe=%s traps=%d",
                    is ? "ok" : "FAIL", g_addclient ? "ok" : "FAIL", g_setprop ? "ok" : "FAIL",
-                   g_setprops ? "ok" : "FAIL", g_getprop ? "ok" : "FAIL", g_setnotif ? "ok" : "FAIL", ntr);
+                   g_setprops ? "ok" : "FAIL", g_getprop ? "ok" : "FAIL", g_setnotif ? "ok" : "FAIL",
+                   g_reqprobe ? "ok" : "FAIL", ntr);
 
               plog(@"=== LAUNCH step=%d build=%s wake=0x%x", g_step, BUILD_TAG, g_wake);
               if (g_fd >= 0) fsync(g_fd);
@@ -1526,10 +1532,10 @@ jobs:
             <key>CFBundleIdentifier</key><string>com.buurza47.probe</string>
             <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
             <key>CFBundleName</key><string>probe</string>
-            <key>CFBundleDisplayName</key><string>buurd70</string>
+            <key>CFBundleDisplayName</key><string>buurd71</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleShortVersionString</key><string>1.0</string>
-            <key>CFBundleVersion</key><string>70</string>
+            <key>CFBundleVersion</key><string>71</string>
             <key>MinimumOSVersion</key><string>16.0</string>
             <key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
             <key>UILaunchScreen</key><dict/>
@@ -1543,11 +1549,18 @@ jobs:
       - name: api-guard
         run: |
           set -e
-          for sym in IOConnectSetCFProperty IOConnectSetCFProperties IOConnectGetCFProperty IOConnectSetNotificationPort IOConnectAddClient; do
+          for sym in IOConnectSetCFProperty IOConnectSetCFProperties IOConnectGetCFProperty IOConnectSetNotificationPort IOConnectAddClient IOServiceRequestProbe; do
             if grep -n "$sym" Sources/main.m; then
               echo "::warning::$sym referenced — confirm dlsym, never by name"
             fi
           done
+
+      - name: avail-guard
+        run: |
+          set -e
+          if grep -nE '\bIOServiceRequestProbe\s*\(' Sources/main.m | grep -v 'g_reqprobe'; then
+            echo "::warning::direct IOServiceRequestProbe call — should go through g_reqprobe"
+          fi || true
 
       - name: cast-guard
         run: |
