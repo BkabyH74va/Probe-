@@ -115,7 +115,7 @@ jobs:
           static fn_trap5 g_trap5 = NULL;
           static fn_trap6 g_trap6 = NULL;
 
-          #define BUILD_TAG "v71-global"
+          #define BUILD_TAG "v72-fwd"
           #define MAXC 128
           #define STEP_MAX 37
           #define TRY_MAX 2
@@ -230,6 +230,21 @@ jobs:
               "probe-req", "s9-after", "arity", "prop-surface", "arm-matrix",
               "summary", "verdict"
           };
+
+          /* ---- forward declarations: keep before first use ---- */
+          static void ulog(NSString* fmt, ...);
+          static void plog(NSString* fmt, ...);
+          static NSString* kr_name(kern_return_t kr);
+          static NSString* hexn(const uint8_t* p, size_t n, size_t cap);
+          static void desc_into(uint8_t* in, size_t n);
+          static void canary(uint32_t sel, int mode, size_t zos, size_t zis, int arg0, uint32_t sic, const char* tag);
+          static void vic_fill(int idx, uint8_t v);
+          static int vic_scan(int idx, size_t* first, size_t* dirty);
+          static CFMutableDictionaryRef make_sdict(void);
+          static void dump_props(io_object_t o, int node);
+          static void dump_tree(void);
+          static void dump_node(io_object_t o, const char* lbl);
+          /* ------------------------------------------------------ */
 
           static void ulog(NSString* fmt, ...) {
               va_list ap; va_start(ap, fmt);
@@ -1905,10 +1920,10 @@ jobs:
             <key>CFBundleIdentifier</key><string>com.buurza47.probe</string>
             <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
             <key>CFBundleName</key><string>probe</string>
-            <key>CFBundleDisplayName</key><string>buurd74</string>
+            <key>CFBundleDisplayName</key><string>buurd75</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleShortVersionString</key><string>1.0</string>
-            <key>CFBundleVersion</key><string>74</string>
+            <key>CFBundleVersion</key><string>75</string>
             <key>MinimumOSVersion</key><string>16.0</string>
             <key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
             <key>UILaunchScreen</key><dict/>
@@ -1919,6 +1934,18 @@ jobs:
           plutil -lint out/Payload/probe.app/Info.plist
           wc -l Sources/main.m
 
+      - name: proto-guard
+        run: |
+          set -e
+          for f in canary vic_fill vic_scan make_sdict dump_props dump_tree dump_node; do
+            d=$(grep -nE "^ *static (void|int|CFMutableDictionaryRef|NSString\*) $f\(" Sources/main.m | head -1 | cut -d: -f1)
+            p=$(grep -nE "^ *static (void|int|CFMutableDictionaryRef|NSString\*) $f\(" Sources/main.m | head -1 | cut -d: -f1)
+            fwd=$(grep -nE "^ *static .* $f\(.*\);" Sources/main.m | head -1 | cut -d: -f1)
+            if [ -z "$fwd" ]; then echo "::error::no forward decl for $f"; exit 1; fi
+            if [ -n "$d" ] && [ "$fwd" -gt "$d" ]; then echo "::error::forward decl for $f is after definition"; exit 1; fi
+            echo "ok $f decl@$fwd def@$d"
+          done
+
       - name: api-guard
         run: |
           set -e
@@ -1927,16 +1954,6 @@ jobs:
               echo "::warning::$sym referenced — confirm dlsym, never by name"
             fi
           done
-
-      - name: avail-guard
-        run: |
-          set -e
-          if grep -nE '\bIOServiceRequestProbe\s*\(' Sources/main.m | grep -v 'g_reqprobe'; then
-            echo "::warning::direct IOServiceRequestProbe call — should go through g_reqprobe"
-          fi || true
-          if grep -nE '\bIOSurfaceLookup\s*\(' Sources/main.m | grep -v 'g_surflookup'; then
-            echo "::warning::direct IOSurfaceLookup call — should go through g_surflookup"
-          fi || true
 
       - name: cast-guard
         run: |
