@@ -914,9 +914,9 @@ jobs:
               CFTypeRef vals[5];
               vals[0] = (__bridge CFTypeRef)@(g_sid);
               vals[1] = (__bridge CFTypeRef)@(4096);
-              vals[2] = (__bridge CFTypeRef)d4;
-              vals[3] = (__bridge CFTypeRef)d16;
-              vals[4] = (__bridge CFTypeRef)sd;
+              vals[2] = (CFTypeRef)d4;
+              vals[3] = (CFTypeRef)d16;
+              vals[4] = (CFTypeRef)sd;
               ulog(@"PROP rich conns=%d sid=0x%x", g_nconn, g_sid);
               for (int ci = 0; ci < g_nconn; ci++) {
                   if (!g_conn[ci]) continue;
@@ -933,7 +933,7 @@ jobs:
                           }
                       }
                   }
-                  kern_return_t kr2 = g_setprop(g_conn[ci], (__bridge CFStringRef)@("Class"), (__bridge CFTypeRef)sref);
+                  kern_return_t kr2 = g_setprop(g_conn[ci], (__bridge CFStringRef)@("Class"), (CFTypeRef)sref);
                   if (kr2 == KERN_SUCCESS) ulog(@"!!! PROP n%d Class str OK", g_node[ci]);
               }
               CFRelease(d4); CFRelease(d16); CFRelease(sd);
@@ -1389,6 +1389,15 @@ jobs:
             fi
           done
 
+      - name: cast-guard
+        run: |
+          set -e
+          # __bridge needs one side to be a retainable ObjC pointer.
+          # CF ref -> CFTypeRef must be a plain C cast. Catch bare identifiers.
+          if grep -nE '__bridge CFTypeRef\)[A-Za-z_]' Sources/main.m; then
+            echo "::warning::__bridge on a CF type — use a plain (CFTypeRef) cast"
+          fi || true
+
       - name: build
         run: |
           set -euo pipefail
@@ -1400,6 +1409,7 @@ jobs:
             -isysroot "$SDK" -I stub -O1 -std=gnu11 \
             -Wno-implicit-function-declaration -Wno-typedef-redefinition \
             -Wno-deprecated-declarations -Wno-nullability-completeness \
+            -Wno-c2x-extensions \
             -framework UIKit -framework Foundation -framework CoreFoundation \
             -framework IOKit -framework VideoToolbox -framework CoreMedia \
             -framework CoreVideo -framework Security \
