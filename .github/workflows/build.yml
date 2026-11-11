@@ -102,7 +102,7 @@ jobs:
           static fn_trap5 g_trap5 = NULL;
           static fn_trap6 g_trap6 = NULL;
 
-          #define BUILD_TAG "v62-fallback"
+          #define BUILD_TAG "v63-sigscan"
           #define MAXC 128
           #define STEP_MAX 22
           #define TRY_MAX 2
@@ -110,9 +110,9 @@ jobs:
           #define PKID_MAX 24
           #define VIC_MAX 72
           #define FIXED 4096
-          #define BIGOUT 16
           #define SEL_N 64
           #define SELSWEEP 16
+          #define SIG_MAX 8
           #define SCO 16
           #define SVC_N 6
           #define SV_N 12
@@ -138,14 +138,15 @@ jobs:
           static volatile int g_canary_dirty = 0;
           static volatile int g_oobsz = 0;
           static volatile int g_gapread = 0;
-          static volatile int g_cls_err = 0;
           static volatile int g_outw = 0;
           static volatile int g_nonbad = 0;
           static volatile int g_sic_ok = 0;
           static volatile int g_addok = 0;
           static volatile int g_trap_ok = 0;
           static volatile int g_live_sel = 0;
+          static volatile int g_sigp = 0;
           static volatile uint32_t g_tbl_mask = 0;
+          static volatile uint16_t g_sig[32];
           static int g_tick = 0;
           static int g_try = 0;
           static int g_fd = -1;
@@ -160,6 +161,7 @@ jobs:
           static size_t g_valloc[VIC_MAX];
           static uint32_t g_sid = 0;
           static uint64_t g_hdl = 0;
+          static uint8_t* g_cbuf = NULL;
           static io_service_t g_root = 0;
           static io_service_t g_child[MAXCHILD + 1];
           static io_service_t g_pkid[PKID_MAX + 1];
@@ -343,11 +345,6 @@ jobs:
                                     uint8_t* soutS, size_t* soSz) {
               return rawx(c, sel, mode, sin, sic, sinS, zis, zis ? 1 : 0, sout, soCnt, soutS, soSz);
           }
-          static kern_return_t hb(void) {
-              if (g_best < 0 || g_best >= g_nconn) return (kern_return_t)0xe00002cc;
-              uint64_t so[SCO] = {0}; size_t sc = 0; uint8_t sb[64]; size_t szb = 0;
-              return rawv(g_conn[g_best], 0, 0, NULL, 0, NULL, 0, so, &sc, sb, &szb);
-          }
           static void note_ok(uint32_t sel) { if (sel < SEL_N) g_live_sel |= (1 << (sel & 31)); }
 
           static void probe1(int ci, uint32_t sel, int mode, uint32_t sic, int a0, size_t zis, const char* tag) {
@@ -358,6 +355,7 @@ jobs:
               if (a0 == 1) sin[0] = (uint64_t)g_conn[ci];
               else if (a0 == 2) sin[0] = g_sid;
               else if (a0 == 3) for (uint32_t k = 0; k < SCO; k++) sin[k] = SV[k % SV_N];
+              else if (a0 == 4) sin[0] = (uint64_t)g_cbuf;
               uint64_t so[SCO] = {0}; size_t sc = 0;
               uint8_t sb[FIXED]; size_t szb = FIXED;
               memset(sb, AAM, sizeof(sb));
@@ -628,24 +626,31 @@ jobs:
 
           static void sel_sweep(void) {
               if (!g_nconn) { plog(@"SWEEP noconn"); ulog(@"SWEEP no conn"); return; }
-              ulog(@"SWEEP 0-%d x %d conns", SELSWEEP - 1, g_nconn);
+              ulog(@"SWEEP 0-%d sic0-%d x %d conns", SELSWEEP - 1, SIG_MAX, g_nconn);
               for (int ci = 0; ci < g_nconn; ci++) {
                   if (!g_conn[ci]) continue;
                   for (uint32_t s = 0; s < SELSWEEP; s++) {
-                      uint64_t sin[SCO] = {0};
-                      uint64_t so[SCO] = {0}; size_t sc = 0;
-                      uint8_t sb[64]; size_t szb = 64;
-                      memset(sb, AAM, sizeof(sb));
-                      kern_return_t kr = rawv(g_conn[ci], s, 0, sin, 0, NULL, 0, so, &sc, sb, &szb);
-                      __sync_fetch_and_add(&g_done, 1);
-                      if (kr != 0xe00002c2) {
-                          if (s < 32) g_tbl_mask |= (1u << s);
-                          plog(@"SWEEP n%d s%u -> %@", g_node[ci], s, kr_name(kr));
-                          ulog(@"SWEEP n%d s%u -> %@", g_node[ci], s, kr_name(kr));
-                      } else __sync_fetch_and_add(&g_badarg, 1);
+                      for (uint32_t sic = 0; sic <= SIG_MAX; sic++) {
+                          uint64_t sin[SCO]; for (uint32_t k = 0; k < SCO; k++) sin[k] = SV[k % SV_N];
+                          uint64_t so[SCO] = {0}; size_t sc = 0;
+                          uint8_t sb[64]; size_t szb = 64;
+                          memset(sb, AAM, sizeof(sb));
+                          kern_return_t kr = rawv(g_conn[ci], s, 0, sin, sic, NULL, 0, so, &sc, sb, &szb);
+                          __sync_fetch_and_add(&g_done, 1);
+                          if (kr != 0xe00002c2) {
+                              if (s < 32) {
+                                  g_tbl_mask |= (1u << s);
+                                  g_sig[s] |= (uint16_t)(1u << sic);
+                                  __sync_fetch_and_add(&g_sigp, 1);
+                              }
+                              plog(@"SIG n%d s%u sic%u -> %@ so0=%llu", g_node[ci], s, sic, kr_name(kr), (unsigned long long)so[0]);
+                              ulog(@"SIG n%d s%u sic%u -> %@", g_node[ci], s, sic, kr_name(kr));
+                          } else __sync_fetch_and_add(&g_badarg, 1);
+                      }
                   }
               }
-              plog(@"SWEEP mask=0x%x", g_tbl_mask);
+              for (uint32_t s = 0; s < 32; s++) if (g_sig[s]) { plog(@"SIGMASK s%u = 0x%x", s, g_sig[s]); ulog(@"SIGMASK s%u = 0x%x", s, g_sig[s]); }
+              plog(@"SWEEP mask=0x%x sigp=%d", g_tbl_mask, g_sigp);
               ulog(@"SWEEP mask=0x%x", g_tbl_mask);
           }
 
@@ -654,37 +659,44 @@ jobs:
               uint32_t sels[16]; int ns = 0;
               for (uint32_t s = 0; s < SELSWEEP && ns < 8; s++) if (g_tbl_mask & (1u << s)) sels[ns++] = s;
               if (!ns) { sels[0] = 0; sels[1] = 2; sels[2] = 9; ns = 3; }
+              int calls = 0;
               ulog(@"MAP matrix sels=%d conns=%d", ns, g_nconn);
               for (int ci = 0; ci < g_nconn; ci++) {
                   if (!g_conn[ci]) continue;
-                  for (int si = 0; si < ns; si++)
-                      for (int m = 0; m <= 1; m++)
-                          for (uint32_t sic = 0; sic <= 2; sic++)
-                              for (int a0 = 0; a0 <= 2; a0++)
-                                  probe1(ci, sels[si], m, sic, a0, 0, "map");
+                  for (int si = 0; si < ns; si++) {
+                      uint32_t sel = sels[si];
+                      uint16_t m = g_sig[sel] ? g_sig[sel] : 1u;
+                      for (uint32_t sic = 0; sic <= SIG_MAX; sic++) {
+                          if (!(m & (1u << sic))) continue;
+                          for (int mo = 0; mo <= 2; mo++)
+                              for (int a0 = 0; a0 <= 3; a0++) { probe1(ci, sel, mo, sic, a0, 0, "map"); calls++; }
+                      }
+                  }
               }
-              ulog(@"MAP done live=%d", g_ssw_hit);
+              ulog(@"MAP done live=%d calls=%d", g_ssw_hit, calls);
           }
 
           static void traps(void) {
               int nsym = (g_trap0?1:0)+(g_trap1?1:0)+(g_trap2?1:0)+(g_trap3?1:0)+(g_trap4?1:0)+(g_trap5?1:0)+(g_trap6?1:0);
               if (!nsym) { plog(@"TRAP nosyms"); ulog(@"TRAP no syms"); return; }
               if (!g_nconn) { plog(@"TRAP noconn"); ulog(@"TRAP no conn"); return; }
-              ulog(@"TRAP start conns=%d syms=%d", g_nconn, nsym);
+              uint8_t* tb = calloc(1, FIXED);
+              if (tb) memset(tb, PAT, FIXED);
+              uintptr_t p = (uintptr_t)tb;
+              ulog(@"TRAP start conns=%d syms=%d buf=0x%lx", g_nconn, nsym, (unsigned long)p);
               for (int ci = 0; ci < g_nconn; ci++) {
                   if (!g_conn[ci]) continue;
                   for (uint32_t idx = 0; idx <= 2; idx++) {
                       for (int n = 0; n <= 6; n++) {
                           kern_return_t kr = (kern_return_t)0xe00002c7;
-                          uintptr_t a1 = (uintptr_t)g_conn[ci], a2 = (uintptr_t)g_sid, a3 = 4096, a4 = 0, a5 = 0, a6 = 0;
                           switch (n) {
                               case 0: if (g_trap0) kr = g_trap0(g_conn[ci], idx); break;
-                              case 1: if (g_trap1) kr = g_trap1(g_conn[ci], idx, a1); break;
-                              case 2: if (g_trap2) kr = g_trap2(g_conn[ci], idx, a1, a2); break;
-                              case 3: if (g_trap3) kr = g_trap3(g_conn[ci], idx, a1, a2, a3); break;
-                              case 4: if (g_trap4) kr = g_trap4(g_conn[ci], idx, a1, a2, a3, a4); break;
-                              case 5: if (g_trap5) kr = g_trap5(g_conn[ci], idx, a1, a2, a3, a4, a5); break;
-                              default: if (g_trap6) kr = g_trap6(g_conn[ci], idx, a1, a2, a3, a4, a5, a6); break;
+                              case 1: if (g_trap1) kr = g_trap1(g_conn[ci], idx, p); break;
+                              case 2: if (g_trap2) kr = g_trap2(g_conn[ci], idx, p, (uintptr_t)FIXED); break;
+                              case 3: if (g_trap3) kr = g_trap3(g_conn[ci], idx, p, (uintptr_t)FIXED, (uintptr_t)g_sid); break;
+                              case 4: if (g_trap4) kr = g_trap4(g_conn[ci], idx, p, (uintptr_t)FIXED, (uintptr_t)g_sid, 0); break;
+                              case 5: if (g_trap5) kr = g_trap5(g_conn[ci], idx, p, (uintptr_t)FIXED, (uintptr_t)g_sid, 0, 0); break;
+                              default: if (g_trap6) kr = g_trap6(g_conn[ci], idx, p, (uintptr_t)FIXED, (uintptr_t)g_sid, 0, 0, 0); break;
                           }
                           __sync_fetch_and_add(&g_done, 1);
                           plog(@"TRAP n%d idx%u a%d -> %@", g_node[ci], idx, n, kr_name(kr));
@@ -693,6 +705,7 @@ jobs:
                       }
                   }
               }
+              free(tb);
               ulog(@"trap done ok=%d", g_trap_ok);
           }
 
@@ -793,6 +806,7 @@ jobs:
           static void canary(uint32_t sel, int mode, size_t zos, size_t zis, int arg0, uint32_t sic, const char* tag) {
               if (g_pairn == 0) { plog(@"CAN %s NO PAIRS", tag); ulog(@"CAN %s NO PAIRS", tag); return; }
               if (g_nconn == 0) { plog(@"CAN %s NO CONN", tag); ulog(@"CAN %s NO CONN", tag); return; }
+              if (!g_cbuf) { g_cbuf = calloc(1, FIXED); if (g_cbuf) memset(g_cbuf, PAT, FIXED); }
               ulog(@"CAN %s START s%u pairs=%d conns=%d m%d zo=%zu zi=%zu a0=%d sic=%u", tag, sel, g_pairn, g_nconn, mode, zos, zis, arg0, sic);
               uint8_t* in = NULL;
               if (zis) { in = calloc(1, zis); if (!in) return; memset(in, PAT, zis); desc_into(in, zis); }
@@ -805,6 +819,7 @@ jobs:
                       if (arg0 == 1) sin[0] = (uint64_t)g_conn[ci];
                       else if (arg0 == 2) sin[0] = g_sid;
                       else if (arg0 == 3) for (uint32_t k = 0; k < SCO; k++) sin[k] = SV[k % SV_N];
+                      else if (arg0 == 4) sin[0] = (uint64_t)g_cbuf;
                       uint64_t so[SCO] = {0}; size_t sc = 0;
                       uint8_t sb[FIXED]; size_t szb = zos;
                       memset(sb, AAM, sizeof(sb));
@@ -853,16 +868,16 @@ jobs:
           }
 
           static void agg_table(NSString* st) {
-              int cnt[32][2][3]; memset(cnt, 0, sizeof(cnt));
+              int cnt[32][3][9]; memset(cnt, 0, sizeof(cnt));
               for (NSString* ln in [st componentsSeparatedByString:@"\n"]) {
                   if (![ln hasPrefix:@"P "]) continue;
                   if ([ln rangeOfString:@"-> BadArg"].location == NSNotFound) continue;
                   uint32_t s = 0, sic = 0; int m = 0;
                   if (sscanf(ln.UTF8String, "P %*s n%*d s%u sic%u m%d", &s, &sic, &m) != 3) continue;
-                  if (s < 32 && m < 2 && sic < 3) cnt[s][m][sic]++;
+                  if (s < 32 && m < 3 && sic < 9) cnt[s][m][sic]++;
               }
               NSMutableString* roll = [NSMutableString string];
-              for (uint32_t s = 0; s < 32; s++) for (int m = 0; m < 2; m++) for (uint32_t sic = 0; sic < 3; sic++) {
+              for (uint32_t s = 0; s < 32; s++) for (int m = 0; m < 3; m++) for (uint32_t sic = 0; sic < 9; sic++) {
                   if (!cnt[s][m][sic]) continue;
                   plog(@"AGG s%u m%d sic%u bad=%d", s, m, sic, cnt[s][m][sic]);
                   if (sic == 0 && m == 0) [roll appendFormat:@" s%u:%d", s, cnt[s][m][sic]];
@@ -889,7 +904,8 @@ jobs:
                       if ([ln rangeOfString:@"-> BadArg"].location != NSNotFound) { bad++; continue; }
                       nonbad++; [keep addObject:ln]; continue;
                   }
-                  if ([ln hasPrefix:@"ADD "] || [ln hasPrefix:@"TRAP "] || [ln hasPrefix:@"SWEEP "] || [ln hasPrefix:@"OOBSZ "] || [ln hasPrefix:@"OUTW "] ||
+                  if ([ln hasPrefix:@"ADD "] || [ln hasPrefix:@"TRAP "] || [ln hasPrefix:@"SWEEP "] || [ln hasPrefix:@"SIG "] ||
+                      [ln hasPrefix:@"SIGMASK "] || [ln hasPrefix:@"OOBSZ "] || [ln hasPrefix:@"OUTW "] ||
                       [ln hasPrefix:@"SO0 "] || [ln hasPrefix:@"GAP "] || [ln hasPrefix:@"CH "] || [ln hasPrefix:@"PK "] ||
                       [ln hasPrefix:@"PKO "] || [ln hasPrefix:@"SIGNAL "] || [ln hasPrefix:@"VIC "] || [ln hasPrefix:@"NODE "] ||
                       [ln hasPrefix:@"DEV "] || [ln hasPrefix:@"STEP "] || [ln hasPrefix:@"MAP "] || [ln hasPrefix:@"LIVE "] ||
@@ -912,10 +928,11 @@ jobs:
                   plog(@"VERDICT: DRY conns=%d pairs=%d vic=%d - tail metrics vacuous", g_nconn, g_pairn, g_vicn);
                   ulog(@"VERDICT: DRY conns=%d pairs=%d", g_nconn, g_pairn);
               }
-              plog(@"VERDICT probes=%d badarg=%d writes=%d oob=%d gap=%d outw=%d nonbad=%d so0=%d sicok=%d addok=%d trapok=%d tblmask=0x%x livemask=0x%x conns=%d",
-                   g_probes, g_badarg, g_canary_w, g_oobsz, g_gapread, g_outw, g_nonbad, g_s0nz, g_sic_ok, g_addok, g_trap_ok, g_tbl_mask, g_live_sel, g_nconn);
-              ulog(@"VERDICT probes=%d badarg=%d writes=%d oob=%d outw=%d nonbad=%d sicok=%d addok=%d trapok=%d", g_probes, g_badarg, g_canary_w, g_oobsz, g_outw, g_nonbad, g_sic_ok, g_addok, g_trap_ok);
+              plog(@"VERDICT probes=%d badarg=%d writes=%d oob=%d gap=%d outw=%d nonbad=%d so0=%d sicok=%d addok=%d trapok=%d sigp=%d tblmask=0x%x livemask=0x%x conns=%d",
+                   g_probes, g_badarg, g_canary_w, g_oobsz, g_gapread, g_outw, g_nonbad, g_s0nz, g_sic_ok, g_addok, g_trap_ok, g_sigp, g_tbl_mask, g_live_sel, g_nconn);
+              ulog(@"VERDICT probes=%d badarg=%d writes=%d oob=%d outw=%d nonbad=%d sicok=%d addok=%d trapok=%d sigp=%d", g_probes, g_badarg, g_canary_w, g_oobsz, g_outw, g_nonbad, g_sic_ok, g_addok, g_trap_ok, g_sigp);
               if (g_tbl_mask) { plog(@"VERDICT: table mask 0x%x", g_tbl_mask); ulog(@"VERDICT: table mask 0x%x", g_tbl_mask); }
+              if (g_sigp == 0) { plog(@"VERDICT: no signature anywhere"); ulog(@"VERDICT: no signature anywhere"); }
               if (g_addok) { plog(@"VERDICT: ADDCLIENT ACCEPTED x%d", g_addok); ulog(@"VERDICT: ADDCLIENT ACCEPTED"); }
               if (g_trap_ok) { plog(@"VERDICT: trap succeeded x%d", g_trap_ok); ulog(@"VERDICT: trap succeeded"); }
               if (g_sic_ok) { plog(@"VERDICT: selector accepted args x%d", g_sic_ok); ulog(@"VERDICT: args accepted"); }
@@ -976,12 +993,16 @@ jobs:
                   case 17: addclient_all(); break;
                   case 18:
                       canary(2, 0, 4096, 0, 0, 0, "s2v");
+                      canary(2, 0, 4096, 0, 3, 0, "s2sv");
                       canary(2, 1, 4096, FIXED, 1, 1, "s2p");
+                      canary(2, 1, 4096, FIXED, 4, 1, "s2ptr");
                       canary(2, 1, 64, FIXED, 1, 1, "s2s");
                       break;
                   case 19:
                       canary(9, 0, 4096, 0, 0, 0, "s9v");
+                      canary(9, 0, 4096, 0, 3, 0, "s9sv");
                       canary(9, 1, 4096, FIXED, 1, 1, "s9p");
+                      canary(9, 1, 4096, FIXED, 4, 1, "s9ptr");
                       canary(9, 1, 64, FIXED, 2, 1, "s9sid");
                       break;
                   case 20: gap_probe(); break;
@@ -1056,8 +1077,8 @@ jobs:
                   do_step(g_step);
                   int dh = g_hits - h0, dd = g_done - d0;
                   plog(@"STEP %d calls+%d hits+%d relive=%d", g_step, dd, dh, g_relive);
-                  plog(@"LIVE step=%d conns=%d vic=%d pair=%d probes=%d badarg=%d writes=%d oob=%d gap=%d outw=%d trapok=%d tblmask=0x%x",
-                       g_step, g_nconn, g_vicn, g_pairn, g_probes, g_badarg, g_canary_w, g_oobsz, g_gapread, g_outw, g_trap_ok, g_tbl_mask);
+                  plog(@"LIVE step=%d conns=%d vic=%d pair=%d probes=%d badarg=%d writes=%d oob=%d gap=%d outw=%d trapok=%d sigp=%d tblmask=0x%x",
+                       g_step, g_nconn, g_vicn, g_pairn, g_probes, g_badarg, g_canary_w, g_oobsz, g_gapread, g_outw, g_trap_ok, g_sigp, g_tbl_mask);
                   if (g_fd >= 0) fsync(g_fd);
                   ulog(@"STEP %d SURVIVED (+%d calls)", g_step, dd);
                   g_step++; save_step(g_step);
@@ -1100,7 +1121,7 @@ jobs:
               [NSTimer scheduledTimerWithTimeInterval:0.25 repeats:YES block:^(NSTimer*) {
                   g_tick++;
                   if (g_tick % 4 == 0) refresh_counts();
-                  g_hb.text = [NSString stringWithFormat:@"%s %d/%d conn=%d vic=%d pair=%d pr=%d bad=%d w=%d oob=%d gap=%d ow=%d add=%d tr=%d tm=%x", BUILD_TAG, g_step, STEP_MAX, g_nconn, g_vicn, g_pairn, g_probes, g_badarg, g_canary_w, g_oobsz, g_gapread, g_outw, g_addok, g_trap_ok, g_tbl_mask];
+                  g_hb.text = [NSString stringWithFormat:@"%s %d/%d conn=%d vic=%d pair=%d pr=%d bad=%d w=%d oob=%d gap=%d ow=%d add=%d tr=%d sg=%d tm=%x", BUILD_TAG, g_step, STEP_MAX, g_nconn, g_vicn, g_pairn, g_probes, g_badarg, g_canary_w, g_oobsz, g_gapread, g_outw, g_addok, g_trap_ok, g_sigp, g_tbl_mask];
                   flush_ui();
               }];
               dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_global_queue(0,0), ^{ run(); });
@@ -1122,10 +1143,10 @@ jobs:
             <key>CFBundleIdentifier</key><string>com.buurza47.probe</string>
             <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
             <key>CFBundleName</key><string>probe</string>
-            <key>CFBundleDisplayName</key><string>buurd66</string>
+            <key>CFBundleDisplayName</key><string>buurd67</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleShortVersionString</key><string>1.0</string>
-            <key>CFBundleVersion</key><string>66</string>
+            <key>CFBundleVersion</key><string>67</string>
             <key>MinimumOSVersion</key><string>16.0</string>
             <key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
             <key>UILaunchScreen</key><dict/>
