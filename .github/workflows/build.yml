@@ -38,9 +38,9 @@ jobs:
           void *IOSurfaceGetBaseAddress(IOSurfaceRef buffer);
           size_t IOSurfaceGetBytesPerRow(IOSurfaceRef buffer);
           IOSurfaceRef IOSurfaceCreate(CFDictionaryRef properties);
+          IOSurfaceRef IOSurfaceLookup(uint32_t csid);
           kern_return_t IOSurfaceLock(IOSurfaceRef buffer, uint32_t options, uint32_t *seed);
           kern_return_t IOSurfaceUnlock(IOSurfaceRef buffer, uint32_t options, uint32_t *seed);
-          IOSurfaceRef IOSurfaceLookup(uint32_t csid);
           #endif
           STUBEOF
           wc -c stub/IOSurface/IOSurface.h
@@ -70,6 +70,7 @@ jobs:
           extern int csops(pid_t pid, unsigned int ops, void* uaddr, size_t usize);
 
           typedef IOSurfaceRef (*fn_surfcreate)(CFDictionaryRef);
+          typedef IOSurfaceRef (*fn_surflookup)(uint32_t);
           typedef kern_return_t (*fn_surflock)(IOSurfaceRef, uint32_t, uint32_t*);
           typedef kern_return_t (*fn_surfunlock)(IOSurfaceRef, uint32_t, uint32_t*);
           typedef size_t (*fn_allocusize)(IOSurfaceRef);
@@ -92,6 +93,7 @@ jobs:
           typedef kern_return_t (*fn_trap6)(io_connect_t, uint32_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t);
 
           static fn_surfcreate g_surfcreate = NULL;
+          static fn_surflookup g_surflookup = NULL;
           static fn_surflock g_surflock = NULL;
           static fn_surfunlock g_surfunlock = NULL;
           static fn_allocusize g_allocusize = NULL;
@@ -113,14 +115,15 @@ jobs:
           static fn_trap5 g_trap5 = NULL;
           static fn_trap6 g_trap6 = NULL;
 
-          #define BUILD_TAG "v70-psurf"
+          #define BUILD_TAG "v71-global"
           #define MAXC 128
-          #define STEP_MAX 33
+          #define STEP_MAX 37
           #define TRY_MAX 2
           #define MAXCHILD 16
           #define PKID_MAX 24
           #define VIC_MAX 72
           #define FIXED 4096
+          #define BIGBUF 8192
           #define SEL_N 64
           #define SELSWEEP 256
           #define HI_MAX 2048
@@ -158,12 +161,14 @@ jobs:
           static volatile int g_sigp = 0;
           static volatile int g_propok = 0;
           static volatile int g_getpropok = 0;
+          static volatile int g_getp_ok = 0;
+          static volatile int g_globrt = 0;
           static volatile int g_probe_ok = 0;
           static volatile int g_notifok = 0;
           static volatile int g_notifmsg = 0;
           static volatile int g_symok = 0;
           static volatile int g_symno = 0;
-          static volatile int g_notift[4];
+          static volatile int g_notifmask = 0;
           static volatile int g_hi_sel = 0;
           static volatile int g_probesym = 0;
           static volatile int g_replay = 0;
@@ -191,6 +196,8 @@ jobs:
           static uint32_t g_sid = 0;
           static uint64_t g_hdl = 0;
           static uint8_t* g_cbuf = NULL;
+          static IOSurfaceRef g_gsurf = NULL;
+          static IOSurfaceRef g_glook = NULL;
           static io_service_t g_root = 0;
           static io_service_t g_child[MAXCHILD + 1];
           static io_service_t g_pkid[PKID_MAX + 1];
@@ -217,10 +224,11 @@ jobs:
               "boot", "census", "sig-blob", "dev-info", "tree-up", "svc-open",
               "dump-tree", "prop-dump", "parent-kids", "vt-init", "vt-encode",
               "root-open", "child-open", "map-all", "surf-make", "surf-alloc",
-              "traps", "addclient", "can-void", "prop-rich", "prop-read",
-              "seq", "gap-forensics", "argmatrix", "s9-sid", "wide-sweep",
-              "notif", "probe-req", "s9-after", "arity", "prop-surface",
-              "arm-matrix", "summary", "verdict"
+              "sym-audit", "surf-global", "s0-deep", "traps", "addclient",
+              "can-void", "prop-rich", "getp-verify", "prop-readback", "seq",
+              "gap-forensics", "argmatrix", "s9-sid", "wide-sweep", "notif",
+              "probe-req", "s9-after", "arity", "prop-surface", "arm-matrix",
+              "summary", "verdict"
           };
 
           static void ulog(NSString* fmt, ...) {
@@ -246,13 +254,13 @@ jobs:
               g_tv.text = [g_lines componentsJoinedByString:@"\n"];
               if (g_lines.count) [g_tv scrollRangeToVisible:NSMakeRange(g_tv.text.length, 0)];
           }
-          static int drain_port(const char* tag) {
+          static int drain_wait(const char* tag, int ms) {
               int got = 0;
               for (int i = 0; i < 64; i++) {
                   struct { mach_msg_header_t h; uint8_t body[512]; } msg;
                   memset(&msg, 0, sizeof(msg));
                   mach_msg_return_t r = mach_msg(&msg.h, MACH_RCV_MSG | MACH_RCV_TIMEOUT,
-                                                 0, sizeof(msg), g_wake, 2, MACH_PORT_NULL);
+                                                 0, sizeof(msg), g_wake, (mach_msg_timeout_t)ms, MACH_PORT_NULL);
                   if (r != MACH_MSG_SUCCESS) break;
                   got++;
                   __sync_fetch_and_add(&g_notifmsg, 1);
@@ -263,6 +271,7 @@ jobs:
               }
               return got;
           }
+          static int drain_port(const char* tag) { return drain_wait(tag, 2); }
           static void sigh(int sig) {
               char b[96];
               int n = snprintf(b, sizeof(b), "SIGNAL %d at step %d (%s)\n", sig, g_step, STEP_NAME[g_step < STEP_MAX+1 ? g_step : STEP_MAX]);
@@ -328,11 +337,23 @@ jobs:
           static void save_try(void) {
               [[NSString stringWithFormat:@"%d:%d", g_step, g_try] writeToFile:doc_file("try.txt") atomically:YES encoding:NSUTF8StringEncoding error:nil];
           }
+          static int step_done(int s) {
+              NSString* d = [NSString stringWithContentsOfFile:doc_file("done.txt") encoding:NSUTF8StringEncoding error:nil];
+              if (!d) return 0;
+              return [d rangeOfString:[NSString stringWithFormat:@"[%d]", s]].location != NSNotFound;
+          }
+          static void mark_done(int s) {
+              NSString* d = [NSString stringWithContentsOfFile:doc_file("done.txt") encoding:NSUTF8StringEncoding error:nil];
+              if (d && [d rangeOfString:[NSString stringWithFormat:@"[%d]", s]].location != NSNotFound) return;
+              NSString* n = [NSString stringWithFormat:@"%@[%d]", d ? d : @"", s];
+              [n writeToFile:doc_file("done.txt") atomically:YES encoding:NSUTF8StringEncoding error:nil];
+          }
           static void latch_build(void) {
               NSString* bt = [NSString stringWithContentsOfFile:doc_file("build.txt") encoding:NSUTF8StringEncoding error:nil];
               if ([bt isEqualToString:@BUILD_TAG]) return;
               unlink(doc_file("state.txt").UTF8String);
               unlink(doc_file("try.txt").UTF8String);
+              unlink(doc_file("done.txt").UTF8String);
               save_step(0); g_try = 0; save_try();
               g_root_idx = -1; g_best = -1; g_s4ci = -1;
               [@BUILD_TAG writeToFile:doc_file("build.txt") atomically:YES encoding:NSUTF8StringEncoding error:nil];
@@ -341,7 +362,6 @@ jobs:
               NSString* st = [NSString stringWithContentsOfFile:doc_file("state.txt") encoding:NSUTF8StringEncoding error:nil];
               if (!st) return;
               int pr = 0, w = 0, ob = 0, gp = 0, ow = 0, nb = 0, so = 0, ao = 0, to = 0, ba = 0, pp = 0, po = 0, nf = 0, gpo = 0, pq = 0, sp = 0, hs = 0, sk = 0;
-              uint64_t tm = 0, okm = 0;
               for (NSString* ln in [st componentsSeparatedByString:@"\n"]) {
                   if ([ln hasPrefix:@"CAN "]) { pr++; if ([ln rangeOfString:@"hit=1"].location != NSNotFound) w++; continue; }
                   if ([ln hasPrefix:@"OOBSZ "]) ob++;
@@ -358,21 +378,22 @@ jobs:
                   if ([ln hasPrefix:@"NOTIF n"]) {
                       int nd = 0; unsigned int t = 0;
                       if (sscanf(ln.UTF8String, "NOTIF n%d t%u", &nd, &t) == 2) {
-                          if ([ln rangeOfString:@"-> OK"].location != NSNotFound) { nf++; if (t < 4) g_notift[t]++; }
+                          if ([ln rangeOfString:@"-> OK"].location != NSNotFound) { nf++; if (t < 32) g_notifmask |= (1 << t); }
                       }
                       continue;
                   }
                   if ([ln hasPrefix:@"TRAP "] && [ln rangeOfString:@"-> OK"].location != NSNotFound) to++;
                   if ([ln hasPrefix:@"PROBESYM "]) { if ([ln rangeOfString:@" ok"].location != NSNotFound) g_probesym = 1; else g_probesym = -1; continue; }
+                  if ([ln hasPrefix:@"GLOBRT "] && [ln rangeOfString:@"ok"].location != NSNotFound) g_globrt = 1;
                   if ([ln hasPrefix:@"SIG "]) {
                       int nd = 0; unsigned int s = 0, sic = 0;
                       if (sscanf(ln.UTF8String, "SIG n%d s%u sic%u", &nd, &s, &sic) == 3) {
                           sp++;
                           if (s < HI_MAX) g_any_sel[s] = 1;
                           if (s < 64) {
-                              tm |= (1ULL << (s & 63));
+                              g_tbl_mask |= (1ULL << (s & 63));
                               g_sig[s] |= (uint16_t)(1u << (sic & 15));
-                              if ([ln rangeOfString:@"-> OK"].location != NSNotFound) okm |= (1ULL << (s & 63));
+                              if ([ln rangeOfString:@"-> OK"].location != NSNotFound) g_ok_sel |= (1ULL << (s & 63));
                           }
                       }
                       continue;
@@ -387,7 +408,8 @@ jobs:
                   }
               }
               g_probes = pr + pp; g_badarg = ba; g_canary_w = w; g_oobsz = ob; g_gapread = gp; g_outw = ow; g_nonbad = nb; g_s0nz = so; g_addok = ao; g_trap_ok = to; g_propok = po; g_getpropok = gpo; g_probe_ok = pq; g_notifok = nf;
-              g_sigp = sp; g_tbl_mask = tm; g_ok_sel = okm; g_hi_sel = hs;
+              g_sigp = sp; g_hi_sel = hs;
+              g_sic_ok = 0;
               for (uint32_t s = 0; s < 64; s++) if (g_sig[s]) g_sic_ok++;
           }
           static void load_state(void) {
@@ -774,7 +796,7 @@ jobs:
                               g_any_sel[s] = 1;
                               if (s < 64) { g_tbl_mask |= (1ULL << s); g_sig[s] |= (uint16_t)(1u << sic); if (kr == KERN_SUCCESS) g_ok_sel |= (1ULL << s); }
                               __sync_fetch_and_add(&g_sigp, 1);
-                              plog(@"SIG n%d s%u sic%u -> %@ so0=%llu", g_node[ci], s, sic, kr_name(kr), (unsigned long long)so[0]);
+                              plog(@"SIG n%d s%u sic%u -> %@ sc%zu szb%zu so0=%llu", g_node[ci], s, sic, kr_name(kr), sc, szb, (unsigned long long)so[0]);
                               ulog(@"SIG n%d s%u sic%u -> %@", g_node[ci], s, sic, kr_name(kr));
                           } else __sync_fetch_and_add(&g_badarg, 1);
                       }
@@ -808,6 +830,87 @@ jobs:
               ulog(@"MAP done live=%d calls=%d", g_ssw_hit, calls);
               int m = drain_port("map");
               ulog(@"MAP async msgs=%d", m);
+          }
+
+          static void sym_audit(void) {
+              ulog(@"SYMA start");
+              plog(@"SYMN surfcreate %s", g_surfcreate ? "ok" : "no");
+              plog(@"SYMN surflookup %s", g_surflookup ? "ok" : "no");
+              plog(@"SYMN surflock %s", g_surflock ? "ok" : "no");
+              plog(@"SYMN baseaddr %s", g_baseaddr ? "ok" : "no");
+              plog(@"SYMN allocusize %s", g_allocusize ? "ok" : "no");
+              plog(@"SYMN surfid %s", g_surfid ? "ok" : "no");
+              plog(@"SYMN getsurf %s", g_getsurf ? "ok" : "no");
+              plog(@"SYMN addclient %s", g_addclient ? "ok" : "no");
+              plog(@"SYMN setprop %s", g_setprop ? "ok" : "no");
+              plog(@"SYMN setprops %s", g_setprops ? "ok" : "no");
+              plog(@"SYMN getprop %s", g_getprop ? "ok" : "no");
+              plog(@"SYMN setnotif %s", g_setnotif ? "ok" : "no");
+              plog(@"SYMN reqprobe %s", g_reqprobe ? "ok" : "no");
+              plog(@"SYMN trap0 %s", g_trap0 ? "ok" : "no");
+              plog(@"SYMN trap1 %s", g_trap1 ? "ok" : "no");
+              plog(@"SYMN trap2 %s", g_trap2 ? "ok" : "no");
+              g_getp_ok = g_getprop ? 1 : 0;
+              plog(@"SYMN verdict getprop=%d lookup=%d", g_getp_ok, g_surflookup ? 1 : 0);
+              ulog(@"SYMA getprop=%d lookup=%d", g_getp_ok, g_surflookup ? 1 : 0);
+              if (!g_getp_ok) ulog(@"SYMA getprop ABSENT - setprop acceptance unverifiable, property axis suspect");
+          }
+
+          static void surf_global(void) {
+              if (!g_surfcreate || !g_surflookup || !g_surfid) { plog(@"GLOBRT nosym"); ulog(@"GLOBRT nosym"); return; }
+              CFMutableDictionaryRef d = CFDictionaryCreateMutable(kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+              CFDictionarySetValue(d, CFSTR("IOSurfaceWidth"), (__bridge CFTypeRef)@(64));
+              CFDictionarySetValue(d, CFSTR("IOSurfaceHeight"), (__bridge CFTypeRef)@(64));
+              CFDictionarySetValue(d, CFSTR("IOSurfaceBytesPerElement"), (__bridge CFTypeRef)@(4));
+              CFDictionarySetValue(d, CFSTR("IOSurfaceBytesPerRow"), (__bridge CFTypeRef)@(256));
+              CFDictionarySetValue(d, CFSTR("IOSurfacePixelFormat"), (__bridge CFTypeRef)@(0x42475241));
+              CFDictionarySetValue(d, CFSTR("IOSurfaceIsGlobal"), (__bridge CFTypeRef)@YES);
+              g_gsurf = g_surfcreate(d);
+              CFRelease(d);
+              if (!g_gsurf) { plog(@"GLOBRT create=no"); ulog(@"GLOBRT create FAIL"); return; }
+              uint32_t gid = g_surfid(g_gsurf);
+              plog(@"GLOBRT create=ok id=0x%x", gid);
+              ulog(@"GLOBRT create ok id=0x%x", gid);
+              g_glook = g_surflookup(gid);
+              plog(@"GLOBRT lookup id=0x%x -> %p", gid, (void*)g_glook);
+              if (!g_glook) {
+                  ulog(@"GLOBRT lookup FAIL - surface not reachable cross-context");
+                  plog(@"GLOBRT verdict NOT-GLOBAL");
+              } else {
+                  g_globrt = 1;
+                  ulog(@"GLOBRT lookup OK - global surface reachable");
+                  plog(@"GLOBRT verdict GLOBAL id=0x%x", gid);
+                  if (g_baseaddr) {
+                      void* b = g_baseaddr(g_glook);
+                      void* b2 = g_baseaddr(g_gsurf);
+                      plog(@"GLOBRT base look=%p orig=%p same=%d", b, b2, b == b2 ? 1 : 0);
+                      ulog(@"GLOBRT base same=%d", b == b2 ? 1 : 0);
+                  }
+              }
+              SV[3] = gid;
+          }
+
+          static void s0_deep(void) {
+              if (!g_nconn) { ulog(@"s0d no conn"); return; }
+              ulog(@"S0D start conns=%d sels 0,2 full geometry", g_nconn);
+              for (int ci = 0; ci < g_nconn; ci++) {
+                  if (!g_conn[ci]) continue;
+                  for (int s = 0; s < 2; s++) {
+                      uint32_t sel = s ? 2 : 0;
+                      for (size_t zoc = 0; zoc <= SCO; zoc++) {
+                          probe_x(ci, sel, 0, 0, zoc, BIGBUF, 0, 0, "s0d");
+                      }
+                      probe_x(ci, sel, 0, 0, 0, BIGBUF, 0, 2, "s0d");
+                      probe_x(ci, sel, 1, 0, 0, BIGBUF, 4096, 0, "s0d");
+                      probe_x(ci, sel, 1, 0, 0, BIGBUF, 4096, 2, "s0d");
+                  }
+                  usleep(40);
+              }
+              canary(0, 0, BIGBUF, 0, 0, 0, "s0cv");
+              canary(2, 0, BIGBUF, 0, 0, 0, "s2cv");
+              canary(0, 0, BIGBUF, 0, 2, 0, "s0cv2");
+              canary(2, 0, BIGBUF, 0, 2, 0, "s2cv2");
+              ulog(@"s0d done");
           }
 
           static void traps(void) {
@@ -1016,6 +1119,7 @@ jobs:
                               ulog(@"!!! PROP n%d %s v%d OK", g_node[ci], keys[k], v);
                               probe_x(ci, 9, 0, 0, 0, 0, 0, 0, "s9pr");
                               probe_x(ci, 9, 0, 0, 0, 4096, 0, 0, "s9pr");
+                              probe_x(ci, 2, 0, 0, 0, 0, 0, 0, "s2pr");
                           }
                       }
                   }
@@ -1039,13 +1143,24 @@ jobs:
               } else ulog(@"no setprops sym");
           }
 
-          static void prop_readback(void) {
-              const char* keys[4] = { "IOSurfaceID", "BufferSize", "IOSurface", "buffer" };
+          static int count_reg_props(void) {
+              if (!g_root) return -1;
+              CFMutableDictionaryRef p = NULL;
+              if (IORegistryEntryCreateCFProperties(g_root, &p, kCFAllocatorDefault, 0) != KERN_SUCCESS || !p) return -1;
+              int n = (int)((NSDictionary*)(__bridge NSDictionary*)p).count;
+              CFRelease(p);
+              return n;
+          }
+
+          static void getp_verify(void) {
+              const char* keys[12] = { "IOSurfaceID", "BufferSize", "IOSurface", "buffer", "Class",
+                                       "ImageWidth", "ImageHeight", "PixelFormat", "BytesPerRow",
+                                       "IOSurfaceWidth", "IOSurfaceHeight", "AllocSize" };
               if (g_getprop) {
-                  ulog(@"GETP start conns=%d", g_nconn);
+                  ulog(@"GETP start conns=%d keys=12", g_nconn);
                   for (int ci = 0; ci < g_nconn; ci++) {
                       if (!g_conn[ci]) continue;
-                      for (int k = 0; k < 4; k++) {
+                      for (int k = 0; k < 12; k++) {
                           CFTypeRef v = NULL;
                           kern_return_t kr = g_getprop(g_conn[ci], (__bridge CFStringRef)@(keys[k]), &v);
                           plog(@"GETP n%d k=%s -> %@ v=%s", g_node[ci], keys[k], kr_name(kr), v ? "set" : "null");
@@ -1053,14 +1168,35 @@ jobs:
                               __sync_fetch_and_add(&g_getpropok, 1);
                               CFTypeID t = CFGetTypeID(v);
                               const char* tn = t == CFDataGetTypeID() ? "data" : (t == CFDictionaryGetTypeID() ? "dict" : (t == CFStringGetTypeID() ? "str" : "num"));
+                              plog(@"GETPV n%d k=%s type=%s", g_node[ci], keys[k], tn);
                               ulog(@"!!! GETP n%d %s OK type=%s", g_node[ci], keys[k], tn);
                               CFRelease(v);
                           }
                       }
                   }
                   ulog(@"getp done ok=%d", g_getpropok);
-              } else ulog(@"no getprop sym");
+              } else {
+                  ulog(@"GETP getprop absent - using provider registry diff");
+                  plog(@"GETPV absent");
+              }
 
+              int before = count_reg_props();
+              plog(@"PROVD before=%d", before);
+              if (g_setprop && g_nconn) {
+                  for (int ci = 0; ci < g_nconn && ci < 8; ci++) {
+                      if (!g_conn[ci]) continue;
+                      g_setprop(g_conn[ci], CFSTR("IOSurfaceID"), (__bridge CFTypeRef)@(g_sid));
+                      g_setprop(g_conn[ci], CFSTR("BufferSize"), (__bridge CFTypeRef)@(8192));
+                  }
+              }
+              usleep(200000);
+              int after = count_reg_props();
+              plog(@"PROVD after=%d delta=%d", after, after - before);
+              ulog(@"PROVD before=%d after=%d delta=%d", before, after, after - before);
+              if (after != before) ulog(@"!!! PROVD provider props changed - setprop reaches driver");
+          }
+
+          static void prop_readback(void) {
               dump_props(g_root, 900);
               for (int i = 1; i <= g_nchild; i++) dump_props(g_child[i], 900 + i);
               ulog(@"prop readback done");
@@ -1123,27 +1259,6 @@ jobs:
               }
               plog(@"GAP examined=%d nz=%d", examined, found);
               ulog(@"gap examined=%d nz=%d", examined, found);
-
-              int orig = g_vicn;
-              if (g_surfcreate) {
-                  CFMutableDictionaryRef d = make_sdict();
-                  IOSurfaceRef tmp[16]; int tn = 0;
-                  for (int i = 0; i < 16; i++) { IOSurfaceRef s = g_surfcreate(d); if (!s) break; tmp[tn++] = s; }
-                  CFRelease(d);
-                  plog(@"GAP churn alloc=%d", tn);
-                  ulog(@"gap churn +%d", tn);
-                  int changed = 0;
-                  for (int i = 0; i + 1 < orig; i++) {
-                      if (!g_gapsz[i]) continue;
-                      const uint8_t* p = (const uint8_t*)g_gapbase[i];
-                      size_t nz2 = 0;
-                      for (size_t k = 0; k < g_gapsz[i]; k++) if (p[k]) nz2++;
-                      if (nz2 != g_gapnz[i]) { changed++; plog(@"GAPCH %d %zu->%zu", i, g_gapnz[i], nz2); }
-                  }
-                  plog(@"GAP churn changed=%d", changed);
-                  ulog(@"gap churn changed=%d", changed);
-                  for (int i = 0; i < tn; i++) CFRelease(tmp[i]);
-              }
               g_gapread = found;
           }
 
@@ -1195,7 +1310,8 @@ jobs:
               for (int i = 0; i < g_vicn && n < 6; i += stride) idxs[n++] = i;
               uint32_t ids[6];
               for (int i = 0; i < n; i++) ids[i] = g_surfid(g_vic[idxs[i]]);
-              ulog(@"S9SID start conns=%d vic=%d ids=%d", g_nconn, g_vicn, n);
+              if (g_glook) { ids[0] = g_surfid(g_glook); plog(@"S9SID global-first id=0x%x", ids[0]); }
+              ulog(@"S9SID start conns=%d vic=%d ids=%d global=%d", g_nconn, g_vicn, n, g_glook ? 1 : 0);
               int moved = 0;
               for (int ci = 0; ci < g_nconn; ci++) {
                   if (!g_conn[ci]) continue;
@@ -1244,6 +1360,7 @@ jobs:
               if (!g_setnotif) { ulog(@"no setnotif sym"); return; }
               if (!g_nconn) { ulog(@"notif no conn"); return; }
               ulog(@"NOTIF start conns=%d port=0x%x", g_nconn, g_wake);
+              int firstok = -1;
               for (int ci = 0; ci < g_nconn; ci++) {
                   if (!g_conn[ci]) continue;
                   for (uint32_t t = 0; t <= 3; t++) {
@@ -1252,17 +1369,26 @@ jobs:
                       plog(@"NOTIF n%d t%u -> %@", g_node[ci], t, kr_name(kr));
                       if (kr == KERN_SUCCESS) {
                           __sync_fetch_and_add(&g_notifok, 1);
-                          g_notift[t & 3]++;
+                          g_notifmask |= (1 << (t & 31));
                           ulog(@"!!! NOTIF n%d t%u OK", g_node[ci], t);
+                          if (firstok < 0) firstok = ci;
                           probe_x(ci, 9, 0, 0, 0, 0, 0, 0, "s9nf");
                           probe_x(ci, 9, 0, 0, 0, 4096, 0, 0, "s9nf");
                           probe_x(ci, 9, 2, 0, 0, 0, 0, 0, "s9asy");
-                          int m = drain_port("nf");
+                          int m = drain_wait("nf", 500);
                           if (m) ulog(@"!!! NOTIF n%d t%u async msgs=%d", g_node[ci], t, m);
                       }
                   }
               }
-              ulog(@"notif done ok=%d msg=%d", g_notifok, g_notifmsg);
+              if (firstok >= 0) {
+                  ulog(@"NOTIF deep drain on conn %d", g_node[firstok]);
+                  probe_x(firstok, 9, 2, 0, 0, 0, 0, 2, "s9asyd");
+                  int m = drain_wait("nfdeep", 800);
+                  plog(@"NOTIF deep msgs=%d", m);
+                  ulog(@"NOTIF deep msgs=%d", m);
+              }
+              plog(@"NOTIF mask=0x%x ok=%d msg=%d", g_notifmask, g_notifok, g_notifmsg);
+              ulog(@"notif done mask=0x%x ok=%d msg=%d", g_notifmask, g_notifok, g_notifmsg);
           }
 
           static void probe_req(void) {
@@ -1340,19 +1466,19 @@ jobs:
           static void prop_surface(void) {
               if (!g_setprop || !g_surfid) { ulog(@"psurf nosym"); return; }
               if (!g_nconn || !g_vicn) { ulog(@"psurf dry conns=%d vic=%d", g_nconn, g_vicn); return; }
-              ulog(@"PSURF start conns=%d vic=%d", g_nconn, g_vicn);
+              ulog(@"PSURF start conns=%d vic=%d globrt=%d glook=%d", g_nconn, g_vicn, g_globrt, g_glook ? 1 : 0);
               const char* keys[4] = { "IOSurface", "Surface", "IOSurfaceRef", "Buffer" };
               int accepted = 0;
               for (int ci = 0; ci < g_nconn; ci++) {
                   if (!g_conn[ci]) continue;
                   int vi = ci % g_vicn;
-                  IOSurfaceRef s = g_vic[vi];
+                  IOSurfaceRef s = (g_glook && ci < 8) ? g_glook : g_vic[vi];
                   if (!s) continue;
                   uint32_t sid = g_surfid(s);
                   for (int k = 0; k < 4; k++) {
                       kern_return_t kr = g_setprop(g_conn[ci], (__bridge CFStringRef)@(keys[k]), (CFTypeRef)s);
                       __sync_fetch_and_add(&g_done, 1);
-                      plog(@"PSURF n%d k=%s vid=0x%x -> %@", g_node[ci], keys[k], sid, kr_name(kr));
+                      plog(@"PSURF n%d k=%s vid=0x%x glob=%d -> %@", g_node[ci], keys[k], sid, g_glook && ci < 8 ? 1 : 0, kr_name(kr));
                       if (kr != KERN_SUCCESS) continue;
                       accepted++;
                       __sync_fetch_and_add(&g_propok, 1);
@@ -1363,15 +1489,28 @@ jobs:
                       probe_x(ci, 9, 0, 0, 0, 4096, 0, 2, "ps9s");
                       probe_x(ci, 0, 1, 0, 0, 0, 4096, 2, "ps0i");
                       probe_x(ci, 9, 2, 0, 0, 0, 0, 2, "ps9a");
-                      int m = drain_port("psurf");
+                      int m = drain_wait("psurf", 300);
                       if (m) ulog(@"!!! PSURF n%d %s async msgs=%d", g_node[ci], keys[k], m);
-                      vic_fill(vi, AAM);
-                      probe_x(ci, 9, 0, 0, 0, 0, 0, 2, "ps9w");
-                      size_t first = 0, dirty = 0;
-                      if (vic_scan(vi, &first, &dirty)) {
-                          __sync_fetch_and_add(&g_canary_w, 1);
-                          plog(@"PSURFW n%d %s first=0x%zx dirty=%zu", g_node[ci], keys[k], first, dirty);
-                          ulog(@"!!! PSURF n%d %s SURFACE WRITTEN first=0x%zx dirty=%zu", g_node[ci], keys[k], first, dirty);
+                      if (g_glook && ci < 8 && g_baseaddr) {
+                          void* b = g_baseaddr(g_glook);
+                          if (b) {
+                              memset(b, AAM, 256);
+                              probe_x(ci, 9, 0, 0, 0, 0, 0, 2, "ps9w");
+                              size_t d = 0, f = (size_t)-1;
+                              for (size_t q = 0; q < 256; q++) { uint8_t* pp = (uint8_t*)b; if (pp[q] != AAM) { d++; if (f == (size_t)-1) f = q; } }
+                              plog(@"PSURFG n%d %s first=0x%zx dirty=%zu", g_node[ci], keys[k], f, d);
+                              if (d) { __sync_fetch_and_add(&g_canary_w, 1); ulog(@"!!! PSURFG n%d %s GLOBAL WRITTEN first=0x%zx dirty=%zu", g_node[ci], keys[k], f, d); }
+                          }
+                      }
+                      if (!g_glook) {
+                          vic_fill(vi, AAM);
+                          probe_x(ci, 9, 0, 0, 0, 0, 0, 2, "ps9w");
+                          size_t first = 0, dirty = 0;
+                          if (vic_scan(vi, &first, &dirty)) {
+                              __sync_fetch_and_add(&g_canary_w, 1);
+                              plog(@"PSURFW n%d %s first=0x%zx dirty=%zu", g_node[ci], keys[k], first, dirty);
+                              ulog(@"!!! PSURF n%d %s SURFACE WRITTEN first=0x%zx dirty=%zu", g_node[ci], keys[k], first, dirty);
+                          }
                       }
                   }
                   g_setprop(g_conn[ci], CFSTR("IOSurfaceID"), (__bridge CFTypeRef)@(sid));
@@ -1385,19 +1524,20 @@ jobs:
                   probe_x(ci, 0, 0, 0, 0, 0, 0, 2, "ps0n");
                   usleep(60);
               }
-              int m = drain_port("psurf-end");
+              int m = drain_wait("psurf-end", 500);
               ulog(@"psurf done accepted=%d async=%d", accepted, m);
           }
 
           static void arm_matrix(void) {
               static const int arms[16] = { 0, 2, 1, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 9 };
               if (!g_nconn) { ulog(@"ARM no conn"); return; }
-              ulog(@"ARM start conns=%d (props already set)", g_nconn);
+              ulog(@"ARM start conns=%d glob=%d", g_nconn, g_glook ? 1 : 0);
               int flips = 0;
               for (int ci = 0; ci < g_nconn; ci++) {
                   if (!g_conn[ci]) continue;
                   int vi = g_vicn ? (ci % g_vicn) : -1;
-                  uintptr_t base = (vi >= 0 && g_baseaddr && g_vic[vi]) ? (uintptr_t)g_baseaddr(g_vic[vi]) : 0;
+                  uintptr_t base = (g_glook && g_baseaddr) ? (uintptr_t)g_baseaddr(g_glook)
+                                    : ((vi >= 0 && g_baseaddr && g_vic[vi]) ? (uintptr_t)g_baseaddr(g_vic[vi]) : 0);
                   for (int ai = 0; ai < 16; ai++) {
                       uint32_t arm = (uint32_t)arms[ai];
                       for (int v = 0; v < 4; v++) {
@@ -1420,7 +1560,7 @@ jobs:
                       }
                   }
               }
-              int m = drain_port("arm");
+              int m = drain_wait("arm", 300);
               ulog(@"arm done flips=%d async=%d", flips, m);
           }
 
@@ -1463,6 +1603,8 @@ jobs:
                   }
                   if ([ln hasPrefix:@"ADD "] || [ln hasPrefix:@"ADDM "] || [ln hasPrefix:@"TRAP "] || [ln hasPrefix:@"SWEEP "] || [ln hasPrefix:@"SIG "] ||
                       [ln hasPrefix:@"SIGMASK "] || [ln hasPrefix:@"PROP "] || [ln hasPrefix:@"SETPS "] || [ln hasPrefix:@"GETP "] ||
+                      [ln hasPrefix:@"GETPV "] || [ln hasPrefix:@"PROVD "] || [ln hasPrefix:@"SYMN "] || [ln hasPrefix:@"GLOBRT "] ||
+                      [ln hasPrefix:@"S0DEEP "] || [ln hasPrefix:@"PSURFG "] ||
                       [ln hasPrefix:@"SEQ "] || [ln hasPrefix:@"GAPCH "] || [ln hasPrefix:@"S9SID "] || [ln hasPrefix:@"S9A "] ||
                       [ln hasPrefix:@"WS "] || [ln hasPrefix:@"PROBE "] || [ln hasPrefix:@"PROBESYM "] || [ln hasPrefix:@"SYM "] ||
                       [ln hasPrefix:@"NOTIF "] || [ln hasPrefix:@"NOTIFMSG "] || [ln hasPrefix:@"PSURF "] || [ln hasPrefix:@"PSURFW "] ||
@@ -1501,22 +1643,26 @@ jobs:
               if (hi) { plog(@"VERDICT: selectors above 15: %d", hi); ulog(@"VERDICT: selectors above 15: %d", hi); }
               if (g_sigp == 0) { plog(@"VERDICT: no signature anywhere"); ulog(@"VERDICT: no signature anywhere"); }
               else { plog(@"VERDICT: live responses=%d, succeeding selectors=0x%llx", g_sigp, (unsigned long long)g_ok_sel); ulog(@"VERDICT: live=%d ok=0x%llx", g_sigp, (unsigned long long)g_ok_sel); }
-              plog(@"VERDICT notif t0=%d t1=%d t2=%d t3=%d msg=%d", g_notift[0], g_notift[1], g_notift[2], g_notift[3], g_notifmsg);
-              ulog(@"VERDICT notif t=%d/%d/%d/%d msg=%d", g_notift[0], g_notift[1], g_notift[2], g_notift[3], g_notifmsg);
-              if (g_symno) { plog(@"VERDICT: %d optional syms MISSING", g_symno); ulog(@"VERDICT: %d syms missing", g_symno); }
-              if (g_symok) { plog(@"VERDICT: %d optional syms present", g_symok); ulog(@"VERDICT: %d syms present", g_symok); }
+              plog(@"VERDICT notifmask=0x%x ok=%d msg=%d", g_notifmask, g_notifok, g_notifmsg);
+              ulog(@"VERDICT notifmask=0x%x ok=%d msg=%d", g_notifmask, g_notifok, g_notifmsg);
+              if (g_notifmask == 0x1) { plog(@"VERDICT: only type 0 accepted - fixed, not per-node"); ulog(@"VERDICT: only t0 accepted, fixed"); }
+              else if (g_notifmask) { plog(@"VERDICT: notification types 0x%x accepted", g_notifmask); ulog(@"VERDICT: notif types 0x%x", g_notifmask); }
+              if (g_globrt) { plog(@"VERDICT: GLOBAL SURFACE ROUND-TRIP OK"); ulog(@"VERDICT: global surface round-trip ok"); }
+              else { plog(@"VERDICT: global surface round-trip FAILED - private surfaces unreachable"); ulog(@"VERDICT: global round-trip FAILED"); }
+              if (g_getp_ok == 0) { plog(@"VERDICT: getprop ABSENT - all %d setprop OKs unverified", g_propok); ulog(@"VERDICT: getprop absent, setprop unverified"); }
+              else if (g_getpropok) { plog(@"VERDICT: GETPROP READBACK WORKS x%d", g_getpropok); ulog(@"VERDICT: getprop readback works"); }
+              else { plog(@"VERDICT: getprop present but 0 reads - sets are cached not applied"); ulog(@"VERDICT: getprop present, 0 reads"); }
+              if (g_symno) { plog(@"VERDICT: %d syms MISSING", g_symno); ulog(@"VERDICT: %d syms missing", g_symno); }
+              if (g_symok) { plog(@"VERDICT: %d syms present", g_symok); ulog(@"VERDICT: %d syms present", g_symok); }
               if (g_probesym == 1) { plog(@"VERDICT: reqprobe present"); ulog(@"VERDICT: reqprobe present"); }
-              else if (g_probesym == -1) { plog(@"VERDICT: reqprobe ABSENT - step 27 dead, drop it"); ulog(@"VERDICT: reqprobe absent, drop step 27"); }
-              else { plog(@"VERDICT: reqprobe unresolved"); ulog(@"VERDICT: reqprobe unresolved"); }
-              if (g_getpropok) { plog(@"VERDICT: GETPROP READBACK WORKS x%d", g_getpropok); ulog(@"VERDICT: getprop readback works"); }
-              else { plog(@"VERDICT: no property readback - setprop unverified despite %d OK", g_propok); ulog(@"VERDICT: no readback, setprop unverified"); }
+              else if (g_probesym == -1) { plog(@"VERDICT: reqprobe ABSENT - drop step 31"); ulog(@"VERDICT: reqprobe absent, drop"); }
               if (g_notifmsg) { plog(@"VERDICT: ASYNC COMPLETIONS DELIVERED x%d", g_notifmsg); ulog(@"VERDICT: async delivered"); }
               if (g_probe_ok) { plog(@"VERDICT: request-probe ok x%d", g_probe_ok); ulog(@"VERDICT: probe req ok"); }
               if (g_addok) { plog(@"VERDICT: ADDCLIENT ACCEPTED x%d", g_addok); ulog(@"VERDICT: ADDCLIENT ACCEPTED"); }
               if (g_trap_ok) { plog(@"VERDICT: trap succeeded x%d", g_trap_ok); ulog(@"VERDICT: trap succeeded"); }
               if (g_sic_ok) { plog(@"VERDICT: selector accepted args x%d", g_sic_ok); ulog(@"VERDICT: args accepted"); }
               if (g_notifok) { plog(@"VERDICT: notification port set x%d", g_notifok); ulog(@"VERDICT: notif port set"); }
-              if (g_canary_w) { plog(@"VERDICT: OOB WRITE x%d", g_canary_w); ulog(@"VERDICT: OOB WRITE"); }
+              if (g_canary_w) { plog(@"VERDICT: WRITE x%d", g_canary_w); ulog(@"VERDICT: WRITE"); }
               if (g_oobsz) { plog(@"VERDICT: szb overrun x%d", g_oobsz); ulog(@"VERDICT: szb overrun"); }
               if (g_outw) { plog(@"VERDICT: output written x%d", g_outw); ulog(@"VERDICT: output written"); }
               if (g_s0nz) { plog(@"VERDICT: scalar returned x%d", g_s0nz); ulog(@"VERDICT: scalar returned"); }
@@ -1544,8 +1690,9 @@ jobs:
               plog(@"PROLOGUE pk +%d", g_nconn - c0); ulog(@"PROLOGUE pk +%d", g_nconn - c0);
               surf_make();
               surf_alloc();
-              plog(@"PROLOGUE conns=%d vic=%d pair=%d sid=0x%x", g_nconn, g_vicn, g_pairn, g_sid);
-              ulog(@"PROLOGUE conns=%d vic=%d pair=%d", g_nconn, g_vicn, g_pairn);
+              surf_global();
+              plog(@"PROLOGUE conns=%d vic=%d pair=%d sid=0x%x glob=%d", g_nconn, g_vicn, g_pairn, g_sid, g_globrt);
+              ulog(@"PROLOGUE conns=%d vic=%d pair=%d glob=%d", g_nconn, g_vicn, g_pairn, g_globrt);
               if (g_nconn < 1) { plog(@"PROLOGUE FAIL conns=0"); ulog(@"PROLOGUE FAIL conns=0"); return 0; }
               if (g_pairn < 1) { plog(@"PROLOGUE WARN pairs=0"); ulog(@"PROLOGUE WARN pairs=0"); }
               return 1;
@@ -1569,29 +1716,33 @@ jobs:
                   case 13: map_all(); break;
                   case 14: surf_make(); break;
                   case 15: surf_alloc(); break;
-                  case 16: traps(); break;
-                  case 17: addclient_all(); break;
-                  case 18:
+                  case 16: sym_audit(); break;
+                  case 17: surf_global(); break;
+                  case 18: s0_deep(); break;
+                  case 19: traps(); break;
+                  case 20: addclient_all(); break;
+                  case 21:
                       canary(2, 0, 4096, 0, 0, 0, "s2v");
                       canary(9, 0, 4096, 0, 0, 0, "s9v");
                       canary(9, 1, 0, 4096, 0, 0, "s9si");
                       canary(9, 1, 0, 4096, 4, 0, "s9si4");
                       break;
-                  case 19: prop_rich(); break;
-                  case 20: prop_readback(); break;
-                  case 21: seq_probe(); break;
-                  case 22: gap_forensics(); break;
-                  case 23: argmatrix(); break;
-                  case 24: s9_sid(); break;
-                  case 25: wide_sweep(); break;
-                  case 26: notif(); break;
-                  case 27: probe_req(); break;
-                  case 28: s9_after(); break;
-                  case 29: arity(); break;
-                  case 30: prop_surface(); break;
-                  case 31: arm_matrix(); break;
-                  case 32: summary(); break;
-                  case 33: verdict(); break;
+                  case 22: prop_rich(); break;
+                  case 23: getp_verify(); break;
+                  case 24: prop_readback(); break;
+                  case 25: seq_probe(); break;
+                  case 26: gap_forensics(); break;
+                  case 27: argmatrix(); break;
+                  case 28: s9_sid(); break;
+                  case 29: wide_sweep(); break;
+                  case 30: notif(); break;
+                  case 31: probe_req(); break;
+                  case 32: s9_after(); break;
+                  case 33: arity(); break;
+                  case 34: prop_surface(); break;
+                  case 35: arm_matrix(); break;
+                  case 36: summary(); break;
+                  case 37: verdict(); break;
               }
           }
 
@@ -1612,6 +1763,7 @@ jobs:
               void* ik = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY);
               void* ih = ik ? ik : RTLD_DEFAULT;
               g_surfcreate = (fn_surfcreate)dlsym(is ? is : RTLD_DEFAULT, "IOSurfaceCreate");
+              g_surflookup = (fn_surflookup)dlsym(is ? is : RTLD_DEFAULT, "IOSurfaceLookup");
               g_surflock = (fn_surflock)dlsym(is ? is : RTLD_DEFAULT, "IOSurfaceLock");
               g_surfunlock = (fn_surfunlock)dlsym(is ? is : RTLD_DEFAULT, "IOSurfaceUnlock");
               g_allocusize = (fn_allocusize)dlsym(is ? is : RTLD_DEFAULT, "IOSurfaceGetAllocSize");
@@ -1632,20 +1784,20 @@ jobs:
               g_trap5 = (fn_trap5)dlsym(ih, "IOConnectTrap5");
               g_trap6 = (fn_trap6)dlsym(ih, "IOConnectTrap6");
               int ntr = (g_trap0?1:0)+(g_trap1?1:0)+(g_trap2?1:0)+(g_trap3?1:0)+(g_trap4?1:0)+(g_trap5?1:0)+(g_trap6?1:0);
-              plog(@"syms is=%p create=%p lock=%p base=%p alloc=%p addclient=%p setprop=%p setprops=%p getprop=%p setnotif=%p reqprobe=%p traps=%d",
-                   is, (void*)g_surfcreate, (void*)g_surflock, (void*)g_baseaddr, (void*)g_allocusize,
+              plog(@"syms is=%p lookup=%p create=%p lock=%p base=%p alloc=%p addclient=%p setprop=%p setprops=%p getprop=%p setnotif=%p reqprobe=%p traps=%d",
+                   is, (void*)g_surflookup, (void*)g_surfcreate, (void*)g_surflock, (void*)g_baseaddr, (void*)g_allocusize,
                    (void*)g_addclient, (void*)g_setprop, (void*)g_setprops, (void*)g_getprop, (void*)g_setnotif,
                    (void*)g_reqprobe, ntr);
               plog(@"SYM addclient %s", g_addclient ? "ok" : "no");
               plog(@"SYM setprop %s", g_setprop ? "ok" : "no");
-              plog(@"SYM setprops %s", g_setprops ? "ok" : "no");
               plog(@"SYM getprop %s", g_getprop ? "ok" : "no");
               plog(@"SYM setnotif %s", g_setnotif ? "ok" : "no");
               plog(@"SYM reqprobe %s", g_reqprobe ? "ok" : "no");
+              plog(@"SYM lookup %s", g_surflookup ? "ok" : "no");
               plog(@"SYM traps %d", ntr);
               plog(@"PROBESYM %s", g_reqprobe ? "ok" : "no");
-              ulog(@"IOSurface=%s addclient=%s setprop=%s getprop=%s setnotif=%s traps=%d",
-                   is ? "ok" : "FAIL", g_addclient ? "ok" : "FAIL", g_setprop ? "ok" : "FAIL",
+              ulog(@"IOSurface=%s lookup=%s addclient=%s setprop=%s getprop=%s setnotif=%s traps=%d",
+                   is ? "ok" : "FAIL", g_surflookup ? "ok" : "FAIL", g_addclient ? "ok" : "FAIL", g_setprop ? "ok" : "FAIL",
                    g_getprop ? "ok" : "FAIL", g_setnotif ? "ok" : "FAIL", ntr);
 
               plog(@"=== LAUNCH step=%d build=%s wake=0x%x", g_step, BUILD_TAG, g_wake);
@@ -1672,6 +1824,12 @@ jobs:
               if (!g_root) { ulog(@"NO ROOT"); g_stop = 1; }
 
               while (g_step <= STEP_MAX && !g_stop) {
+                  if (step_done(g_step)) {
+                      ulog(@"DONE %d %s (skip)", g_step, STEP_NAME[g_step]);
+                      g_step++; save_step(g_step);
+                      usleep(60000);
+                      continue;
+                  }
                   load_try();
                   if (g_try >= TRY_MAX) { ulog(@"SKIP %d", g_step); plog(@"SKIP %d", g_step); g_step++; save_step(g_step); usleep(150000); continue; }
                   g_try++; save_try();
@@ -1679,13 +1837,14 @@ jobs:
                   int h0 = g_hits, d0 = g_done;
                   do_step(g_step);
                   int dh = g_hits - h0, dd = g_done - d0;
-                  plog(@"STEP %d calls+%d hits+%d relive=%d", g_step, dd, dh, g_relive);
-                  plog(@"LIVE step=%d conns=%d vic=%d pair=%d probes=%d badarg=%d writes=%d oob=%d gap=%d outw=%d trapok=%d sigp=%d propok=%d getpok=%d probeok=%d notifok=%d notifmsg=%d hi=%d tblmask=0x%llx",
-                       g_step, g_nconn, g_vicn, g_pairn, g_probes, g_badarg, g_canary_w, g_oobsz, g_gapread, g_outw, g_trap_ok, g_sigp, g_propok, g_getpropok, g_probe_ok, g_notifok, g_notifmsg, g_hi_sel, (unsigned long long)g_tbl_mask);
+                  plog(@"STEP %d calls+%d hits+%d", g_step, dd, dh);
+                  plog(@"LIVE step=%d conns=%d vic=%d pair=%d probes=%d badarg=%d writes=%d oob=%d gap=%d outw=%d trapok=%d sigp=%d propok=%d getpok=%d probeok=%d notifok=%d notifmsg=%d globrt=%d getpsym=%d hi=%d tblmask=0x%llx",
+                       g_step, g_nconn, g_vicn, g_pairn, g_probes, g_badarg, g_canary_w, g_oobsz, g_gapread, g_outw, g_trap_ok, g_sigp, g_propok, g_getpropok, g_probe_ok, g_notifok, g_notifmsg, g_globrt, g_getp_ok, g_hi_sel, (unsigned long long)g_tbl_mask);
                   if (g_fd >= 0) fsync(g_fd);
                   ulog(@"STEP %d SURVIVED (+%d calls)", g_step, dd);
+                  mark_done(g_step);
                   g_step++; save_step(g_step);
-                  if (g_step <= STEP_MAX) usleep(250000);
+                  if (g_step <= STEP_MAX) usleep(200000);
               }
               ulog(@"CHAIN END"); plog(@"CHAIN END");
               summary();
@@ -1724,7 +1883,7 @@ jobs:
               [NSTimer scheduledTimerWithTimeInterval:0.25 repeats:YES block:^(NSTimer*) {
                   g_tick++;
                   if (g_tick % 4 == 0) refresh_counts();
-                  g_hb.text = [NSString stringWithFormat:@"%s %d/%d conn=%d vic=%d pair=%d pr=%d bad=%d w=%d oob=%d gap=%d ow=%d add=%d tr=%d pp=%d gpo=%d pq=%d nf=%d msg=%d sg=%d hi=%d tm=%llx ok=%llx", BUILD_TAG, g_step, STEP_MAX, g_nconn, g_vicn, g_pairn, g_probes, g_badarg, g_canary_w, g_oobsz, g_gapread, g_outw, g_addok, g_trap_ok, g_propok, g_getpropok, g_probe_ok, g_notifok, g_notifmsg, g_sigp, g_hi_sel, (unsigned long long)g_tbl_mask, (unsigned long long)g_ok_sel];
+                  g_hb.text = [NSString stringWithFormat:@"%s %d/%d conn=%d vic=%d pair=%d pr=%d bad=%d w=%d oob=%d gap=%d ow=%d add=%d tr=%d pp=%d gpo=%d pq=%d nf=%d msg=%d sg=%d hi=%d tm=%llx ok=%llx gl=%d", BUILD_TAG, g_step, STEP_MAX, g_nconn, g_vicn, g_pairn, g_probes, g_badarg, g_canary_w, g_oobsz, g_gapread, g_outw, g_addok, g_trap_ok, g_propok, g_getpropok, g_probe_ok, g_notifok, g_notifmsg, g_sigp, g_hi_sel, (unsigned long long)g_tbl_mask, (unsigned long long)g_ok_sel, g_globrt];
                   flush_ui();
               }];
               dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_global_queue(0,0), ^{ run(); });
@@ -1746,10 +1905,10 @@ jobs:
             <key>CFBundleIdentifier</key><string>com.buurza47.probe</string>
             <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
             <key>CFBundleName</key><string>probe</string>
-            <key>CFBundleDisplayName</key><string>buurd73</string>
+            <key>CFBundleDisplayName</key><string>buurd74</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleShortVersionString</key><string>1.0</string>
-            <key>CFBundleVersion</key><string>73</string>
+            <key>CFBundleVersion</key><string>74</string>
             <key>MinimumOSVersion</key><string>16.0</string>
             <key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
             <key>UILaunchScreen</key><dict/>
@@ -1763,7 +1922,7 @@ jobs:
       - name: api-guard
         run: |
           set -e
-          for sym in IOConnectSetCFProperty IOConnectSetCFProperties IOConnectGetCFProperty IOConnectSetNotificationPort IOConnectAddClient IOServiceRequestProbe; do
+          for sym in IOConnectSetCFProperty IOConnectSetCFProperties IOConnectGetCFProperty IOConnectSetNotificationPort IOConnectAddClient IOServiceRequestProbe IOSurfaceLookup; do
             if grep -n "$sym" Sources/main.m; then
               echo "::warning::$sym referenced — confirm dlsym, never by name"
             fi
@@ -1774,6 +1933,9 @@ jobs:
           set -e
           if grep -nE '\bIOServiceRequestProbe\s*\(' Sources/main.m | grep -v 'g_reqprobe'; then
             echo "::warning::direct IOServiceRequestProbe call — should go through g_reqprobe"
+          fi || true
+          if grep -nE '\bIOSurfaceLookup\s*\(' Sources/main.m | grep -v 'g_surflookup'; then
+            echo "::warning::direct IOSurfaceLookup call — should go through g_surflookup"
           fi || true
 
       - name: cast-guard
